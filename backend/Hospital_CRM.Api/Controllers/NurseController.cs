@@ -281,6 +281,22 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse")]
     public async Task<IActionResult> SetAvailability(Guid id, [FromBody] SetAvailabilityRequest request, CancellationToken ct)
     {
+        var userId = User.GetUserId();
+        var tenantId = User.GetTenantId();
+        if (!userId.HasValue || !tenantId.HasValue) return Unauthorized(new { error = "invalid_token" });
+
+        var nurse = await _db.NurseProfiles
+            .Include(n => n.User)
+            .FirstOrDefaultAsync(n => n.Id == id && n.TenantId == tenantId.Value, ct);
+        if (nurse is null) return NotFound(new { error = "nurse_not_found" });
+
+        if (User.GetUserRole() == "ClinicAdmin")
+        {
+            var admin = await _db.Users.FindAsync([userId.Value], ct);
+            if (admin?.ClinicId is null || admin.ClinicId != nurse.User?.ClinicId) return Forbid();
+        }
+        else if (User.GetUserRole() != "Nurse" || nurse.User is null || nurse.UserId != userId.Value) return Forbid();
+
         if (request.StartDate > request.EndDate)
             return BadRequest(new { error = "start_date_must_be_before_end_date" });
 
@@ -288,7 +304,7 @@ public class NurseController : ControllerBase
         {
             Id = Guid.NewGuid(),
             NurseProfileId = id,
-            TenantId = User.GetTenantId() ?? Guid.Empty,
+            TenantId = nurse.TenantId,
             StartDate = request.StartDate,
             EndDate = request.EndDate,
             PreferredShift = request.PreferredShift,

@@ -1087,7 +1087,7 @@ export default function PharmacyPOS() {
               </div>
             ) : loadedPrescription ? (
               <div className="space-y-4">
-                <div className="card p-3 bg-slate-50 border-slate-200 grid grid-cols-2 gap-2 text-xs">
+                <div className="card p-3 bg-[var(--color-surface-raised)] border-[var(--color-border)] grid grid-cols-2 gap-2 text-xs">
                   <div>
                     <span className="text-slate-500 block text-[11px]">Patient Details</span>
                     <span className="font-semibold text-slate-900">{loadedPrescription.patientName}</span>
@@ -1110,7 +1110,7 @@ export default function PharmacyPOS() {
                   <h4 className="font-semibold text-slate-900 text-xs">Prescribed Medicines ({loadedPrescription.items.length})</h4>
                   <div className="card divide-y border-slate-200 overflow-hidden">
                     {loadedPrescription.items.map((it) => (
-                      <div key={it.id} className="p-3 flex items-center justify-between hover:bg-slate-50">
+                      <div key={it.id} className="p-3 flex items-center justify-between hover:bg-[var(--color-surface-hover)]">
                         <div>
                           <div className="flex items-center gap-2">
                             <span className="font-semibold text-slate-900">{it.brandName ? `${it.brandName} (${it.genericName})` : it.genericName}</span>
@@ -1200,7 +1200,7 @@ export default function PharmacyPOS() {
                   ) : (
                     <div className="card divide-y border-slate-200 max-h-64 overflow-y-auto">
                       {pendingPrescriptions.map(rx => (
-                        <div key={rx.prescriptionId} className="p-3 flex items-center justify-between hover:bg-slate-50">
+                        <div key={rx.prescriptionId} className="p-3 flex items-center justify-between hover:bg-[var(--color-surface-hover)]">
                           <div>
                             <span className="font-semibold text-slate-900 block">{rx.patientName}</span>
                             <span className="text-[11px] text-slate-500">

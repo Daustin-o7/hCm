@@ -1,4 +1,5 @@
 ﻿using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -352,7 +353,7 @@ public class ConsultationsController : ControllerBase
         // Sync draft prescription items if provided
         if (request.PrescriptionItems != null)
         {
-            var drugSchedules = await LoadDrugSchedulesAsync(request.PrescriptionItems, ct);
+            var drugSchedules = await LoadDrugSchedulesAsync(request.PrescriptionItems.Select(i => i.DrugId), ct);
             var rx = draft.Prescriptions.FirstOrDefault();
             if (rx is null)
             {
@@ -530,7 +531,7 @@ public class ConsultationsController : ControllerBase
 
         // 4. Safety Check: NDPS statutory digital prescribing guard.
         // The request's schedule string is client-supplied, so the catalogue is the authority.
-        var drugSchedules = await LoadDrugSchedulesAsync(request.PrescriptionItems, ct);
+        var drugSchedules = await LoadDrugSchedulesAsync(request.PrescriptionItems.Select(i => i.DrugId), ct);
         var ndpsItem = request.PrescriptionItems?.FirstOrDefault(i =>
             (i.DrugId is { } drugId && drugSchedules.TryGetValue(drugId, out var sched) && sched == ScheduleClass.NDPS) ||
             string.Equals(i.ScheduleClass, "ndps", StringComparison.OrdinalIgnoreCase));
@@ -810,7 +811,7 @@ public class ConsultationsController : ControllerBase
         }
         else
         {
-            var drugSchedules = await LoadDrugSchedulesAsync(request.PrescriptionItems, ct);
+            var drugSchedules = await LoadDrugSchedulesAsync(request.PrescriptionItems.Select(i => i.DrugId), ct);
             foreach (var item in request.PrescriptionItems)
                 rx.Items.Add(BuildItem(item, drugSchedules));
 
@@ -918,23 +919,27 @@ public class ConsultationsController : ControllerBase
         // though an amendment leaves it in status Amended.
         var isSuperseded = consultation.Version < latestVersion.Version;
 
-        // Tamper-evident digital signature check
-        var signatureValid = consultation.SignedAt.HasValue &&
-            string.Equals(
-                consultation.DigitalSignatureHash,
-                SignatureHash(consultation.DoctorId, consultation.AppointmentId, consultation.Id,
-                    consultation.Diagnosis, SecondPrecision(consultation.SignedAt.Value)),
+        var fullContentSeal = consultation.DigitalSignatureHash?.StartsWith("v2:", StringComparison.Ordinal) == true;
+        var signatureValid = fullContentSeal && ContentSealValid(consultation);
+        var legacySignatureValid = !fullContentSeal && consultation.SignedAt.HasValue &&
+            string.Equals(consultation.DigitalSignatureHash,
+                SignatureHash(consultation.DoctorId, consultation.AppointmentId, consultation.Id, consultation.Diagnosis, SecondPrecision(consultation.SignedAt.Value)),
                 StringComparison.OrdinalIgnoreCase);
+        var integrity = signatureValid ? "full_content" : legacySignatureValid ? "legacy_limited" : "invalid";
 
         return Ok(new
         {
-            verified = true,
-            status = isSuperseded ? "superseded" : "valid",
+            verified = signatureValid,
+            status = !signatureValid ? integrity == "legacy_limited" ? "legacy_limited" : "invalid" : isSuperseded ? "superseded" : "valid",
+            contentIntegrity = integrity,
+            legacySignatureValid,
             isSuperseded,
             supersededOn = isSuperseded ? latestVersion.CreatedAt : (DateTimeOffset?)null,
             latestVersion = latestVersion.Version,
             currentVersion = consultation.Version,
-            statusDescription = isSuperseded
+            statusDescription = !signatureValid
+                ? legacySignatureValid ? "Legacy identity-only seal: medicine and note content integrity cannot be verified." : "Clinical content integrity verification failed. Do not rely on this prescription; contact the clinic."
+                : isSuperseded
                 ? $"This prescription was superseded on {latestVersion.CreatedAt:yyyy-MM-dd} by amended version {latestVersion.Version}."
                 : "This prescription is valid and active.",
             signatureValid,
@@ -1450,11 +1455,151 @@ public class ConsultationsController : ControllerBase
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
             $"{doctorId}|{appointmentId}|{consultationId}|{diagnosis}|{signedAt.ToUnixTimeSeconds()}")));
 
+    private static string ContentHash(Consultation c)
+    {
+        var content = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            c.Id, c.TenantId, c.AppointmentId, PatientId = c.Appointment.PatientId, c.Appointment.ClinicId,
+            c.DoctorId, c.SignedByDoctorId, SignedAt = c.SignedAt?.ToUnixTimeSeconds(),
+            c.DoctorRegistrationNumber, c.DoctorQualifications, c.Version, c.PreviousVersionId,
+            c.Status, c.AmendmentReason, c.VerificationQrCode,
+            c.ChiefComplaint, c.Observations, c.Diagnosis, c.AdvisedInvestigations, c.IcdCode, c.IcdTitle,
+            c.FollowUpDate, c.FollowUpNotes, c.TemplateId, c.TemplateVersion,
+            StructuredObservations = CanonicalJson(c.StructuredObservationsJson), Odontogram = CanonicalJson(c.OdontogramJson),
+            Medicines = c.Prescriptions.SelectMany(p => p.Items).OrderBy(i => i.Id).Select(i => new
+            {
+                i.Id, i.DrugId, i.GenericName, i.BrandName, i.DosageForm, i.Strength, i.Route, i.Frequency,
+                i.Duration, i.DurationUnit, i.Timing, i.TotalQuantity, i.SpecialInstructions, i.ScheduleClass,
+                i.IsUnverified, i.MedicineText, i.DosageText, i.FrequencyText, i.DurationText
+            })
+        });
+        return "v2:" + Convert.ToHexString(SHA256.HashData(content));
+    }
+
+    private static bool ContentSealValid(Consultation consultation)
+    {
+        if (!consultation.SignedAt.HasValue || consultation.Appointment is null) return false;
+        try { return string.Equals(consultation.DigitalSignatureHash, ContentHash(consultation), StringComparison.Ordinal); }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or ArgumentException) { return false; }
+    }
+
+    private static bool StructuredJsonValid(params string?[] values)
+    {
+        try { foreach (var value in values) CanonicalJson(value); return true; }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or ArgumentException) { return false; }
+    }
+
+    private static string? CanonicalJson(string? value)
+    {
+        if (value is null) return null;
+        using var document = JsonDocument.Parse(value);
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer)) WriteCanonicalJson(writer, document.RootElement);
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    private static void WriteCanonicalJson(Utf8JsonWriter writer, JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                var properties = element.EnumerateObject().OrderBy(p => p.Name, StringComparer.Ordinal).ToList();
+                if (properties.Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() != properties.Count)
+                    throw new JsonException("Duplicate clinical JSON fields are not supported.");
+                foreach (var property in properties) { writer.WritePropertyName(property.Name); WriteCanonicalJson(writer, property.Value); }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray()) WriteCanonicalJson(writer, item);
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.Number:
+                if (element.TryGetDecimal(out var number)) writer.WriteRawValue(number.ToString("G29", CultureInfo.InvariantCulture));
+                else writer.WriteNumberValue(element.GetDouble());
+                break;
+            default: element.WriteTo(writer); break;
+        }
+    }
+
+    private Task<TenantMembership?> SigningMembershipAsync(Guid doctorId, Guid tenantId, Guid? clinicId, CancellationToken ct) =>
+        _db.TenantMemberships.FirstOrDefaultAsync(m => m.UserId == doctorId && m.TenantId == tenantId &&
+            m.ClinicId == clinicId && m.Role == UserRole.Doctor && m.Status == "active" &&
+            m.RegistrationNumber != null && m.RegistrationNumber.Trim() != "" &&
+            m.RegistrationNumber != "NMC-VERIFIED-PRACTITIONER" && m.Qualifications != null && m.Qualifications.Trim() != "", ct);
+
+    private async Task<List<PrescriptionItem>> EffectiveItemsAsync(List<StructuredPrescriptionItemRequest>? requested,
+        IEnumerable<PrescriptionItem> previous, CancellationToken ct)
+    {
+        var previousItems = previous.ToList();
+        var schedules = await LoadDrugSchedulesAsync(requested is null ? previousItems.Select(i => i.DrugId) : requested.Select(i => i.DrugId), ct);
+        if (requested is not null) return requested.Select(i => BuildItem(i, schedules)).ToList();
+        var items = previousItems.Select(CloneItem).ToList();
+        foreach (var item in items)
+            if (item.DrugId is { } id && schedules.TryGetValue(id, out var schedule))
+                item.ScheduleClass = item.ScheduleClass == ScheduleClass.NDPS ? ScheduleClass.NDPS : schedule;
+        return items;
+    }
+
+    private async Task<(IActionResult? Error, List<object> Warnings)> ValidatePrescriptionAsync(
+        Appointment appointment, List<PrescriptionItem> items, CancellationToken ct)
+    {
+        var warnings = new List<object>();
+        if (items.Any(i => string.IsNullOrWhiteSpace(i.GenericName) || i.TotalQuantity <= 0 || i.Duration <= 0 ||
+            i.DispensedQuantity < 0 || i.DispensedQuantity > i.TotalQuantity))
+            return (BadRequest(new { error = "invalid_prescription_item", message = "Each medicine needs a name, positive duration and quantity, and consistent supplied quantity." }), warnings);
+        var ndps = items.FirstOrDefault(i => i.ScheduleClass == ScheduleClass.NDPS);
+        if (ndps is not null)
+            return (BadRequest(new { error = "ndps_digital_prescribing_prohibited", message = $"Digital prescribing of NDPS substance '{ndps.GenericName}' is disabled. Official physical stationery and a wet signature are required." }), warnings);
+
+        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.Id == appointment.ClinicId, ct);
+        var timezone = new TimezoneService();
+        var today = timezone.GetClinicToday(clinic?.Timezone);
+        var start = new DateTimeOffset(timezone.GetStartOfDayUtc(today, clinic?.Timezone));
+        var end = new DateTimeOffset(timezone.GetStartOfDayUtc(today.AddDays(1), clinic?.Timezone));
+        var vitals = await _db.PatientVitals
+            .Where(v => v.PatientId == appointment.PatientId && v.RecordedAt >= start && v.RecordedAt < end)
+            .OrderByDescending(v => v.AppointmentId == appointment.Id).ThenByDescending(v => v.RecordedAt).FirstOrDefaultAsync(ct);
+        var patient = appointment.Patient;
+        var age = patient.Dob is { } dob ? today.Year - dob.Year - (today < dob.AddYears(today.Year - dob.Year) ? 1 : 0) : patient.ApproxAge;
+        if (age is < 12 && items.Count > 0 && vitals?.WeightKg is not > 0)
+            return (BadRequest(new { error = "pediatric_weight_required", message = "Pediatric prescribing requires a positive weight in today's encounter or patient vitals." }), warnings);
+
+        var precheck = await _db.PrecheckSubmissions.FirstOrDefaultAsync(p => p.AppointmentId == appointment.Id, ct);
+        var allergies = new[] { precheck?.Allergies, vitals?.Allergies }.Where(s => !string.IsNullOrWhiteSpace(s))
+            .SelectMany(s => s!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).Distinct(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items)
+            foreach (var allergy in allergies)
+                if (allergy.Length >= 3 && $"{item.GenericName} {item.BrandName}".Contains(allergy, StringComparison.OrdinalIgnoreCase))
+                    warnings.Add(new { type = "allergy_warning", drug = item.GenericName, allergenMatched = allergy, message = $"Prescribed medicine '{item.GenericName}' matches recorded allergy '{allergy}'." });
+        foreach (var duplicate in items.GroupBy(i => i.GenericName.Trim(), StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1))
+            warnings.Add(new { type = "duplicate_drug_warning", genericName = duplicate.Key, message = $"Duplicate prescription of generic ingredient '{duplicate.Key}'." });
+        return (null, warnings);
+    }
+
+    private static bool SameMedicine(PrescriptionItem old, PrescriptionItem item) =>
+        old.DrugId == item.DrugId &&
+        string.Equals(old.GenericName.Trim(), item.GenericName.Trim(), StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(old.BrandName?.Trim(), item.BrandName?.Trim(), StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(old.Strength.Trim(), item.Strength.Trim(), StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(old.DosageForm.Trim(), item.DosageForm.Trim(), StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(old.Route.Trim(), item.Route.Trim(), StringComparison.OrdinalIgnoreCase);
+
+    private static void CarryFulfillment(PrescriptionItem source, PrescriptionItem target)
+    {
+        target.DispensedQuantity = source.DispensedQuantity;
+        target.IsDispensed = source.IsDispensed;
+        target.DispensedBatchId = source.DispensedBatchId;
+        target.SubstitutedDrugId = source.SubstitutedDrugId;
+        target.SubstitutionReason = source.SubstitutionReason;
+    }
+
     /// <summary>Catalogue schedule classes for the ordered drugs; empty when nothing is linked.</summary>
     private async Task<Dictionary<Guid, ScheduleClass>> LoadDrugSchedulesAsync(
-        List<StructuredPrescriptionItemRequest>? items, CancellationToken ct)
+        IEnumerable<Guid?> drugIds, CancellationToken ct)
     {
-        var ids = items?.Where(i => i.DrugId.HasValue).Select(i => i.DrugId!.Value).Distinct().ToList() ?? [];
+        var ids = drugIds.Where(id => id.HasValue).Select(id => id!.Value).Distinct().ToList();
         if (ids.Count == 0) return [];
 
         return await _db.Drugs
@@ -1490,7 +1635,7 @@ public class ConsultationsController : ControllerBase
             Timing = item.Timing?.Trim() ?? "After food",
             TotalQuantity = item.TotalQuantity ?? ((item.Duration ?? 5) * 2),
             SpecialInstructions = item.SpecialInstructions?.Trim(),
-            ScheduleClass = catalogued
+            ScheduleClass = ParseScheduleClass(item.ScheduleClass) == ScheduleClass.NDPS ? ScheduleClass.NDPS : catalogued
                 ? drugSchedules[item.DrugId!.Value]
                 : ParseScheduleClass(item.ScheduleClass),
             IsUnverified = item.IsUnverified ?? (!catalogued && item.DrugId.HasValue),
@@ -1520,6 +1665,10 @@ public class ConsultationsController : ControllerBase
         ScheduleClass = item.ScheduleClass,
         IsUnverified = item.IsUnverified,
         IsDispensed = item.IsDispensed,
+        DispensedQuantity = item.DispensedQuantity,
+        DispensedBatchId = item.DispensedBatchId,
+        SubstitutedDrugId = item.SubstitutedDrugId,
+        SubstitutionReason = item.SubstitutionReason,
         MedicineText = item.MedicineText,
         DosageText = item.DosageText,
         FrequencyText = item.FrequencyText,
@@ -1633,7 +1782,8 @@ public record StructuredPrescriptionItemRequest(
     int? TotalQuantity,
     string? SpecialInstructions,
     string? ScheduleClass,
-    bool? IsUnverified
+    bool? IsUnverified,
+    Guid? PrescriptionItemId = null
 );
 
 public record SaveConsultationDraftRequest(

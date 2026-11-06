@@ -53,7 +53,7 @@ export default function QueueStatus() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86a2 2 0 001.74-3L13.74 4a2 2 0 00-3.48 0L3.34 16a2 2 0 001.73 3z" />
             </svg>
           </div>
-          <h1 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'Outfit, sans-serif' }}>Token not found</h1>
+          <h1 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'var(--font-heading)' }}>Token not found</h1>
           <p className="text-sm text-slate-600">
             This queue tracker link doesn't match any active appointment. Please verify the link or ask reception for assistance.
           </p>
@@ -66,7 +66,7 @@ export default function QueueStatus() {
     return (
       <PublicPage badge={badge} footer={footer}>
         <div className="py-6 space-y-3 text-center">
-          <h1 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'Outfit, sans-serif' }}>Connection problem</h1>
+          <h1 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'var(--font-heading)' }}>Connection problem</h1>
           <p className="text-sm text-slate-600">Couldn't reach the clinic system. Retrying shortly.</p>
           <button onClick={() => { setError(null); fetchStatus() }} className="btn btn-secondary btn-sm cursor-pointer">
             Try now
@@ -82,7 +82,7 @@ export default function QueueStatus() {
         <div className="py-10 space-y-4 animate-pulse text-center">
           <div className="h-4 w-32 mx-auto rounded bg-slate-200"></div>
           <div className="h-16 w-40 mx-auto rounded-lg bg-slate-200"></div>
-          <div className="h-4 w-44 mx-auto rounded bg-slate-100"></div>
+          <div className="h-4 w-44 mx-auto rounded bg-[var(--color-surface-raised)]"></div>
         </div>
       </PublicPage>
     )
@@ -96,14 +96,14 @@ export default function QueueStatus() {
       <div className="py-4 space-y-5 text-center">
         <div>
           <div className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Now serving</div>
-          <div className="text-5xl font-extrabold text-teal-700 tabular-nums" style={{ fontFamily: 'Outfit, sans-serif' }}>
+          <div className="text-5xl font-extrabold text-teal-700 tabular-nums" style={{ fontFamily: 'var(--font-heading)' }}>
             #{state.currentlyServing}
           </div>
         </div>
 
-        <div className={`rounded-xl border p-5 ${yourTurn ? 'bg-teal-50/80 border-teal-200 shadow-sm' : 'bg-slate-50 border-slate-200'}`}>
+        <div className={`rounded-xl border p-5 ${yourTurn ? 'bg-teal-50/80 border-teal-200 shadow-sm' : 'bg-[var(--color-surface-raised)] border-[var(--color-border)]'}`}>
           <div className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Your token</div>
-          <div className="text-4xl font-extrabold text-slate-800 tabular-nums my-1" style={{ fontFamily: 'Outfit, sans-serif' }}>
+          <div className="text-4xl font-extrabold text-slate-800 tabular-nums my-1" style={{ fontFamily: 'var(--font-heading)' }}>
             #{state.yourToken}
           </div>
           <div className={`text-base font-bold ${yourTurn ? 'text-teal-700 animate-pulse' : 'text-slate-700'}`}>
@@ -111,7 +111,7 @@ export default function QueueStatus() {
           </div>
 
           {state.estimatedWaitMinutes !== undefined && !yourTurn && (
-            <div className="mt-3 pt-3 border-t border-slate-200/80 flex items-center justify-center gap-2 text-xs font-semibold text-slate-600">
+            <div className="mt-3 pt-3 border-t border-[var(--color-border)] flex items-center justify-center gap-2 text-xs font-semibold text-slate-600">
               <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>

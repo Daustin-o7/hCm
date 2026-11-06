@@ -243,7 +243,7 @@ export default function Appointments() {
               Appointments & OPD Desk
             </h1>
             <span className="badge badge-info">
-              <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse-soft"></span>
+              <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse-soft"></span>
               Live Queue Active
             </span>
           </div>
@@ -348,8 +348,8 @@ export default function Appointments() {
         {/* Live OPD Stats Mini-Cards (5 cols) */}
         <div className="lg:col-span-5 grid grid-cols-3 gap-2.5">
           <div className="card p-3.5 text-center hover-card">
-            <div className="w-8 h-8 rounded-xl mx-auto mb-2 flex items-center justify-center bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-900">
-              <svg width="16" height="16" fill="none" stroke="#2563eb" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+            <div className="w-8 h-8 rounded-xl mx-auto mb-2 flex items-center justify-center bg-[var(--brand-primary-10)] border border-[var(--color-border)]">
+              <svg width="16" height="16" fill="none" stroke="var(--brand-primary)" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
             </div>
             <div className="text-xl font-bold text-[var(--color-text)]" style={{ fontFamily: 'var(--font-heading)' }}>
               {loading ? <Skeleton width="36px" height="24px" style={{ margin: '0 auto' }} /> : stats.total}

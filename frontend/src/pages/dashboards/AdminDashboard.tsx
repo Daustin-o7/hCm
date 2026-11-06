@@ -391,7 +391,7 @@ export default function AdminDashboard() {
             </div>
           </div>
 
-          <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 flex items-center justify-between text-xs">
+          <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] flex items-center justify-between text-xs">
             <span className="font-semibold text-slate-600 dark:text-slate-300">DPDP Statutory Consent Capture:</span>
             <span className="badge badge-success font-mono font-bold">100% Compliant</span>
           </div>

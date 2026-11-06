@@ -268,7 +268,7 @@ export default function Reports() {
         <div className="space-y-6">
           <EmptyState
             illustration={
-              <div className="w-12 h-12 rounded-xl bg-slate-100 dark:bg-slate-800/80 text-slate-500 dark:text-slate-400 flex items-center justify-center text-xl shadow-xs border border-slate-200 dark:border-slate-700">
+              <div className="w-12 h-12 rounded-xl bg-[var(--color-surface-raised)] text-[var(--color-text-secondary)] flex items-center justify-center text-xl shadow-xs border border-[var(--color-border)]">
                 📊
               </div>
             }
@@ -457,7 +457,7 @@ export default function Reports() {
                 </div>
                 <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'var(--color-surface-raised)' }}>
                   <div 
-                    className="h-full bg-blue-500 rounded-full transition-all duration-300" 
+                    className="h-full bg-[var(--brand-primary)] rounded-full transition-all duration-300" 
                     style={{ width: `${Math.min(100, Math.max(0, safeGet(paymentDistribution, 'cardPercentage', 0)))}%` }}
                   />
                 </div>

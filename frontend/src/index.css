@@ -589,24 +589,24 @@
   }
 
   .badge-success {
-    background: #f0fdf4;
-    color: #14532d;
-    border-color: #bbf7d0;
+    background: var(--color-success-bg);
+    color: var(--color-success-text);
+    border-color: var(--color-success-border);
   }
   .badge-warning {
-    background: #fffbeb;
-    color: #78350f;
-    border-color: #fde68a;
+    background: var(--color-warning-bg);
+    color: var(--color-warning-text);
+    border-color: var(--color-warning-border);
   }
   .badge-danger {
-    background: #fff1f2;
-    color: #881337;
-    border-color: #fecdd3;
+    background: var(--color-danger-bg);
+    color: var(--color-danger-text);
+    border-color: var(--color-danger-border);
   }
   .badge-info {
-    background: #f0f9ff;
-    color: #0c4a6e;
-    border-color: #bae6fd;
+    background: var(--color-info-bg);
+    color: var(--color-info-text);
+    border-color: var(--color-info-border);
   }
   .badge-neutral {
     background: var(--color-surface-raised);

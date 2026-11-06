@@ -853,7 +853,7 @@ export default function Consultations() {
 
         {/* Right Header Toolbar: Discipline Switcher, Save Draft & Finalize Buttons */}
         <div className="flex items-center gap-2 flex-wrap">
-          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-md px-2 py-1">
+          <div className="flex items-center gap-1.5 bg-[var(--color-surface-raised)] border border-[var(--color-border)] rounded-md px-2 py-1">
             <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider font-mono">Discipline:</span>
             <select
               value={selectedSpecialty}
@@ -1248,7 +1248,7 @@ export default function Consultations() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {templateSections.map((sec, idx) => (
-              <div key={idx} className="p-3 rounded-md bg-slate-50 border border-slate-200 space-y-1">
+              <div key={idx} className="p-3 rounded-md bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-1">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-bold text-slate-800">{sec.label}</span>
                   <span className="text-[10px] font-mono text-slate-400">#{sec.key}</span>
@@ -1294,7 +1294,7 @@ export default function Consultations() {
                   {customTemplates.map(t => (
                     <li
                       key={t.id}
-                      className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-50 border border-slate-200"
+                      className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[var(--color-surface-raised)] border border-[var(--color-border)]"
                     >
                       <div className="min-w-0">
                         <div className="text-xs font-semibold text-slate-800 truncate">{t.name}</div>

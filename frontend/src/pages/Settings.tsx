@@ -501,7 +501,7 @@ function HolidaysEditor({ holidays, isAdmin, onAdd, onDelete }: {
       </div>
 
       {showAdd && (
-        <div className="rounded-xl border border-slate-200 p-4 space-y-3 bg-slate-50">
+        <div className="rounded-xl border border-[var(--color-border)] p-4 space-y-3 bg-[var(--color-surface-raised)]">
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
               <label className="label">Holiday Name</label>

@@ -302,7 +302,7 @@ export default function NurseDashboard() {
                 {patients.map(p => (
                   <tr key={p.id} className="hover:bg-[var(--color-surface-hover)] transition-colors">
                     <td>
-                      <span className="font-mono font-bold text-xs px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-teal-700 dark:text-teal-300 border border-slate-200 dark:border-slate-700">
+                      <span className="font-mono font-bold text-xs px-2 py-0.5 rounded bg-[var(--brand-primary-10)] text-[var(--brand-primary)] border border-[var(--color-border)]">
                         {p.tokenNumber}
                       </span>
                     </td>

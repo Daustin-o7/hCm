@@ -21,13 +21,14 @@ public class ConsultationsControllerTests
         return new HospitalCrmDbContext(options);
     }
 
-    private ConsultationsController CreateController(HospitalCrmDbContext db, Guid doctorId)
+    private ConsultationsController CreateController(HospitalCrmDbContext db, Guid doctorId, Guid? tenantId = null)
     {
         var controller = new ConsultationsController(db);
         var claims = new[]
         {
             new Claim("sub", doctorId.ToString()),
-            new Claim("role", "Doctor")
+            new Claim("role", "Doctor"),
+            new Claim("tenant_id", (tenantId ?? Guid.Empty).ToString())
         };
         var identity = new ClaimsIdentity(claims, "TestAuth");
         controller.ControllerContext = new ControllerContext
@@ -62,6 +63,7 @@ public class ConsultationsControllerTests
         var db = CreateInMemoryDb();
         var doctorId = Guid.NewGuid();
         var clinicId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
 
         var doctor = new User
         {
@@ -69,6 +71,7 @@ public class ConsultationsControllerTests
             Name = "Dr. Test",
             Role = UserRole.Doctor,
             ClinicId = clinicId,
+            TenantId = tenantId,
             Email = "dr.test@samstack.ai",
             PasswordHash = "hash"
         };
@@ -77,6 +80,7 @@ public class ConsultationsControllerTests
         var patient = new Patient
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             Name = "Patient One",
             Phone = "9988776655",
             CreatedBy = doctorId
@@ -89,15 +93,17 @@ public class ConsultationsControllerTests
             DoctorId = doctorId,
             PatientId = patient.Id,
             ClinicId = clinicId,
+            TenantId = tenantId,
             Date = DateOnly.FromDateTime(DateTime.UtcNow),
             TimeSlot = "10:30",
-            Status = AppointmentStatus.Completed,
+            Status = AppointmentStatus.CheckedIn,
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.Appointments.Add(appointment);
+        db.TenantMemberships.Add(new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor, RegistrationNumber = "TEST-REG", Qualifications = "TEST-QUAL" });
         await db.SaveChangesAsync();
 
-        var controller = CreateController(db, doctorId);
+        var controller = CreateController(db, doctorId, tenantId);
 
         // 1. Initial Consultation (v1)
         var createRequest = new CreateConsultationRequest(
@@ -160,6 +166,7 @@ public class ConsultationsControllerTests
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.Consultations.Add(consultation);
+        db.Appointments.Add(new Appointment { Id = consultation.AppointmentId, DoctorId = doctorId, Status = AppointmentStatus.CheckedIn, TimeSlot = "10:30" });
         await db.SaveChangesAsync();
 
         var controller = CreateController(db, doctorId);
