@@ -411,9 +411,7 @@ export default function Appointments() {
                 type="button"
                 onClick={() => setSelectedSpecialtyFilter(spec.id)}
                 className={`flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-semibold whitespace-nowrap transition-all cursor-pointer border ${
-                  isSelected
-                    ? 'bg-teal-600 text-white border-teal-700 shadow-sm'
-                    : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-teal-500'
+                  isSelected ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] dark:bg-slate-800 text-[var(--color-text-secondary)] border-[var(--color-border)] hover:border-[var(--brand-primary)]'
                 }`}
               >
                 <span>{spec.icon}</span>

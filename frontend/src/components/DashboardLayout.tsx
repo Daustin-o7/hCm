@@ -538,7 +538,7 @@ export default function DashboardLayout() {
         {/* Refined User Footer Card */}
         <div className="p-2.5 border-t border-slate-800/80 bg-[#0B1322]/90">
           <div className="flex items-center gap-2.5 p-2 rounded-lg bg-white/[0.03] border border-white/10 shadow-xs">
-            <div className="w-8 h-8 rounded-md bg-[#0d5c63] text-teal-300 border border-teal-500/30 flex items-center justify-center font-bold text-xs shrink-0">
+            <div className="w-8 h-8 rounded-md bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs flex items-center justify-center font-bold text-xs shrink-0">
               {user?.name ? user.name.charAt(0).toUpperCase() : 'U'}
             </div>
             <div className="flex-1 min-w-0">
@@ -638,7 +638,7 @@ export default function DashboardLayout() {
 
             {/* Quick Profile Chip */}
             <div className="flex items-center gap-2 pl-2 border-l border-[var(--color-border)]">
-              <div className="w-8 h-8 rounded-md bg-[#0d5c63] text-teal-200 border border-teal-600/30 flex items-center justify-center font-bold text-xs shadow-xs">
+              <div className="w-8 h-8 rounded-md bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs flex items-center justify-center font-bold text-xs shadow-xs">
                 {user?.name ? user.name.charAt(0).toUpperCase() : 'A'}
               </div>
             </div>

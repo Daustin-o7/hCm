@@ -95,7 +95,7 @@ export default function PatientCommandRibbon({
         {/* Patient Identity & Demographics */}
         <div className="flex items-center gap-3">
           <div
-            className="w-11 h-11 rounded-md text-teal-200 bg-[#0d5c63] border border-teal-600/30 flex items-center justify-center font-bold text-base shadow-xs shrink-0"
+            className="w-11 h-11 rounded-md text-teal-200 bg-[var(--brand-primary)] border border-teal-600/30 flex items-center justify-center font-bold text-base shadow-xs shrink-0"
             style={{
               fontFamily: 'var(--font-heading)'
             }}

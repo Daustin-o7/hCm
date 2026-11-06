@@ -497,7 +497,7 @@ export default function SpecialtyToolsPanel({
                       type="button"
                       onClick={() => setPhysioModalities(prev => active ? prev.filter(m => m !== mod) : [...prev, mod])}
                       className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
-                        active ? 'bg-teal-600 text-white border-teal-600' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-slate-700'
+                        active ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--brand-primary)]'
                       }`}
                     >
                       {active ? '✓ ' : '+ '}{mod}
@@ -518,7 +518,7 @@ export default function SpecialtyToolsPanel({
                       type="button"
                       onClick={() => setPhysioExercises(prev => active ? prev.filter(e => e !== ex) : [...prev, ex])}
                       className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
-                        active ? 'bg-teal-600 text-white border-teal-600' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-slate-700'
+                        active ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--brand-primary)]'
                       }`}
                     >
                       {active ? '✓ ' : '+ '}{ex}
@@ -831,7 +831,7 @@ export default function SpecialtyToolsPanel({
                     type="button"
                     onClick={() => setDermaSigns(prev => active ? prev.filter(s => s !== sign) : [...prev, sign])}
                     className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
-                      active ? 'bg-teal-600 text-white border-teal-600' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-slate-700'
+                      active ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--brand-primary)]'
                     }`}
                   >
                     {active ? '✓ ' : '+ '}{sign}
