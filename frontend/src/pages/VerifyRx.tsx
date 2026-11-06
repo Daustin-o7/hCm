@@ -122,7 +122,7 @@ export default function VerifyRx() {
     <div className="min-h-screen bg-slate-100 py-8 px-4 flex justify-center">
       <div className="max-w-2xl w-full bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden space-y-6 pb-6">
         {/* Top Header Banner */}
-        <div className={`p-6 text-white ${data.isSuperseded ? 'bg-rose-900 border-b border-rose-800' : 'bg-[#0F1F17] border-b border-[#1E3A2E]'}`}>
+        <div className={`p-6 text-white ${data.isSuperseded ? 'bg-rose-900 border-b border-rose-800' : 'bg-[#0b131e] border-b border-slate-800'}`}>
           <div className="flex items-start justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 mb-1.5">

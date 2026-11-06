@@ -202,12 +202,12 @@ const NAV_SECTIONS: NavSection[] = [
 ]
 
 const ROLE_LABEL: Record<string, string> = {
-  clinicadmin:   'Administrator',
-  owner:         'Owner',
-  doctor:        'Doctor',
-  receptionist:  'Receptionist',
-  pharmacist:    'Pharmacist',
-  nurse:         'Nurse',
+  clinicadmin: 'Administrator',
+  owner: 'Owner',
+  doctor: 'Doctor',
+  receptionist: 'Receptionist',
+  pharmacist: 'Pharmacist',
+  nurse: 'Nurse',
   platformadmin: 'Platform Admin',
 }
 
@@ -367,9 +367,8 @@ export default function DashboardLayout() {
       {/* Desktop & Mobile Sidebar */}
       {/* Desktop & Mobile Sidebar */}
       <aside
-        className={`fixed top-0 bottom-0 left-0 z-50 w-64 bg-[#0F172A] text-slate-200 flex flex-col border-r border-slate-800/80 transition-transform duration-300 ease-in-out lg:translate-x-0 shadow-2xl lg:shadow-none ${
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
-        }`}
+        className={`fixed top-0 bottom-0 left-0 z-50 w-64 bg-[#0F172A] text-slate-200 flex flex-col border-r border-slate-800/80 transition-transform duration-300 ease-in-out lg:translate-x-0 shadow-2xl lg:shadow-none ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          }`}
       >
         {/* Brand Header */}
         <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between bg-[#0B1322]/90 backdrop-blur-md">
@@ -479,10 +478,9 @@ export default function DashboardLayout() {
                     to={item.href}
                     end={item.end}
                     className={({ isActive }) =>
-                      `relative flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${
-                        isActive
-                          ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
-                          : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
+                      `relative flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${isActive
+                        ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
+                        : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
                       }`
                     }
                   >
@@ -490,11 +488,10 @@ export default function DashboardLayout() {
                       <>
                         <div className="flex items-center gap-2.5 min-w-0">
                           <item.icon
-                            className={`w-4 h-4 shrink-0 transition-colors ${
-                              isActive
+                            className={`w-4 h-4 shrink-0 transition-colors ${isActive
                                 ? 'text-teal-400'
                                 : 'text-slate-400 group-hover:text-slate-200'
-                            }`}
+                              }`}
                           />
                           <span className="truncate">{item.name}</span>
                         </div>
@@ -519,19 +516,17 @@ export default function DashboardLayout() {
             <NavLink
               to="/dashboard/settings"
               className={({ isActive }) =>
-                `flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${
-                  isActive
-                    ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
-                    : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
+                `flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${isActive
+                  ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
+                  : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
                 }`
               }
             >
               {({ isActive }) => (
                 <>
                   <SettingsIcon
-                    className={`w-4 h-4 shrink-0 transition-colors ${
-                      isActive ? 'text-teal-400' : 'text-slate-400 group-hover:text-slate-200'
-                    }`}
+                    className={`w-4 h-4 shrink-0 transition-colors ${isActive ? 'text-teal-400' : 'text-slate-400 group-hover:text-slate-200'
+                      }`}
                   />
                   <span className="truncate">Settings</span>
                 </>
@@ -543,7 +538,7 @@ export default function DashboardLayout() {
         {/* Refined User Footer Card */}
         <div className="p-2.5 border-t border-slate-800/80 bg-[#0B1322]/90">
           <div className="flex items-center gap-2.5 p-2 rounded-lg bg-white/[0.03] border border-white/10 shadow-xs">
-            <div className="w-8 h-8 rounded-md bg-[#1E3A2E] text-teal-300 border border-teal-500/30 flex items-center justify-center font-bold text-xs shrink-0">
+            <div className="w-8 h-8 rounded-md bg-[#0d5c63] text-teal-300 border border-teal-500/30 flex items-center justify-center font-bold text-xs shrink-0">
               {user?.name ? user.name.charAt(0).toUpperCase() : 'U'}
             </div>
             <div className="flex-1 min-w-0">
@@ -643,7 +638,7 @@ export default function DashboardLayout() {
 
             {/* Quick Profile Chip */}
             <div className="flex items-center gap-2 pl-2 border-l border-[var(--color-border)]">
-              <div className="w-8 h-8 rounded-md bg-[#1E3A2E] text-teal-200 border border-teal-600/30 flex items-center justify-center font-bold text-xs shadow-xs">
+              <div className="w-8 h-8 rounded-md bg-[#0d5c63] text-teal-200 border border-teal-600/30 flex items-center justify-center font-bold text-xs shadow-xs">
                 {user?.name ? user.name.charAt(0).toUpperCase() : 'A'}
               </div>
             </div>
@@ -688,10 +683,9 @@ export default function DashboardLayout() {
             to="/dashboard"
             end
             className={({ isActive }) =>
-              `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                isActive
-                  ? 'text-teal-700 dark:text-teal-400 font-bold bg-teal-50/80 dark:bg-teal-950/50'
-                  : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+              `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                ? 'text-teal-700 dark:text-teal-400 font-bold bg-teal-50/80 dark:bg-teal-950/50'
+                : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
               }`
             }
           >
@@ -704,10 +698,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/pharmacy/pos"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -718,10 +711,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/pharmacy/batches"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -732,10 +724,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/pharmacy/compliance"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -748,10 +739,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/patients"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -762,10 +752,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/queue"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -776,10 +765,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/roster"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -792,10 +780,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/patients"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -806,10 +793,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/appointments"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -820,10 +806,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/queue"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >

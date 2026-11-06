@@ -404,7 +404,7 @@ export default function Patients() {
                         onClick={() => { setSearchQuery(r.name); setShowSearchDropdown(false); fetchPatients(r.name); }}
                         className="flex items-center gap-3 text-left flex-1 min-w-0"
                       >
-                        <div className="avatar avatar-sm flex-shrink-0 bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold text-[11px]">
+                        <div className="avatar avatar-sm flex-shrink-0 bg-[#0d5c63] text-teal-200 border border-teal-600/30 font-bold text-[11px]">
                           {getInitials(r.name)}
                         </div>
                         <div className="flex-1 min-w-0">
@@ -520,7 +520,7 @@ export default function Patients() {
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                         <div
-                          className="avatar avatar-sm bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold shadow-xs"
+                          className="avatar avatar-sm bg-[#0d5c63] text-teal-200 border border-teal-600/30 font-bold shadow-xs"
                         >
                           {getInitials(p.name)}
                         </div>
@@ -739,7 +739,7 @@ export default function Patients() {
                 className="card p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="avatar avatar-md flex-shrink-0 bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold">
+                  <div className="avatar avatar-md flex-shrink-0 bg-[#0d5c63] text-teal-200 border border-teal-600/30 font-bold">
                     {getInitials(match.name)}
                   </div>
                   <div className="min-w-0">
@@ -861,7 +861,7 @@ export default function Patients() {
             <div className="flex items-center justify-between p-4 rounded-lg" style={{ background: 'var(--color-surface-raised)', border: '1px solid var(--color-border)' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
                 <div
-                  className="avatar avatar-lg bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold shadow-xs"
+                  className="avatar avatar-lg bg-[#0d5c63] text-teal-200 border border-teal-600/30 font-bold shadow-xs"
                 >
                   {getInitials(viewingPatient.name)}
                 </div>
