@@ -15,6 +15,7 @@ namespace Hospital_CRM.Tests;
 public class ReportsControllerTests
 {
     private const string Month = "2026-06";
+    private static readonly Guid TenantId = Guid.NewGuid();
     private static readonly DateOnly MonthStart = new(2026, 6, 1);
     private static readonly DateTimeOffset InMonth = new(2026, 6, 15, 10, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset OutOfMonth = new(2026, 7, 5, 10, 0, 0, TimeSpan.Zero);
@@ -24,14 +25,18 @@ public class ReportsControllerTests
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private ReportsController CreateController(HospitalCrmDbContext db, Guid userId, Guid? clinicId = null)
     {
+        clinicId ??= Guid.NewGuid();
+        db.Clinics.Add(new Clinic { Id = clinicId.Value, TenantId = TenantId });
+        db.TenantMemberships.Add(new TenantMembership { UserId = userId, TenantId = TenantId, ClinicId = clinicId, Role = UserRole.ClinicAdmin });
         var user = new User
         {
             Id = userId,
+            TenantId = TenantId,
             Name = "Admin Test",
             Role = UserRole.ClinicAdmin,
             ClinicId = clinicId,
@@ -42,7 +47,9 @@ public class ReportsControllerTests
         db.SaveChanges();
 
         var controller = new ReportsController(db);
-        var identity = new ClaimsIdentity(new[] { new Claim("sub", userId.ToString()) }, "TestAuth");
+        var identity = new ClaimsIdentity(new[] {
+            new Claim("sub", userId.ToString()), new Claim("tenant_id", TenantId.ToString()),
+            new Claim("clinicId", clinicId.Value.ToString()), new Claim("role", "ClinicAdmin") }, "TestAuth");
         controller.ControllerContext = new ControllerContext
         {
             HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(identity) }
@@ -61,6 +68,7 @@ public class ReportsControllerTests
             var appointment = new Appointment
             {
                 Id = Guid.NewGuid(),
+                TenantId = TenantId,
                 DoctorId = Guid.NewGuid(),
                 PatientId = Guid.NewGuid(),
                 ClinicId = clinicId.Value,
@@ -76,6 +84,7 @@ public class ReportsControllerTests
         var invoice = new Invoice
         {
             Id = Guid.NewGuid(),
+            TenantId = TenantId,
             InvoiceNumber = Random.Shared.Next(1, 999999),
             AppointmentId = appointmentId,
             WalkInCustomerName = walkInName,
@@ -90,6 +99,7 @@ public class ReportsControllerTests
         var payment = new Payment
         {
             Id = Guid.NewGuid(),
+            TenantId = TenantId,
             InvoiceId = invoice.Id,
             Method = method,
             Amount = amount,
@@ -119,6 +129,7 @@ public class ReportsControllerTests
         db.Payments.Add(new Payment
         {
             Id = Guid.NewGuid(),
+            TenantId = TenantId,
             InvoiceId = invoiceA.Id,
             Method = PaymentMethod.Cash,
             Amount = 500m,
@@ -138,7 +149,7 @@ public class ReportsControllerTests
         db.LedgerExpenses.Add(new LedgerExpense
         {
             Id = Guid.NewGuid(),
-            TenantId = Guid.Empty,
+            TenantId = TenantId,
             Category = ExpenseCategory.Rent,
             CategoryOther = "",
             Amount = 300m,
@@ -149,7 +160,7 @@ public class ReportsControllerTests
         db.LedgerExpenses.Add(new LedgerExpense
         {
             Id = Guid.NewGuid(),
-            TenantId = Guid.Empty,
+            TenantId = TenantId,
             Category = ExpenseCategory.Rent,
             CategoryOther = "",
             Amount = 999m,
@@ -201,6 +212,7 @@ public class ReportsControllerTests
             db.Payments.Add(new Payment
             {
                 Id = Guid.NewGuid(),
+                TenantId = TenantId,
                 InvoiceId = invoice.Id,
                 Method = method,
                 Amount = amount,
@@ -225,19 +237,26 @@ public class ReportsControllerTests
     }
 
     [Fact]
-    public async Task PlatformHealth_CountsTenantsUsersConsultations()
+    public async Task PlatformHealth_CountsSelectedActiveMembersAndOwnedConsultations()
     {
         var db = CreateInMemoryDb();
         var userId = Guid.NewGuid();
         var clinicId = Guid.NewGuid();
         var controller = CreateController(db, userId, clinicId);
 
-        db.Users.Add(new User { Id = Guid.NewGuid(), Name = "Doc", Role = UserRole.Doctor, ClinicId = clinicId, Email = "d@x.ai", PasswordHash = "h" });
-        db.Users.Add(new User { Id = Guid.NewGuid(), Name = "Platform", Role = UserRole.PlatformAdmin, ClinicId = null, Email = "p@x.ai", PasswordHash = "h" });
+        var doctorId = Guid.NewGuid();
+        db.Users.Add(new User { Id = doctorId, TenantId = TenantId, Name = "Doc", Role = UserRole.Doctor, ClinicId = clinicId, Email = "d@x.ai", PasswordHash = "h" });
+        db.Users.Add(new User { Id = Guid.NewGuid(), TenantId = Guid.NewGuid(), Name = "Platform", Role = UserRole.PlatformAdmin, ClinicId = null, Email = "p@x.ai", PasswordHash = "h" });
+        db.TenantMemberships.AddRange(
+            new TenantMembership { UserId = doctorId, TenantId = TenantId, ClinicId = clinicId, Role = UserRole.Doctor },
+            new TenantMembership { UserId = Guid.NewGuid(), TenantId = TenantId, ClinicId = clinicId, Status = "suspended" },
+            new TenantMembership { UserId = Guid.NewGuid(), TenantId = TenantId, ClinicId = Guid.NewGuid() });
+        var (invoice, _) = await SeedPayment(db, clinicId, 1, PaymentMethod.Cash);
         db.Consultations.Add(new Consultation
         {
             Id = Guid.NewGuid(),
-            AppointmentId = Guid.NewGuid(),
+            TenantId = TenantId,
+            AppointmentId = invoice.AppointmentId!.Value,
             DoctorId = userId,
             ChiefComplaint = "c",
             Diagnosis = "d",
@@ -247,7 +266,8 @@ public class ReportsControllerTests
         db.Consultations.Add(new Consultation
         {
             Id = Guid.NewGuid(),
-            AppointmentId = Guid.NewGuid(),
+            TenantId = TenantId,
+            AppointmentId = invoice.AppointmentId!.Value,
             DoctorId = userId,
             ChiefComplaint = "c",
             Diagnosis = "d",
@@ -260,7 +280,7 @@ public class ReportsControllerTests
         var json = AsJson(Assert.IsType<OkObjectResult>(result).Value);
 
         Assert.Equal(1, json.GetProperty("activeTenants").GetInt32());
-        Assert.Equal(3, json.GetProperty("totalUsers").GetInt32());
+        Assert.Equal(2, json.GetProperty("totalUsers").GetInt32());
         Assert.Equal(1, json.GetProperty("monthlyConsultations").GetInt32());
         Assert.Equal("healthy", json.GetProperty("overallStatus").GetString());
     }
@@ -270,12 +290,12 @@ public class ReportsControllerTests
     {
         var db = CreateInMemoryDb();
         var userId = Guid.NewGuid();
-        var controller = CreateController(db, userId); // no clinic filter
+        var controller = CreateController(db, userId);
 
         db.TenantTaxProfiles.Add(new TenantTaxProfile
         {
             Id = Guid.NewGuid(),
-            TenantId = Guid.Empty,
+            TenantId = TenantId,
             IsGstRegistered = true,
             Gstin = "27AAAAA0000A1Z5",
             StateCode = "27",
@@ -321,6 +341,7 @@ public class ReportsControllerTests
         var draft = new Invoice
         {
             Id = Guid.NewGuid(),
+            TenantId = TenantId,
             InvoiceNumber = 0,
             WalkInCustomerName = "Draft",
             Subtotal = 100m,
@@ -335,7 +356,7 @@ public class ReportsControllerTests
         db.CreditNotes.Add(new CreditNote
         {
             Id = Guid.NewGuid(),
-            TenantId = Guid.Empty,
+            TenantId = TenantId,
             InvoiceId = taxable.Id,
             CreditNoteNumber = "CN-2026-27-000001",
             FinancialYear = "2026-27",
@@ -351,7 +372,7 @@ public class ReportsControllerTests
         db.CreditNotes.Add(new CreditNote
         {
             Id = Guid.NewGuid(),
-            TenantId = Guid.Empty,
+            TenantId = TenantId,
             InvoiceId = taxable.Id,
             CreditNoteNumber = "CN-2026-27-000002",
             FinancialYear = "2026-27",

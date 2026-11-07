@@ -24,7 +24,7 @@ public class Section5CreditNoteDualControlTests
         new(new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase($"Sec5CnDb_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(InMemoryEventId.TransactionIgnoredWarning))
-            .Options);
+            .Options, TestMaintenanceTenantContext.Instance);
 
     private static ClaimsPrincipal Principal(Guid userId, Guid tenantId) =>
         new(new ClaimsIdentity(new[]

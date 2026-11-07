@@ -1,0 +1,131 @@
+# Part 3 — integrated project completion and first-sale handoff
+
+**Authorized scope:** On 2026-11-07 the user clarified that Part 3 is the project-completion plan the agent is to create. It is not the Voice Agent roadmap or an expansion beyond the shipped Phase 1/2 requirements.
+
+**Status:** local implementation and current-source verification completed for queue-link D1; integrated acceptance remains open. Full Release now passes **1,209 / 0 failed / 70 skipped of 1,279**. Paid activation remains **NO-GO** pending the deployment runbook's Section 8 sign-offs and applicable clinic/finance/legal gates.
+
+Companions: [Part 1 checklist](SALE-READINESS-TODO-2026-11-06.md), [Part 2 plan](SALE-READINESS-PART-2-PLAN-2026-11-06.md), [deployment runbook](SALE-READINESS-DEPLOYMENT-RUNBOOK-2026-11-07.md).
+
+## Current-source verification — queue-link D1
+
+This completion checkpoint supersedes the current-status claims in the dated history below. Source remains uncommitted on `review/full-codebase-sale-readiness-2026-11-06`, base HEAD `954bec60e4c55043632f877d3dfd0ae94e2da824`. Evidence paths are relative to `C:/Users/derek/AppData/Local/Temp/opencode/`.
+
+Short `optin-01/`, `optin-02/` and final handoff filenames in this section are under `queue-expiry-20261107/`.
+
+| Scope / expected DONE criterion | Actual result / artifact | Disposition |
+|---|---|---|
+| Queue-link D1: bounded issuance, terminal shortening, revocation and private reads | Implemented in `Appointment`, appointment/finalization writers, public-token subscription middleware, queue controller and `QueueStatus.tsx`; nullable migration **56**, `20261107102726_QueueTrackingExpiry`, with no backfill | Local implementation done; deployment/installed-device acceptance open |
+| Focused backend contracts compile and pass | **79 passed / 1 opt-in skipped / 0 failed**, `queue-expiry-20261107/results/d1-focused-01.trx` | Focused evidence; overlaps other runs |
+| Final-current complete Release, exact failures/skips and stable inputs | **1,209 passed / 0 failed / 70 NotExecuted / 1,279 total**; `hospital-crm-sale-audit-2026-11-06/part3-tests/part3-completion-suite-queue01.trx`; restore/test exit 0, **463 inputs unchanged** | Ordinary suite done; skips are not passes or production proof |
+| Formatting stable on the same backend/config snapshot | `part3-completion-format-queue01-*` in the audit directory: apply/verify exit 0, **zero changed files**, 463 inputs | Done locally |
+| Migrated public/isolation contracts on restricted runtime | **18/18**, zero skips/failures: 12 isolation and six public lifecycle tests, PG16.15 / all **56 migrations** / `app_user`; `queue-expiry-20261107/results/d1-pg-01.trx` | Current HTTP/SQL evidence; not complete M01–M24 acceptance |
+| Runtime grants and protected history | `queue-expiry-20261107/runtime-role-01.log`: current script exited 0 **as app_user**; M24 tests all 18 protected tables, UPDATE/DELETE/TRUNCATE denial (`42501`), script-list alignment and permitted column updates | Done on disposable target; production repetition remains required |
+| Queue UI build, lint and bounded polling | Production build passed, **46 precache entries**; **8/8 intercepted Chromium** contracts on preview 5179; lint exit 0, **59 warnings / 0 errors**. `queue-expiry-20261107/browser-01.json`, `frontend-lint-01.log` | Pending-request expiry/late response, terminal privacy, stale clearing and phone width proved; SW blocked, installed PWA unproved |
+| Financial and identity/provisioning opt-ins on current source | `queue-expiry-20261107/optin-01/results/`: financial **13/13**, identity/provisioning **30/30**, PG16.15 model-created schemas/selected policies | Done at fixture scope; not full-migration or real-provider evidence |
+| Shared boundary fixtures and files/jobs | Fresh `queue-expiry-20261107/optin-02/results/`: boundary **101/101**, files/jobs **8/8**, zero skips/failures; fresh Release build exit 0, **465 inputs unchanged**. Boundary includes `QueueStatus_ExposesOnlyZeroPhi_AndAccuratePosition`; model-created schemas with selected policies, files/jobs owner/model-created scope | Fixture-scope verification done; full production matrix remains open |
+| Current migrated clinic HTTP journey | `optin-02/results/journey.trx`: **1/1 business test**, **25 HTTP responses**, all **56 migrations** / PG16.15 / `app_user`; original clinical notes preserved, four fresh-host replays, five postings/ten entries reconcile **INR 1,300 debit = credit**; `optin-02/journey-records.json` | Current narrow journey done; synthetic JWT/captured jobs, fresh hosts within one process; historical five guards are not five additional tests in this filter |
+| Current migrated identity HTTP journey | `optin-02/results/identity-journey.trx`: **1/1**, **35 HTTP responses**, all **56 migrations** / PG16.15 / `app_user`; provision/accept/select/reset/revoke and fresh-host protected-receipt replay without repeated mail; `optin-02/identity-journey-records.json` | Local journey done; captured email/manual dispatch and retained on-disk DP ring, not real SMTP/OIDC or replacement-machine recovery |
+| Dependency evidence reconciled to current project inputs | `part3-completion-dependencies/HANDOFF.md`: API **112** / tests **132** resolved package nodes, no reported NuGet advisories. Original audit/assets/inventories/feed hashes and five current project inputs per graph verified; retrospective **717-file** `evidence-manifest.json` / `seal.json` added | Audit evidence sealed, not runnable-distribution certification; frontend four moderate/two low remain open |
+
+**Queue-link decision:** 24 hours from actual check-in, capped at two hours after Completed/Cancelled/NoShow. Replays, date/timezone/midnight and routine edits never renew it. Reschedule revokes the prior token/deadline; legitimate new check-in reissues. Missing-expiry legacy tokens fail closed without backfill. Invalid/unknown/missing-expiry/expired links produce the same generic 404 before owner-subscription disclosure; valid links use the token owner's tenant and `no-store`. Terminal payloads have exactly `status` and `expiresInSeconds`; browser expiry uses server remaining time. This is completion **queue-link D1**, distinct from Part 2's commercial tenant-versus-clinic D1.
+
+**Connected review:** traced every queue token/deadline writer, check-in replay, reschedule, appointment transitions and clinical finalization; reviewed routing/middleware/controller ordering, migration/snapshot and fixtures, client cancellation/serial polling and the eight browser contracts. No additional queue-link defect was identified at ordinary clinic concurrency. Frozen migration role creation assumes serialized cluster-role provisioning; the retry setup preserves all fixture safety/permission guards. Whole-database outage still has an unresolved middleware **500 versus search-specific 503** acceptance question. Linux/CI, live full-flow medicine search → Substitutes, installed PWA and complete isolation/recovery remain open.
+
+**Retained boundary failure:** `optin-01/results/boundary.trx` remains **37 passed / 64 failed of 101**; all 64 records are fixture-initialization SQLSTATE `23505`, `pg_authid_rolname_index`, at `Part2TenantBoundaryPostgresTests.cs:353`. Seven databases on one cluster raced to create the cluster-wide role. `optin-02` provisioned `public_token_router NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` once, checked every flag and zero memberships before fixtures, then passed all 101. This is a setup correction in `run-optin-02.py`, not an application defect fix or a rewrite of the frozen migration. Fresh multi-database provisioning must serialize that cluster-role step; see deployment runbook §3.6.
+
+**Retention:** exact identities and zero other clients were checked before stopping owned public/isolation clusters **55450/55451**; absent PID files/free ports and clean control state were recorded, with data retained. `optin-01` financial/identity/boundary clusters also stopped cleanly. Its post-abort reconciliation matches all **465** backend/test/script inputs; this is explicitly a later observation, not an invented runner-finally snapshot. Superseded driver/failed attempts, historical source freezes, missing-file observations and synthetic databases remain retained. Earlier identity-distribution missing EF/Npgsql DLLs and recurring runtime/data-file loss remain historical integrity limitations; a package-audit seal does not repair them.
+
+`optin-02` boundary, clinic, identity and files/jobs clusters also stopped cleanly after exact identity/zero-other-client checks, with shutdown/control logs retained. `final-ports-observed.json` records **55439/55441/55443/55448/55449/56549/55450/55451/5179 free**. Retained clinic data is `part3-journey-pg-queue02`; identity data is `part3-completion-identity/pg-queue02/data`. Never reuse retained targets for fresh destructive verification. The **463** full-suite selected source/config inputs and **465** opt-in backend/test/script inputs are different inventories, both unchanged; no executable source changed after the passing full-suite snapshot.
+
+**Final handoff:** `queue-expiry-20261107/HANDOFF.md`, `final-verification.json`, `evidence-manifest.json` and `seal.json` record source equality, document/count checks, artifact hashes and the retrospective sealing boundary. The dependency sub-seal is dated **2026-11-07T10:52:09.035621+00:00**, manifest SHA-256 `E42B77DAABE6FBD7A7C1E076B4CBA18BA485FD72758DABAF852AA9983C6752C8`. Copy the retained evidence to approved durable storage before Temp cleanup; sealing is neither backup/recovery nor runnable-distribution certification.
+
+**Acceptance accounting:** preserve **374 entries, 141/342 checked, 233 open; 105 I / 36 F / 136 P / 93 X / 4 D**, with isolation **20 P / 4 X**. These additional local results update evidence, not complete production acceptance. Accounting/no-visit decisions remain unresolved; affected accounting outputs stay withheld and no-visit notifications disabled. The exact reload/retry messages and stable clinical/financial/Sync/outbox identities are preserved.
+
+## Restart-safe integration checkpoint (historical)
+
+Work resumed after the server restart on 2026-11-07, preserving the uncommitted feature branch and prior artifacts.
+
+- Current refund/PDF Release scope: **44 passed, 0 failed, 0 skipped**, normal compilation with isolated outputs; `part3-tests/part3-refund-evidence-resumed.trx` under the audit evidence directory. The remaining test setup failure was an explicitly tracked new invoice line, not a relaxed stock/refund assertion.
+- Financial PostgreSQL proof now passes **13 distinct tests**: **12/12** combined followed by **3/3** targeted (two overlap). It covers concurrent receipt/finalization, true SQL rollback of refunds/stock/register/journals and PDF logs, replay, and propagation of unrelated permission errors. Earlier **6/12** is superseded. This is PostgreSQL **15.1** model-created-schema evidence, not production-version/migration acceptance.
+- Deployment handoff recovered: `part3-deployment-handoff.json` records 44 compiled startup, 18 adapter/readiness and 11 static checks; isolated frontend build passed, lint had 0 errors/51 warnings. Later concurrent edits still require integrated verification.
+- Clinical scope is frozen at **137/137 backend and 17/17 intercepted browser**; legacy routing at **50/50** changed-scope (overlapping earlier **135/135**). Identity final focused scope is **81/81**, including **20 PostgreSQL** cases (18 deterministic blocking interleavings plus two anonymous/RLS cases); received-link browser contracts are **10/10**. These scopes overlap other evidence and are not additive suite totals.
+- Stable Npgsql EF provider **10.0.3** replaces preview.7, bringing Npgsql to **10.0.3** while preserving EF **10.0.11**. **14/14** captured-array translation/runtime cases passed, dependency graphs report no advisories, and model/snapshot drift was absent. Obsolete package-warning suppression and the false binary-compatibility comment are removed. Startup no longer suppresses pending-model warnings.
+- The complete baseline plus `20261107053728_SaleReadinessIntegration` was applied to isolated **55445**. Actual `app_user` notification checks passed absent/empty/foreign tenant denial, composite FK, unique intent, immutable payload and permitted handoff. Both review scripts passed **14 control queries with zero findings** and **41/41 expected anomaly identities/groups** in a separate disposable database; seven duplicate indexes were deliberately removed only there after intact-index controls. Runtime assertion writes rolled back; synthetic fixture databases remain preserved.
+- Historical full Release: **1,032 passed, 4 failed, 43 skipped, 1,079 total**. Connected medicine/pharmacy fixtures and isolated-output source lookup were corrected. Replacement normal full Release: **1,173 passed, zero failed, 51 skipped, 1,224 total**, all **428 source/config hashes unchanged** (`part3-tests/part3-integrated-frozen.*`). A later actual-HTTP constructor fix still needs final-source verification. Report/source scope is **16/16**, including actual sanitized HTTP 500 for an unavailable database and preserved invalid-input 400.
+- Later frozen handoffs: medicine/Sync **52/52 backend**, **4/4 medicine + 14/14 pharmacy browser**; Patients/Billing **50/50 affected browser**; JWT overlap **115/115 connected including 31 overlap checks**; provisioning backend **47 focused + 10 PostgreSQL**; shared session/outbox **133/133 plus 11/11 page integration**. These are overlapping focused results, not one suite total. Shared frontend TypeScript/direct Vite/PWA passes; lint **57 warnings, zero errors**.
+- Later freezes: provisioning UI **23/23** browser; nursing/roster/proxy **79/79**, including **23 PG16.15 cases**, one real HTTP case, 42 actions/44 route-method combinations. Nursing model-created schema/partial roster RLS and concurrent-revocation limits remain explicit. Payee/payment scope is **103 passed / 1 opt-in PostgreSQL skipped**. Provisioning on all 55 migrations passed **63 actual controller/app_user/interceptor assertions**, including identical replay without a second fake mail and outcome-only receipt UPDATE; direct-controller/ephemeral-DP limitations apply.
+- Final frontend verification: normal isolated TypeScript/Vite/PWA build passed, **46 precache entries**; lint **59 warnings, zero errors**. Combined intercepted Chromium contracts **287/287, zero failures/skips/retries, 8.9 minutes**. All 157 application/config/assets and 15 test/support hashes remained matched; nine test files have reversible origin-only adaptation to 5187. The managed server stopped and zero listeners were verified. Installed-PWA/live-provider acceptance remains open. First failed copied-layout attempts are retained.
+- Current frontend audit remains **4 moderate, 2 low, 0 high/critical**; isolated `npm ci` installed **395 packages**. Final API graph including transitives has no reported advisories. Temporary provisioning harness NU1903 belongs to that harness's inherited Newtonsoft 11.0.1 graph, not the separately audited API graph.
+- Schema generation uses an explicit non-connectable design-time connection. The duplicate hard-coded design factory was removed in favor of the existing owner-aware `HospitalCrmDbContextFactory`; no clinic database update was requested.
+- Additive **20261107061139_TenantProvisioningReplayReceipt** is generated separately from frozen 053728. Its RLS permits only platform-admin context; runtime can insert/read and update `ProtectedResponse`, but cannot change replay identity/hash or delete history. Updated grant/verification scripts retain these restrictions. All **55 migrations** applied to fresh `part3_final_schema_20261107` on verified PostgreSQL **16.15**, loopback **55446**; actual `app_user` grant/RLS/immutable-boundary/uniqueness/outcome-update assertions pass with fixture writes rolled back. EF reports **no pending model changes**. Inputs and proof: `part3-schema-complete.sql`, `part3-schema-provisioning.sql`, `part3-final-schema-chain.log`, `part3-provisioning-migrated-proof.sql/.log` under Temp/opencode.
+- Supported-version base evidence: official EDB PostgreSQL 16.15 archive/vendor SHA-256 verified; **54-migration** base, routing/notification controls and **14/14** captured-array checks passed. All 80 tables/1,004 columns/198 constraints/292 indexes structurally match the pre-receipt comparison; **114 inherited migration defaults absent from the snapshot** remain traced. Parent **55446 stopped at 06:43:04 UTC**, after exact identity/55-migration verification and zero other clients; zero listeners/absent PID file confirmed. Data retained; `part2-pg16-verification-20261107/parent-final-retention-state.json`.
+- Recovery is partial: **29 assertions** prove fresh-process lab/secret/JWT recovery and entrypoint storage guards; eight copied files retain hashes. Local file recovery/verification took **5.384 seconds**, not deployment RTO. Restricted ACLs are verified but encryption cannot be verified, so full DB/Hangfire backup/restore was not attempted. Recovery never started 55447; nursing subsequently started and stopped its separately owned 55447 fixture. Evidence: `p3-03-recovery-ca6a30bcc7ce/RECOVERY-EVIDENCE.md`.
+- Historical `part3-integrated-current.log` stopped at three nursing fixture compile errors and executed zero tests; nursing and the 1,173-pass complete run supersede that blocker, without erasing the attempt.
+- Historical scripts now contain **26 finding queries** (five preflight/21 historical), with staged anomaly/control proof retained. Both complete current scripts execute successfully on final 55-migration PG16.15; zero findings on minimal data establish schema compatibility only.
+- Completed journey boundary: **6/6 passed**, including five guards and the complete Kestrel/app_user/55-migration PG16.15 journey; **25 HTTP responses** match. Registration/consent/triage, sign/amend with original preserved, billing/report, pharmacy sale/return and four fresh-host replays pass. Five postings/10 ledger entries balance **INR 1,300 debit = credit**; the earlier per-reference grouping failure was an incorrect harness assumption, adjudicated with exact pair/readback assertions. Constructor annotation and shared `EF.Constant(ids).Contains` are frozen. Run 10 restored current EF10.0.11/Npgsql10.0.3 assets; earlier mixed cached assets limit translation-failure attribution. **55448 stopped at 06:59:42 UTC**, exact identity/no other clients/free ports verified; eight databases retained. Final handoff: `part3-journey-evidence/FINAL-HANDOFF.md`. Initial formatting verification found **1,370 WHITESPACE-only diagnostics**; parent final formatting/full-source verification is pending the additional completion work.
+- Completed frontend follow-up: **19/19 strengthened identity contracts**, same test count, cover both inviters' absent/rejected/delayed acknowledged copy and paired known/unknown reset UI. Clean install/build/lint and175 copied-source hashes pass;5187 free before/after. Package files unchanged; six low/moderate findings have no compatible automatic fix. Handoff: `part3-completion-frontend/HANDOFF.md`.
+- The [full audit](SALE-READINESS-FULL-AUDIT-2026-11-07.md) and [374-entry ledger](SALE-READINESS-ACCEPTANCE-LEDGER-2026-11-07.md) now record **141/342 checked and233 open** (105 implemented/36 focused-proved/136 integration pending/93 external/4 disabled), after promoting P1-C103 and P2-C130. Original requirements remain unchanged. PDF/identity/isolation completion owners are active; parent owns formatting/final suite and final reconciliation.
+
+This checkpoint records progress only; the release checkboxes below close against their complete acceptance criteria.
+
+## Confirmed operating policy
+
+- Offline registration/billing is for clinic-managed, individually authenticated, encrypted devices. Device enforcement, retention duration, key recovery and authorized legacy recovery still require documented rollout ownership.
+- The user confirmed **accountant approval still pending** for monthly GST/reporting basis during this completion pass. Allocation, rounding/remainder and statutory discount/refund treatment remain unapproved.
+- First-clinic prescription PDF languages are **English/Latin-script names and Hindi/Devanagari only**, explicitly selected by the user. Other languages are future scope; proper shaping and embedded-font proof are required for Hindi.
+- PDF owner is now frozen: **87/87 focused tests**,13 source hashes,11 rendered pages with embedded-font/text-map/QR checks. Three Noto fonts and HarfBuzz shape the selected languages. Parent added `libfontconfig1` to runtime Docker/CI and removed stale Docker COPY of deleted warning-suppression props. Linux execution/physical printing/clinic sample approval remain open; see `part3-completion-pdf/HANDOFF.md`.
+- Preserve unowned legacy browser drafts/queues; do not hydrate them into the current user's chart, assign ownership, or delete them automatically.
+- Retain the existing stack and module boundaries. No clinical offline cache, new identity stack, broker or tenancy tier.
+
+## P3-01 — finish connected application contracts
+
+- [x] Complete pharmacy frozen retry, receipt evidence, partial supply and authenticated PDF browser checks.
+- [x] Integrate patient durable registration replay with header middleware, sync post-commit indexing and tenant-scoped uniqueness.
+- [x] Bind API JWT issuance and refresh to the same durable `session_id` family required by OIDC.
+- [x] Integrate selected-context changes with existing fixtures; preserve substantive denial/concurrency assertions.
+- [x] Integrate session-generation changes into dashboard/outbox, branding and identity callers; handle truthful invitation/reset statuses.
+- [x] Generate invoice/credit-note PDFs before print logging; scope authorization and report unsupported encoding honestly.
+- [x] Complete refunds' saved processing/failure evidence, approval/stock/replay/rollback regressions.
+- [ ] Correct remaining ledger approved-note and local-period reporting consumers, using authoritative accounting semantics only.
+
+**Proof:** targeted regressions followed by the integrated Release suite and intercepted browser contracts. HTTP status alone does not prove saved identity, payment, refund or supply.
+
+## P3-02 — deployable isolation, storage and background integration
+
+- [x] Add/review additive migrations for replay/payment/dispense lineage and scoped uniqueness; produce read-only duplicate preflights before applying constraints.
+- [x] Install restricted public-token routing SQL and replace the permissive anonymous precheck policy. Preserve nonunique verification codes across amendments.
+- [x] Integrate explicit startup/CLI maintenance context and fail-closed missing tenant context.
+- [x] Bind signed business/subscription webhook work to explicit tenant scope; replace blanket order-routing bypass.
+- [x] Remove public lab static serving; register encrypted private storage, scoped notifications and provider transport.
+- [x] Make booking notification intent recoverable with protected precheck material; no post-commit fire-and-forget DbContext work.
+- [x] Integrate private lab file download callers.
+- [ ] Implement managed-device, tenant/user/clinic-owned IndexedDB outbox and per-item acknowledgement; retain rejected/unknown work and legacy bytes.
+
+**Proof:** isolated PostgreSQL/app_user/RLS, pool/open-connection, transaction/constraint/replay tests; owned browser queue tests; no live clinic mutations.
+
+## P3-03 — production startup and recovery integration
+
+- [ ] Apply the runbook's configured signing adapter, protected persistent Data Protection keys, production OIDC certificates/HTTPS/client maintenance and effective-role readiness checks.
+- [x] Keep unsafe reconciliation disabled and Hangfire restricted; prepare schema with owner credentials outside runtime.
+- [x] Wire safe browser target guards and run-created-ID cleanup into existing E2E configuration.
+- [x] Install the compatible reviewed lockfile and rerun build/PWA/browser checks and dependency audits.
+- [ ] Rehearse complete database/uploads/key/Hangfire restoration and revalidate grants/RLS using a disposable target.
+- [ ] Record actual RPO/RTO and named monitoring/incident/release owners.
+
+**Proof:** startup failure cases, clean deployment and actual restore artifacts. Mocked script checks do not substitute for a recovery drill; Docker availability and authorized deployment inputs may block this proof.
+
+## P3-04 — final evidence and audit handoff
+
+- [x] Reconcile every checklist against actual current-source outcomes; record HEAD and uncommitted scope.
+- [x] Full Release backend build/tests with counts, failures and skips recorded.
+- [x] Frontend TypeScript/production/PWA build, lint and safe intercepted contracts.
+- [x] Disposable clinic journey through registration/consent, appointment, triage, sign/amend, invoice, confirmed collection and reports; pharmacy supply/return when offered.
+- [ ] Read-only historical reconciliation queries with clinician/pharmacist/accountant reviewers; no automatic history rewriting.
+- [ ] Connected-code review and corrections; no unresolved passing-test claims based on excluded compile files or stale binaries.
+- [x] Publish the full audit: what changed, why, files, evidence, known limitations, unresolved policy/provider/deployment gates and exact before-sale actions.
+
+## External acceptance that code cannot complete
+
+Approved production origins/SMTP/merchant/channel configuration; authorized mailbox and provider delivery/payment evidence; contracted physical Android/device acceptance; no-visit clinical policy; accountant GST/discount/refund treatment; pharmacy credentials/licensing; legacy recovery/retention approval; MSA/DPA/SLA and support policy; clinic training/UAT; signed operational ownership and release approval.
+
+**Current paid-activation verdict: NO-GO** until the applicable integration, engineering, clinic, finance and legal gates are evidenced. This verdict must be updated from final evidence, not the number of implemented patches.

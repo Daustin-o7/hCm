@@ -1,4 +1,5 @@
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Infrastructure.Data;
@@ -32,6 +33,33 @@ public class SubscriptionEnforcementMiddleware
 
     public async Task InvokeAsync(HttpContext context, HospitalCrmDbContext db)
     {
+        // A public bearer link belongs to its resolved tenant, never the ambient staff session.
+        var publicEndpoint = context.GetEndpoint()?.Metadata.GetMetadata<PublicTokenEndpointAttribute>();
+        if (publicEndpoint is not null)
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            var token = context.Request.RouteValues[publicEndpoint.RouteParameter]?.ToString() ?? string.Empty;
+            var binding = await PublicTokenRouting.ResolveAsync(db, publicEndpoint.Purpose, token, context.RequestAborted);
+            if (binding is null)
+            {
+                // The endpoint owns its existing malformed/unknown-token response.
+                await _next(context);
+                return;
+            }
+            using var tenantScope = context.RequestServices.GetRequiredService<ITenantContext>().PushTenant(binding.TenantId);
+            // Expired queue links must not reveal their former owner's subscription state.
+            if (publicEndpoint.Purpose == PublicTokenPurpose.Queue && !await db.Appointments.AnyAsync(a =>
+                    a.Id == binding.ResourceId && a.TenantId == binding.TenantId && a.QueueTrackingToken == token &&
+                    a.QueueToken != null && a.QueueTrackingExpiresAt > DateTimeOffset.UtcNow, context.RequestAborted))
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                await context.Response.WriteAsJsonAsync(new { error = "token_not_found" });
+                return;
+            }
+            await EnforceTenantAsync(context, db, binding.TenantId);
+            return;
+        }
+
         var user = context.User;
 
         // Unauthenticated requests pass to authentication handler
@@ -64,9 +92,17 @@ public class SubscriptionEnforcementMiddleware
             return;
         }
 
+        await EnforceTenantAsync(context, db, tenantId.Value);
+    }
+
+    private async Task EnforceTenantAsync(HttpContext context, HospitalCrmDbContext db, Guid tenantId)
+    {
+        var endpoint = context.GetEndpoint();
+        var path = endpoint?.Metadata.GetMetadata<PublicTokenEndpointAttribute>() is not null
+            ? endpoint.DisplayName : context.Request.Path.Value;
         // Single indexed lookup per request
         var tenant = await db.Tenants.AsNoTracking()
-            .Where(t => t.Id == tenantId.Value)
+            .Where(t => t.Id == tenantId)
             .Select(t => new { t.SubscriptionStatus, t.SubscriptionEndsAt })
             .FirstOrDefaultAsync(context.RequestAborted);
 
@@ -89,7 +125,7 @@ public class SubscriptionEnforcementMiddleware
         if (effectiveAccess == EffectiveAccessLevel.Blocked)
         {
             _logger.LogWarning("Request blocked for suspended tenant {TenantId} on {Method} {Path}",
-                tenantId.Value, context.Request.Method, path);
+                tenantId, context.Request.Method, path);
 
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             await context.Response.WriteAsJsonAsync(new
@@ -110,7 +146,7 @@ public class SubscriptionEnforcementMiddleware
             if (!isSafeMethod)
             {
                 _logger.LogWarning("Mutation rejected for read-only tenant {TenantId}: {Method} {Path}",
-                    tenantId.Value, method, path);
+                    tenantId, method, path);
 
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 await context.Response.WriteAsJsonAsync(new

@@ -1,8 +1,11 @@
+using System.ComponentModel.DataAnnotations;
+using Hangfire;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
@@ -15,47 +18,40 @@ public class PasswordResetController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
     private readonly ILogger<PasswordResetController> _logger;
+    private readonly IBackgroundJobClient? _jobs;
+    private readonly IDataProtectionProvider? _protection;
 
-    public PasswordResetController(HospitalCrmDbContext db, ILogger<PasswordResetController> logger)
+    public PasswordResetController(HospitalCrmDbContext db, ILogger<PasswordResetController> logger,
+        IBackgroundJobClient? jobs = null, IDataProtectionProvider? protection = null)
     {
         _db = db;
         _logger = logger;
+        _jobs = jobs;
+        _protection = protection;
     }
 
     [HttpPost("request-password-reset")]
     [AllowAnonymous]
     [EnableRateLimiting("auth")]
-    public async Task<IActionResult> RequestReset([FromBody] RequestResetRequest request, CancellationToken ct)
+    public Task<IActionResult> RequestReset([FromBody] RequestResetRequest request, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.Email))
-            return BadRequest(new { error = "email_required" });
+        if (string.IsNullOrWhiteSpace(request.Email) || request.Email.Length > 254
+            || !new EmailAddressAttribute().IsValid(request.Email))
+            return Task.FromResult<IActionResult>(BadRequest(new { error = "valid_email_required" }));
 
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == request.Email, ct);
-
-        // Always return 200 OK to prevent user enumeration attacks
-        if (user is null)
-            return Ok(new { message = "If the email exists, a reset token has been issued." });
-
-        var rawToken = Guid.NewGuid().ToString("N");
-        var tokenHash = rawToken.HashToken();
-
-        var resetToken = new PasswordResetToken
+        var requestId = Guid.NewGuid();
+        // Identical work for known/unknown addresses; neither lookup nor SMTP runs on this request.
+        try
         {
-            Id = Guid.NewGuid(),
-            UserId = user.Id,
-            TokenHash = tokenHash,
-            ExpiresAt = DateTimeOffset.UtcNow.AddHours(1)
-        };
-
-        _db.PasswordResetTokens.Add(resetToken);
-        await _db.SaveChangesAsync(ct);
-
-        // SEC-001: NEVER return the raw token in the response body.
-        // In production, send via email/SMS. In dev, log to console for testing.
-        _logger.LogInformation("Password reset requested for user {UserId}", user.Id);
-        _logger.LogDebug("DEV ONLY — reset token for {UserId}: {Token}", user.Id, rawToken);
-
-        return Ok(new { message = "If the email exists, a reset token has been issued." });
+            if (_jobs is null || _protection is null) throw new InvalidOperationException();
+            var payload = PasswordResetEmailJob.ProtectRequest(_protection, request.Email.Trim());
+            _jobs.Enqueue<PasswordResetEmailJob>(job => job.SendAsync(requestId, payload, CancellationToken.None));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError("Reset request {RequestId} could not be queued: {FailureType}", requestId, ex.GetType().Name);
+        }
+        return Task.FromResult<IActionResult>(Ok(new { message = "If the email is registered, you will receive password reset instructions." }));
     }
 
     [HttpPost("confirm-password-reset")]
@@ -65,6 +61,8 @@ public class PasswordResetController : ControllerBase
     {
         if (string.IsNullOrWhiteSpace(request.ResetToken) || string.IsNullOrWhiteSpace(request.NewPassword))
             return BadRequest(new { error = "token_and_password_required" });
+        if (request.NewPassword.Length < 8 || request.NewPassword.Length > 72 || request.ResetToken.Length > 512)
+            return BadRequest(new { error = "invalid_token_or_password_length" });
 
         // Digest lookup: one indexed read instead of hashing every live token.
         var tokenHash = request.ResetToken.HashToken();
@@ -75,12 +73,33 @@ public class PasswordResetController : ControllerBase
         if (tokenRecord is null)
             return BadRequest(new { error = "invalid_or_expired_token" });
 
+        try
+        {
+            return await SessionMutation.RunAsync(_db, tokenRecord.UserId, () => ConfirmResetLockedAsync(tokenRecord, request, ct), ct);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return Conflict(new { error = "password_changed_concurrently" });
+        }
+    }
+
+    private async Task<IActionResult> ConfirmResetLockedAsync(PasswordResetToken tokenRecord, ConfirmResetRequest request, CancellationToken ct)
+    {
+        if (_db.Database.IsRelational()) await _db.Entry(tokenRecord).ReloadAsync(ct);
+        if (tokenRecord.UsedAt is not null || tokenRecord.ExpiresAt <= DateTimeOffset.UtcNow)
+            return BadRequest(new { error = "invalid_or_expired_token" });
         var user = await _db.Users.FindAsync([tokenRecord.UserId], ct);
         if (user is null)
             return BadRequest(new { error = "user_not_found" });
 
         var now = DateTimeOffset.UtcNow;
+        if (_db.Database.IsRelational() && await _db.PasswordResetTokens
+            .Where(t => t.Id == tokenRecord.Id && t.UsedAt == null && t.ExpiresAt > now)
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.UsedAt, now), ct) != 1)
+            return BadRequest(new { error = "invalid_or_expired_token" });
+
         user.PasswordHash = request.NewPassword.HashPassword();
+        user.MustChangePassword = false;
         user.UpdatedAt = now;
         tokenRecord.UsedAt = now;
 
@@ -107,5 +126,6 @@ public class PasswordResetController : ControllerBase
     }
 }
 
-public record RequestResetRequest(string Email);
-public record ConfirmResetRequest(string ResetToken, string NewPassword);
+public record RequestResetRequest([Required, EmailAddress, StringLength(254)] string Email);
+public record ConfirmResetRequest([Required, StringLength(512)] string ResetToken,
+    [Required, MinLength(8), MaxLength(72)] string NewPassword);

@@ -1,7 +1,8 @@
-import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
+import { isAxiosError, isCancel } from 'axios'
 import { useNavigate } from 'react-router-dom'
-import api, { setAccessToken, getAccessToken, clearTokens, refreshSession } from '../services/api'
-import { clearOutbox } from '../services/offlineOutbox'
+import api, { setAccessToken, getAccessToken, clearTokens, refreshSession, refreshClient,
+  beginSessionTransition, getSessionGeneration, assertSessionGeneration, setSessionRefreshEnabled, setRefreshedAccessToken, isSessionActive } from '../services/api'
 import { userManager, isEntraConfigured } from '../services/oidc'
 
 interface User {
@@ -27,8 +28,6 @@ export interface ImpersonationSession {
   expiresAt: number
   startedAt: string
   reason: string
-  // Stored so a reload keeps operating as the impersonated user, not the admin.
-  accessToken: string
 }
 
 export interface LoginResult {
@@ -73,6 +72,7 @@ function accountFlagsFrom(token: string | null) {
 }
 
 export interface AuthContextType {
+  sessionGeneration: number
   user: User | null
   loading: boolean
   memberships: TenantMembership[]
@@ -108,6 +108,46 @@ export interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
+const restoreKey = 'samstack_session_restore'
+const sessionSignalKey = 'samstack_session_signal'
+
+function setRestorePermission(allowed: boolean): boolean {
+  let written = false
+  for (const name of ['localStorage', 'sessionStorage'] as const) {
+    try {
+      window[name].setItem(restoreKey, allowed ? 'allowed' : 'reauth')
+      written = true
+    } catch { /* Storage is optional for an in-memory login. */ }
+  }
+  return written
+}
+
+function canRestoreSession(): boolean {
+  let allowed = true
+  for (const name of ['localStorage', 'sessionStorage'] as const) {
+    try {
+      const store = window[name]
+      const marker = store.getItem(restoreKey)
+      if (marker !== null && marker !== 'allowed') allowed = false
+      // Cookie restore needs a writable deny marker for a later logout or support session.
+      store.setItem(restoreKey, marker ?? 'allowed')
+      const keys = Array.from({ length: store.length }, (_, i) => store.key(i))
+      for (const key of keys) {
+        if (key === 'samstack_admin_backup' || key === 'samstack_impersonation' || key?.startsWith('oidc.user:')) {
+          // Legacy bearers are never session authority, even when their JSON is valid.
+          allowed = false
+          // Keep the deny evidence if storage cannot persist its non-bearer replacement.
+          if (!setRestorePermission(false)) continue
+          store.removeItem(key)
+        }
+      }
+    } catch {
+      allowed = false
+    }
+  }
+  return allowed
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
@@ -116,18 +156,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [currentClinicId, setCurrentClinicId] = useState<string | null>(null)
   const [accountFlags, setAccountFlags] = useState({ mustChangePassword: false, mfaEnrolmentRequired: false })
   const [mfaRequiredForRole, setMfaRequiredForRole] = useState(false)
-  const [impersonation, setImpersonation] = useState<ImpersonationSession | null>(() => {
-    try {
-      const raw = sessionStorage.getItem('samstack_impersonation')
-      if (raw) {
-        const parsed = JSON.parse(raw) as ImpersonationSession
-        if (parsed.expiresAt > Date.now()) return parsed
-      }
-    } catch {
-      // ignore
-    }
-    return null
-  })
+  const [impersonation, setImpersonation] = useState<ImpersonationSession | null>(null)
+  const [sessionGeneration, setSessionGeneration] = useState(getSessionGeneration)
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const adminBackup = useRef<(SessionPayload & { oidc: boolean }) | null>(null)
+  const signoutInFlight = useRef<Promise<unknown> | null>(null)
+  const sessionChannel = useRef<BroadcastChannel | null>(null)
+  const oidcSession = useRef(false)
   const navigate = useNavigate()
 
   const hasRole = useCallback((roles: string[]) => {
@@ -136,91 +171,148 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return roles.some(r => r.toLowerCase() === user.role.toLowerCase())
   }, [user])
 
-  const logout = useCallback(async () => {
-    try {
-      await api.post('/auth/logout', {})
-    } catch {
-      // Non-blocking logout call
-    }
+  const resetLocalSession = useCallback(() => {
+    if (refreshTimer.current) clearTimeout(refreshTimer.current)
     clearTokens()
+    setSessionGeneration(getSessionGeneration())
     setUser(null)
     setMemberships([])
     setCurrentTenantId(null)
     setCurrentClinicId(null)
     setAccountFlags({ mustChangePassword: false, mfaEnrolmentRequired: false })
     setMfaRequiredForRole(false)
-    // Unsaved consultation drafts hold patient data; never leave them on a shared device.
-    Object.keys(localStorage)
-      .filter(k => k.startsWith('hospital_crm_draft_'))
-      .forEach(k => localStorage.removeItem(k))
-    // Queued invoices carry patient names too.
-    clearOutbox()
-    sessionStorage.removeItem('samstack_impersonation')
-    sessionStorage.removeItem('samstack_admin_backup')
+    // Outbox and unknown-owner clinical draft bytes require a separate recovery policy.
+    setRestorePermission(false)
+    adminBackup.current = null
+    oidcSession.current = false
     setImpersonation(null)
-    if (isEntraConfigured && userManager) {
-      try {
-        await userManager.signoutRedirect()
-        return
-      } catch (err) {
-        console.warn('Entra signout redirect failed:', err)
-      }
-    }
-    navigate('/login')
-  }, [navigate])
+    setLoading(false)
+    userManager?.stopSilentRenew()
+    return userManager?.removeUser().catch(() => undefined)
+  }, [])
 
-  const scheduleProactiveRefresh = useCallback((expiresInSeconds: number = 900) => {
+  const signalSession = useCallback((message: 'probe' | 'ended') => {
+    const signal = message === 'ended' ? `ended:${crypto.randomUUID()}` : 'probe'
+    let sent = false
+    try {
+      if (sessionChannel.current) {
+        sessionChannel.current.postMessage(signal)
+        sent = true
+      }
+    } catch { /* A closed or unavailable channel falls back to shared storage. */ }
+    try {
+      // A unique non-bearer pulse also reaches tabs whose native channel is unavailable.
+      localStorage.setItem(sessionSignalKey, signal)
+      sent = true
+    } catch { /* Native messaging still works when storage is denied. */ }
+    return sent
+  }, [])
+
+  const finishSession = useCallback(async (endpoint: '/auth/logout' | '/auth/revoke-all') => {
+    const token = getAccessToken()
+    const removeOidcUser = resetLocalSession()
+    signalSession('ended')
+    const generation = getSessionGeneration()
+    // Local sign-out is immediate; this request retains only the outgoing credential.
+    const request = Promise.all([signoutInFlight.current, removeOidcUser,
+      refreshClient.post(endpoint, {}, { headers: token ? { Authorization: `Bearer ${token}` } : {} }).catch(() => undefined)])
+      .then(async () => {
+        if (generation === getSessionGeneration() && isEntraConfigured && userManager) {
+          try {
+            await userManager.signoutRedirect()
+          } catch { /* Local sign-out already completed. */ }
+        }
+      })
+    signoutInFlight.current = request
+    navigate('/login')
+    await request
+    if (signoutInFlight.current === request) signoutInFlight.current = null
+  }, [navigate, resetLocalSession, signalSession])
+
+  const logout = useCallback(() => finishSession('/auth/logout'), [finishSession])
+
+  const applySessionState = useCallback((session: SessionPayload) => {
+    if (!signalSession('probe')) {
+      void resetLocalSession()
+      throw new Error('This browser cannot synchronize sign-out. Enable site storage or use a supported browser, then sign in again.')
+    }
+    const claims = claimsFromToken(session.accessToken)
+    setUser(session.user ?? null)
+    setCurrentTenantId((claims.tenant_id as string) || session.tenantId || null)
+    setCurrentClinicId((claims.clinicId as string) || (claims.clinic_id as string) || session.clinicId || null)
+    setMemberships(Array.isArray(session.memberships) ? session.memberships : [])
+    setAccountFlags(accountFlagsFrom(session.accessToken))
+    setMfaRequiredForRole(session.mfaRequiredForRole === true)
+    setSessionGeneration(getSessionGeneration())
+    setLoading(false)
+  }, [resetLocalSession, signalSession])
+
+  const scheduleProactiveRefresh = useCallback(function schedule(expiresInSeconds: number = 900) {
+    if (refreshTimer.current) clearTimeout(refreshTimer.current)
+    const generation = getSessionGeneration()
     const refreshDelayMs = Math.max((expiresInSeconds - 120) * 1000, 10000)
-    
-    const timer = setTimeout(async () => {
+    refreshTimer.current = setTimeout(async () => {
       try {
-        // Never refresh the admin's session while impersonating: it would replace the
-        // read-only impersonation token with the admin's and silently escape the limits.
-        if (sessionStorage.getItem('samstack_impersonation')) return
+        assertSessionGeneration(generation)
         const session = await refreshSession()
-        if (!session?.accessToken) return
-        const { expiresIn, tenantId, clinicId, mfaRequiredForRole: roleNeedsMfa } = session
-        const nextMemberships = session.memberships
-        if (tenantId) setCurrentTenantId(tenantId)
-        if (clinicId) setCurrentClinicId(clinicId)
-        if (Array.isArray(nextMemberships)) setMemberships(nextMemberships as TenantMembership[])
-        if (typeof roleNeedsMfa === 'boolean') setMfaRequiredForRole(roleNeedsMfa)
-        scheduleProactiveRefresh(expiresIn || 900)
-      } catch {
-        // Fall back to reactive interceptor or logout
+        assertSessionGeneration(generation)
+        if (!session?.accessToken) throw new Error('The session has ended. Please sign in again.')
+        applySessionState(session as SessionPayload)
+        schedule(session.expiresIn || 900)
+      } catch (error) {
+        // An outage can recover reactively; a rejected or changed identity must end now.
+        if (generation === getSessionGeneration() && !isCancel(error)
+          && (!isAxiosError(error) || error.response?.status === 401 || error.response?.status === 403)) {
+          window.dispatchEvent(new Event('samstack:session-ended'))
+        }
       }
     }, refreshDelayMs)
+  }, [applySessionState])
 
-    return () => clearTimeout(timer)
+  const beginIdentityChange = useCallback(() => {
+    if (refreshTimer.current) clearTimeout(refreshTimer.current)
+    const generation = beginSessionTransition()
+    setSessionGeneration(generation)
+    setLoading(true)
+    return generation
   }, [])
 
   const loginWithEntra = useCallback(async () => {
     if (userManager) {
-      await userManager.signinRedirect()
+      const generation = beginIdentityChange()
+      setRestorePermission(false)
+      try {
+        await signoutInFlight.current
+        assertSessionGeneration(generation)
+        await userManager.signinRedirect()
+      } finally {
+        if (generation === getSessionGeneration()) setLoading(false)
+      }
     } else {
       throw new Error('Single Sign-On (OIDC) identity provider is not configured.')
     }
-  }, [])
+  }, [beginIdentityChange])
 
   const setUserFromEntra = useCallback((userData: User) => {
-    setUser(userData)
-  }, [])
+    const token = getAccessToken()
+    if (!token) return
+    oidcSession.current = true
+    setSessionRefreshEnabled(false)
+    setRestorePermission(false)
+    applySessionState({ accessToken: token, user: userData })
+  }, [applySessionState])
 
   const adoptSession = useCallback((session: SessionPayload) => {
-    setAccessToken(session.accessToken)
-    if (session.user) setUser(session.user)
-    const claims = claimsFromToken(session.accessToken)
-    const tokenTenantId = (claims.tenant_id as string) || session.tenantId || null
-    const tokenClinicId = (claims.clinicId as string) || session.clinicId || null
-    setCurrentTenantId(tokenTenantId)
-    setCurrentClinicId(tokenClinicId)
-    if (session.memberships && Array.isArray(session.memberships)) {
-      setMemberships(session.memberships)
-    }
-    setAccountFlags(accountFlagsFrom(session.accessToken))
-    setMfaRequiredForRole(session.mfaRequiredForRole === true)
+    if (!session.accessToken || !session.user?.id) throw new Error('The sign-in response is incomplete. Please sign in again.')
+    if (getAccessToken() !== session.accessToken || !isSessionActive()) setAccessToken(session.accessToken)
+    setSessionRefreshEnabled(true)
+    setRestorePermission(true)
+    adminBackup.current = null
+    oidcSession.current = false
+    setImpersonation(null)
+    applySessionState(session)
     scheduleProactiveRefresh(session.expiresIn || 900)
-  }, [scheduleProactiveRefresh])
+  }, [applySessionState, scheduleProactiveRefresh])
 
   // A session holding a temporary password or a mandatory second factor may not use the app shell.
   const routeAfterSession = useCallback((session: SessionPayload) => {
@@ -236,8 +328,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     navigate(String(session.user?.role || '').toLowerCase() === 'platformadmin' ? '/dashboard/platform-admin' : '/dashboard')
   }, [navigate])
 
+  const requestSession = useCallback(async (endpoint: string, body: unknown) => {
+    const generation = beginIdentityChange()
+    try {
+      await signoutInFlight.current
+      assertSessionGeneration(generation)
+      const res = await api.post(endpoint, body)
+      assertSessionGeneration(generation)
+      return { ...res, generation }
+    } catch (error) {
+      if (generation === getSessionGeneration()) {
+        resetLocalSession()
+        navigate('/login')
+      }
+      throw error
+    } finally {
+      if (generation === getSessionGeneration()) setLoading(false)
+    }
+  }, [beginIdentityChange, resetLocalSession, navigate])
+
   const completeMfa = useCallback(async (challengeToken: string, code: string): Promise<LoginResult | void> => {
-    const res = await api.post('/auth/mfa/verify', { challengeToken, code })
+    const res = await requestSession('/auth/mfa/verify', { challengeToken, code })
+    assertSessionGeneration(res.generation)
     if (res.data?.requiresTenantSelection) {
       return {
         mfaRequired: false,
@@ -248,34 +360,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     adoptSession(res.data)
     routeAfterSession(res.data)
-  }, [adoptSession, routeAfterSession])
+  }, [adoptSession, routeAfterSession, requestSession])
 
   const changePassword = useCallback(async (currentPassword: string, newPassword: string) => {
-    const res = await api.post('/auth/change-password', { currentPassword, newPassword })
+    const res = await requestSession('/auth/change-password', { currentPassword, newPassword })
+    assertSessionGeneration(res.generation)
     adoptSession(res.data)
     routeAfterSession(res.data)
-  }, [adoptSession, routeAfterSession])
+  }, [adoptSession, routeAfterSession, requestSession])
 
   const selectTenant = useCallback(async (tenantId: string, selectionToken?: string, clinicId?: string | null) => {
-    const res = await api.post('/auth/select-tenant', { tenantId, clinicId: clinicId ?? null, selectionToken })
+    const res = await requestSession('/auth/select-tenant', { tenantId, clinicId: clinicId ?? null, selectionToken })
+    assertSessionGeneration(res.generation)
     adoptSession(res.data)
     routeAfterSession(res.data)
-  }, [adoptSession, routeAfterSession])
+  }, [adoptSession, routeAfterSession, requestSession])
 
   const switchTenant = useCallback(async (tenantId: string, clinicId?: string | null) => {
     // A clinic switch mints a new token scoped to that one tenant; never reuse the old one.
-    const res = await api.post('/auth/select-tenant', { tenantId, clinicId: clinicId ?? null })
+    const res = await requestSession('/auth/select-tenant', { tenantId, clinicId: clinicId ?? null })
+    assertSessionGeneration(res.generation)
     adoptSession(res.data)
     if (String(user?.role || '').toLowerCase() === 'platformadmin') {
       navigate('/dashboard/platform-admin')
     } else {
       navigate('/dashboard')
     }
-  }, [adoptSession, navigate, user?.role])
+  }, [adoptSession, navigate, user?.role, requestSession])
 
   const refreshMemberships = useCallback(async () => {
+    const generation = getSessionGeneration()
     try {
       const res = await api.get('/auth/memberships')
+      assertSessionGeneration(generation)
       if (Array.isArray(res.data)) {
         setMemberships(res.data)
       }
@@ -284,29 +401,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const revokeAllSessions = useCallback(async () => {
-    try {
-      await api.post('/auth/revoke-all', {})
-    } catch {
-      // Non-blocking
-    }
-    clearTokens()
-    setUser(null)
-    setMemberships([])
-    setCurrentTenantId(null)
-    setCurrentClinicId(null)
-    setAccountFlags({ mustChangePassword: false, mfaEnrolmentRequired: false })
-    setMfaRequiredForRole(false)
-    // Same device hygiene as logout: no patient data left behind on a shared front desk.
-    Object.keys(localStorage)
-      .filter(k => k.startsWith('hospital_crm_draft_'))
-      .forEach(k => localStorage.removeItem(k))
-    clearOutbox()
-    navigate('/login')
-  }, [navigate])
+  const revokeAllSessions = useCallback(() => finishSession('/auth/revoke-all'), [finishSession])
 
   const login = useCallback(async (email: string, password: string, tenantId?: string): Promise<LoginResult> => {
-    const res = await api.post('/auth/login', { email, password, tenantId })
+    const res = await requestSession('/auth/login', { email, password, tenantId })
+    assertSessionGeneration(res.generation)
 
     // With a second factor enrolled the password only buys a 5-minute challenge.
     if (res.data?.mfaRequired) {
@@ -325,80 +424,104 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     adoptSession(res.data)
     routeAfterSession(res.data)
     return { mfaRequired: false }
-  }, [adoptSession, routeAfterSession])
+  }, [adoptSession, routeAfterSession, requestSession])
 
   useEffect(() => {
+    let active = true
+    const generation = getSessionGeneration()
     const initAuth = async () => {
-      // 0. Resume an impersonation session across a reload. It has no refresh token of its own,
-      // so falling through to the normal refresh path would silently install the admin's token
-      // and drop the read-only + audit claims.
-      const storedImpersonation = sessionStorage.getItem('samstack_impersonation')
-      if (storedImpersonation) {
-        try {
-          const session = JSON.parse(storedImpersonation) as ImpersonationSession
-          if (session.expiresAt > Date.now() && session.accessToken) {
-            setAccessToken(session.accessToken)
-            setUser(session.targetUser)
-            setLoading(false)
-            return
-          }
-        } catch {
-          // Corrupt entry - fall through to a normal login.
+      try {
+        const restoreAllowed = canRestoreSession()
+        if (!restoreAllowed) {
+          setSessionRefreshEnabled(false)
+          return
         }
-        sessionStorage.removeItem('samstack_impersonation')
-        setImpersonation(null)
-      }
-
-      // 1. Check if OIDC user is cached in storage
-      if (isEntraConfigured && userManager) {
-        try {
+        if (isEntraConfigured && userManager) {
           const oidcUser = await userManager.getUser()
+          if (!active) return
+          assertSessionGeneration(generation)
           if (oidcUser && !oidcUser.expired && oidcUser.access_token) {
             setAccessToken(oidcUser.access_token)
             const profile = oidcUser.profile
             const roles = (profile.roles as string[]) || (profile.extension_Role as string) || (profile.role as string) || 'doctor'
             const role = Array.isArray(roles) ? roles[0] : roles
-
-            setUser({
+            setUserFromEntra({
               id: oidcUser.profile.sub,
               name: oidcUser.profile.name || oidcUser.profile.preferred_username || 'Doctor',
               email: oidcUser.profile.email || (oidcUser.profile as any).upn || '',
               role: String(role).toLowerCase()
             })
-            setLoading(false)
-            return
           }
-        } catch (err) {
-          console.warn('OIDC restore failed:', err)
-        }
-      }
-
-      // 2. Refresh from the HttpOnly cookie (no token is ever kept in JS storage)
-      try {
-        const session = await refreshSession()
-        if (!session?.accessToken) {
-          // No session on this device (204) - stay signed out without an error.
-          setLoading(false)
+          // Missing/corrupt OIDC state requires an explicit SSO sign-in, never cookie fallback.
           return
         }
-        const { accessToken, expiresIn, user: userData, tenantId, clinicId, mfaRequiredForRole: roleNeedsMfa } = session
-        const savedMemberships = session.memberships
-        setUser(userData ?? null)
-        if (tenantId) setCurrentTenantId(tenantId)
-        if (clinicId) setCurrentClinicId(clinicId)
-        if (Array.isArray(savedMemberships)) setMemberships(savedMemberships as TenantMembership[])
-        if (typeof roleNeedsMfa === 'boolean') setMfaRequiredForRole(roleNeedsMfa)
-        setAccountFlags(accountFlagsFrom(accessToken ?? null))
-        scheduleProactiveRefresh(expiresIn || 900)
+        setSessionRefreshEnabled(true)
+        const session = await refreshSession()
+        if (!active) return
+        assertSessionGeneration(generation)
+        if (!session?.accessToken) return
+        adoptSession(session as SessionPayload)
       } catch {
-        clearTokens()
-        setUser(null)
+        if (active && generation === getSessionGeneration()) resetLocalSession()
+      } finally {
+        if (active && generation === getSessionGeneration()) setLoading(false)
       }
-      setLoading(false)
     }
+    void initAuth()
+    return () => {
+      active = false
+      if (refreshTimer.current) clearTimeout(refreshTimer.current)
+    }
+  }, [adoptSession, resetLocalSession, setUserFromEntra])
 
-    initAuth()
-  }, [scheduleProactiveRefresh])
+  useEffect(() => {
+    // A repeated reauth marker emits no storage event; sign-out needs its own signal.
+    try { sessionChannel.current = new BroadcastChannel('samstack:session') } catch { /* Use the non-bearer storage pulse. */ }
+    const remoteEnded = () => { void resetLocalSession(); navigate('/login') }
+    const ended = () => { remoteEnded(); signalSession('ended') }
+    const handled = new Set<string>()
+    const receive = (signal: unknown) => {
+      if (typeof signal !== 'string' || !signal.startsWith('ended:') || handled.has(signal)) return
+      handled.add(signal)
+      remoteEnded()
+    }
+    if (sessionChannel.current) sessionChannel.current.onmessage = event => {
+      receive(event.data)
+    }
+    const storageChanged = (event: StorageEvent) => {
+      if (event.key === sessionSignalKey) receive(event.newValue)
+    }
+    window.addEventListener('samstack:session-ended', ended)
+    window.addEventListener('storage', storageChanged)
+    return () => {
+      window.removeEventListener('samstack:session-ended', ended)
+      window.removeEventListener('storage', storageChanged)
+      sessionChannel.current?.close()
+      sessionChannel.current = null
+    }
+  }, [resetLocalSession, navigate, signalSession])
+
+  useEffect(() => {
+    const manager = userManager
+    if (!manager) return
+    const renew = async () => {
+      if (!oidcSession.current) return
+      const generation = getSessionGeneration()
+      try {
+        const renewed = await manager.signinSilent()
+        assertSessionGeneration(generation)
+        if (!renewed?.access_token) throw new Error('OIDC renewal failed')
+        const profile = renewed.profile
+        const roles = profile.roles || profile.extension_Role || profile.role || 'doctor'
+        setRefreshedAccessToken(renewed.access_token, generation)
+        setUserFromEntra({ id: profile.sub, name: profile.name || profile.preferred_username || 'Doctor',
+          email: profile.email || '', role: String(Array.isArray(roles) ? roles[0] : roles).toLowerCase() })
+      } catch {
+        if (generation === getSessionGeneration()) window.dispatchEvent(new Event('samstack:session-ended'))
+      }
+    }
+    return manager.events.addAccessTokenExpiring(renew)
+  }, [setUserFromEntra])
 
   const startImpersonation = useCallback((session: {
     impersonationId: string
@@ -407,82 +530,73 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     targetUser: User
     reason: string
   }) => {
-    // 1. Back up original admin state to sessionStorage
     const currentToken = getAccessToken()
-    const backup = {
-      adminUser: user,
-      accessToken: currentToken
+    if (!currentToken || !user || user.role.toLowerCase() !== 'platformadmin') {
+      throw new Error('Sign in as a platform administrator before starting support access.')
     }
-    sessionStorage.setItem('samstack_admin_backup', JSON.stringify(backup))
-
-    // 2. Set impersonation token and state
+    // The marker carries no bearer and can only deny restoration after a reload.
+    if (!setRestorePermission(false)) throw new Error('Support access needs browser session storage. Please sign in again.')
+    adminBackup.current = { accessToken: currentToken, user, tenantId: currentTenantId, clinicId: currentClinicId,
+      memberships, mfaRequiredForRole, oidc: oidcSession.current }
+    oidcSession.current = false
+    if (refreshTimer.current) clearTimeout(refreshTimer.current)
     const impState: ImpersonationSession = {
       impersonationId: session.impersonationId,
       targetUser: session.targetUser,
-      expiresAt: Date.now() + session.expiresIn * 1000,
+      expiresAt: Date.now() + Math.min(session.expiresIn, 1800) * 1000,
       startedAt: new Date().toISOString(),
       reason: session.reason,
-      accessToken: session.accessToken
     }
-    sessionStorage.setItem('samstack_impersonation', JSON.stringify(impState))
     setImpersonation(impState)
-
-    // 3. Set API access token and active user
     setAccessToken(session.accessToken)
-    setUser(session.targetUser)
-    setAccountFlags(accountFlagsFrom(session.accessToken))
-
-    // 4. Navigate to dashboard as impersonated user
+    applySessionState({ accessToken: session.accessToken, user: session.targetUser })
     navigate('/dashboard')
-  }, [user, navigate])
+  }, [user, navigate, currentTenantId, currentClinicId, memberships, mfaRequiredForRole, applySessionState])
 
   const endImpersonation = useCallback(async () => {
-    const rawBackup = sessionStorage.getItem('samstack_admin_backup')
+    const backup = adminBackup.current
     const currentImp = impersonation
-
-    // Attempt backend session end call
+    const generation = beginIdentityChange()
     if (currentImp?.impersonationId) {
       try {
         await api.post(`/platform-admin/impersonate/${currentImp.impersonationId}/end`, {})
       } catch {
-        // Continue cleanup even if server call fails
+        // End locally even if the audit endpoint is unavailable.
       }
     }
-
-    sessionStorage.removeItem('samstack_impersonation')
-    sessionStorage.removeItem('samstack_admin_backup')
-    setImpersonation(null)
-
-    if (rawBackup) {
-      try {
-        const backup = JSON.parse(rawBackup)
-        if (backup.accessToken) setAccessToken(backup.accessToken)
-        if (backup.adminUser) setUser(backup.adminUser)
-      } catch {
-        // fallback
-      }
+    if (generation !== getSessionGeneration()) return
+    const expiry = claimsFromToken(backup?.accessToken ?? null).exp
+    if (!backup || typeof expiry !== 'number' || expiry * 1000 <= Date.now()) {
+      await logout()
+      return
     }
-
+    if (backup.oidc) {
+      setAccessToken(backup.accessToken)
+      setUserFromEntra(backup.user)
+      adminBackup.current = null
+      setImpersonation(null)
+    } else adoptSession(backup)
     navigate('/dashboard/platform-admin')
-  }, [impersonation, navigate])
+  }, [impersonation, navigate, beginIdentityChange, adoptSession, logout, setUserFromEntra])
 
   // Impersonation auto-expiry
   useEffect(() => {
     if (!impersonation) return
     const remainingMs = impersonation.expiresAt - Date.now()
     if (remainingMs <= 0) {
-      endImpersonation()
+      void logout()
       return
     }
     const timer = setTimeout(() => {
-      endImpersonation()
+      void logout()
     }, remainingMs)
     return () => clearTimeout(timer)
-  }, [impersonation, endImpersonation])
+  }, [impersonation, logout])
 
   return (
     <AuthContext.Provider
       value={{
+        sessionGeneration,
         user,
         loading,
         memberships,
@@ -521,4 +635,4 @@ export function useAuth() {
     throw new Error('useAuth must be used within AuthProvider')
   }
   return context
-}
+}

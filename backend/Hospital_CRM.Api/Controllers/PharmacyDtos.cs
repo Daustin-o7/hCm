@@ -1,4 +1,6 @@
 using System.ComponentModel.DataAnnotations;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -7,6 +9,9 @@ namespace Hospital_CRM.Api.Controllers;
 
 public static class PharmacyCommon
 {
+    public static string RequestHash<T>(T request) =>
+        Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(request)));
+
     // SEC-015: Sanitize CSV cells to prevent formula injection in Excel/LibreOffice.
     public static string EscapeCsv(string s)
     {
@@ -105,11 +110,14 @@ public record PosCheckoutRequest(
     [Range(0.00, 1000000.00)]
     decimal TenderedAmount,
 
-    [RegularExpression(@"^IDEMP-INV-[a-zA-Z0-9\-]+$", ErrorMessage = "IdempotencyKey must follow format IDEMP-INV-{UUID}")]
+    [Required, StringLength(128), RegularExpression(@"^IDEMP-INV-[a-zA-Z0-9\-]+$", ErrorMessage = "IdempotencyKey must follow format IDEMP-INV-{UUID}")]
     string? IdempotencyKey,
 
     [Required(ErrorMessage = "Items are required"), MinLength(1, ErrorMessage = "At least one checkout item required")]
-    List<PosCheckoutItem> Items
+    List<PosCheckoutItem> Items,
+
+    [StringLength(64)]
+    string? PaymentReference = null
 );
 
 public record PosCheckoutItem(
@@ -156,7 +164,13 @@ public record ReturnRequest(
     [StringLength(100)]
     string? ReturnedByName,
 
-    string? IdempotencyKey
+    [Required, StringLength(128)]
+    string? IdempotencyKey,
+
+    [StringLength(100)]
+    string? RefundReference = null,
+
+    Guid? SourcePaymentId = null
 );
 
 public record ReceivePurchaseOrderRequest(
@@ -191,8 +205,10 @@ public record DispensePrescriptionRequest(
     [StringLength(50)]
     string? PrescriberRegNo = null,
 
+    [Required, StringLength(128)]
     string? IdempotencyKey = null,
 
+    [MaxLength(50)]
     List<DispenseItemSelection>? ItemSelections = null
 );
 
@@ -201,7 +217,7 @@ public record DispenseItemSelection(
     Guid? DrugBatchId,
     int? Quantity,
     Guid? SubstitutedDrugId,
-    string? SubstitutionReason
+    [StringLength(500)] string? SubstitutionReason
 );
 
 public record StockInRequest(

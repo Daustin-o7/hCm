@@ -25,7 +25,7 @@ public class Section4PharmacyAuditFixesTests
             .UseInMemoryDatabase(databaseName: $"Sec4Audit_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static ClaimsPrincipal CreateUserPrincipal(Guid userId, Guid tenantId, string role)
@@ -50,18 +50,6 @@ public class Section4PharmacyAuditFixesTests
         return new ConsultationsController(db, NullLogger<ConsultationsController>.Instance, config);
     }
 
-    private static Consultation Version(Guid appointmentId, Guid doctorId, string code, int version, ConsultationStatus status) => new()
-    {
-        Id = Guid.NewGuid(),
-        AppointmentId = appointmentId,
-        DoctorId = doctorId,
-        Status = status,
-        Version = version,
-        VerificationQrCode = code,
-        CreatedAt = DateTimeOffset.UtcNow.AddDays(-2),
-        SignedAt = DateTimeOffset.UtcNow.AddDays(-2)
-    };
-
     /// <summary>
     /// Full visit graph. The verify query includes required navigations, so a bare Consultation
     /// with dangling FKs is dropped by the include join.
@@ -76,7 +64,7 @@ public class Section4PharmacyAuditFixesTests
             Name = "Verify Clinic",
             PharmacyLicenceNumber20 = "DL-20-TEST"
         };
-        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Dr. Verify", Role = UserRole.Doctor };
+        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinic.Id, Name = "Dr. Verify", Role = UserRole.Doctor };
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Verify Patient", Phone = "9876543210" };
         var appointment = new Appointment
         {
@@ -90,6 +78,7 @@ public class Section4PharmacyAuditFixesTests
         };
         db.Clinics.Add(clinic);
         db.Users.Add(doctor);
+        db.TenantMemberships.Add(new TenantMembership { UserId = doctor.Id, TenantId = tenantId, ClinicId = clinic.Id, Role = UserRole.Doctor });
         db.Patients.Add(patient);
         db.Appointments.Add(appointment);
         await db.SaveChangesAsync();
@@ -105,20 +94,18 @@ public class Section4PharmacyAuditFixesTests
     [Fact]
     public async Task Verify_NewestAmendedVersion_IsActive_NotSuperseded()
     {
-        var db = CreateInMemoryDb();
-        var code = "QR-ACTIVE-V2";
-        var visit = await SeedVisitAsync(db, Guid.NewGuid());
-        db.Consultations.AddRange(
-            Version(visit.AppointmentId, visit.DoctorId, code, 1, ConsultationStatus.Amended),
-            Version(visit.AppointmentId, visit.DoctorId, code, 2, ConsultationStatus.Amended));
-        await db.SaveChangesAsync();
-
-        var result = await CreateConsultationsController(db)
-            .VerifyPrescription(code, null, CancellationToken.None);
+        await using var db = CreateInMemoryDb();
+        var (doctor, _, visit, tenant) = Part1SaleReadinessTests.Seed(db);
+        var controller = Part1SaleReadinessTests.Consult(db, doctor.Id, tenant);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(visit.Id, Part1SaleReadinessTests.Finalize([]), CancellationToken.None));
+        var original = await db.Consultations.SingleAsync();
+        Assert.Equal(201, Assert.IsType<ObjectResult>(await controller.AmendConsultation(original.Id, Part1SaleReadinessTests.Amend(null), CancellationToken.None)).StatusCode);
+        var result = await Part1SaleReadinessTests.VerifyBound(controller, new(tenant, original.Id), original.VerificationQrCode!);
 
         var ok = Assert.IsType<OkObjectResult>(result);
         var doc = JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(ok.Value));
         Assert.False(doc.GetProperty("isSuperseded").GetBoolean());
+        Assert.True(doc.GetProperty("signatureValid").GetBoolean());
         Assert.Equal("valid", doc.GetProperty("status").GetString());
         Assert.Equal(2, doc.GetProperty("currentVersion").GetInt32());
         Assert.Equal(2, doc.GetProperty("latestVersion").GetInt32());
@@ -127,23 +114,21 @@ public class Section4PharmacyAuditFixesTests
     [Fact]
     public async Task Verify_OlderVersion_IsSuperseded_AndUnknownVersionIs404()
     {
-        var db = CreateInMemoryDb();
-        var code = "QR-OLD-V1";
-        var visit = await SeedVisitAsync(db, Guid.NewGuid());
-        db.Consultations.AddRange(
-            Version(visit.AppointmentId, visit.DoctorId, code, 1, ConsultationStatus.Amended),
-            Version(visit.AppointmentId, visit.DoctorId, code, 2, ConsultationStatus.Amended));
-        await db.SaveChangesAsync();
+        await using var db = CreateInMemoryDb();
+        var (doctor, _, visit, tenant) = Part1SaleReadinessTests.Seed(db);
+        var controller = Part1SaleReadinessTests.Consult(db, doctor.Id, tenant);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(visit.Id, Part1SaleReadinessTests.Finalize([]), CancellationToken.None));
+        var original = await db.Consultations.SingleAsync();
+        Assert.Equal(201, Assert.IsType<ObjectResult>(await controller.AmendConsultation(original.Id, Part1SaleReadinessTests.Amend(null), CancellationToken.None)).StatusCode);
 
-        var controller = CreateConsultationsController(db);
-
-        var older = await controller.VerifyPrescription(code, 1, CancellationToken.None);
+        var older = await Part1SaleReadinessTests.VerifyBound(controller, new(tenant, original.Id), original.VerificationQrCode!, 1);
         var olderDoc = JsonSerializer.Deserialize<JsonElement>(
             JsonSerializer.Serialize(Assert.IsType<OkObjectResult>(older).Value));
         Assert.True(olderDoc.GetProperty("isSuperseded").GetBoolean());
+        Assert.True(olderDoc.GetProperty("signatureValid").GetBoolean());
         Assert.Equal(1, olderDoc.GetProperty("currentVersion").GetInt32());
 
-        var unknown = await controller.VerifyPrescription(code, 99, CancellationToken.None);
+        var unknown = await Part1SaleReadinessTests.VerifyBound(controller, new(tenant, original.Id), original.VerificationQrCode!, 99);
         Assert.IsType<NotFoundObjectResult>(unknown);
     }
 
@@ -154,31 +139,39 @@ public class Section4PharmacyAuditFixesTests
         var controller = CreateConsultationsController(db, "unit-test-secret");
         var expired = DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeSeconds();
 
-        var result = await controller.VerifyPrescription("QR-LINK", null, CancellationToken.None,
-            expired, ShareSig("QR-LINK", expired, "unit-test-secret"));
+        const string code = "RX-0123456789ABCDEF";
+        var result = await controller.VerifyPrescription(code, null, CancellationToken.None,
+            expired, ShareSig(code, expired, "unit-test-secret"));
 
         var obj = Assert.IsType<ObjectResult>(result);
         Assert.Equal(410, obj.StatusCode);
+        Assert.Equal("share_link_expired", JsonSerializer.SerializeToElement(obj.Value).GetProperty("error").GetString());
     }
 
     [Fact]
     public async Task Verify_ForgedShareSignature_Returns400_AndCorrectOnePasses()
     {
-        var db = CreateInMemoryDb();
-        var code = "QR-LINK-OK";
-        var visit = await SeedVisitAsync(db, Guid.NewGuid());
-        db.Consultations.Add(Version(visit.AppointmentId, visit.DoctorId, code, 1, ConsultationStatus.Finalized));
-        await db.SaveChangesAsync();
-
+        await using var db = CreateInMemoryDb();
+        var (doctor, _, visit, tenant) = Part1SaleReadinessTests.Seed(db);
+        var clinical = Part1SaleReadinessTests.Consult(db, doctor.Id, tenant);
+        Assert.IsType<OkObjectResult>(await clinical.FinalizeConsultation(visit.Id, Part1SaleReadinessTests.Finalize([]), CancellationToken.None));
+        var original = await db.Consultations.SingleAsync();
+        var code = original.VerificationQrCode!;
         var controller = CreateConsultationsController(db, "unit-test-secret");
         var exp = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds();
 
         var forged = await controller.VerifyPrescription(code, null, CancellationToken.None, exp, "DEADBEEF");
-        Assert.IsType<BadRequestObjectResult>(forged);
+        Assert.Equal("share_link_invalid_signature", JsonSerializer.SerializeToElement(Assert.IsType<BadRequestObjectResult>(forged).Value).GetProperty("error").GetString());
 
         var valid = await controller.VerifyPrescription(code, null, CancellationToken.None,
             exp, ShareSig(code, exp, "unit-test-secret"));
-        Assert.IsType<OkObjectResult>(valid);
+        // No router context: a valid share signature must reach the routing boundary.
+        var routing = Assert.IsType<ObjectResult>(valid);
+        Assert.Equal(503, routing.StatusCode);
+        Assert.Equal("verification_routing_unavailable", JsonSerializer.SerializeToElement(routing.Value).GetProperty("error").GetString());
+        var verified = await Part1SaleReadinessTests.VerifyBound(clinical, new(tenant, original.Id), code);
+        var verifiedDoc = JsonSerializer.SerializeToElement(Assert.IsType<OkObjectResult>(verified).Value);
+        Assert.True(verifiedDoc.GetProperty("signatureValid").GetBoolean());
     }
 
     [Fact]
@@ -187,22 +180,25 @@ public class Section4PharmacyAuditFixesTests
         var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var visit = await SeedVisitAsync(db, tenantId);
+        var clinicId = (await db.Appointments.SingleAsync(a => a.Id == visit.AppointmentId)).ClinicId;
         db.PatientConsents.Add(new PatientConsent
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             PatientId = visit.PatientId,
             Purpose = "whatsapp_opt_in"
         });
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = visit.AppointmentId,
             DoctorId = visit.DoctorId,
             Status = ConsultationStatus.Finalized,
-            VerificationQrCode = "QR-SHARE"
+            VerificationQrCode = "RX-0123456789ABCDEF"
         };
         db.Consultations.Add(consultation);
-        var prescription = new Prescription { Id = Guid.NewGuid(), ConsultationId = consultation.Id };
+        var prescription = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consultation.Id };
         db.Prescriptions.Add(prescription);
         await db.SaveChangesAsync();
 
@@ -211,6 +207,7 @@ public class Section4PharmacyAuditFixesTests
         {
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(visit.DoctorId, tenantId, "Doctor") }
         };
+        ((ClaimsIdentity)controller.User.Identity!).AddClaim(new Claim("clinicId", clinicId.ToString()));
 
         var result = await controller.GenerateShareLink(prescription.Id, CancellationToken.None);
 
@@ -223,26 +220,8 @@ public class Section4PharmacyAuditFixesTests
     {
         var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
-        var doctorId = Guid.NewGuid();
-        var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Draft Patient", Phone = "9876543210" };
-        db.Patients.Add(patient);
-        var appointment = new Appointment
-        {
-            Id = Guid.NewGuid(),
-            TenantId = tenantId,
-            DoctorId = doctorId,
-            PatientId = patient.Id,
-            Date = DateOnly.FromDateTime(DateTime.UtcNow),
-            TimeSlot = "10:00"
-        };
-        db.Appointments.Add(appointment);
-        await db.SaveChangesAsync();
-
-        var controller = new ConsultationsController(db, NullLogger<ConsultationsController>.Instance);
-        controller.ControllerContext = new ControllerContext
-        {
-            HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(doctorId, tenantId, "Doctor") }
-        };
+        var visit = await SeedVisitAsync(db, tenantId);
+        var controller = Part1SaleReadinessTests.Consult(db, visit.DoctorId, tenantId);
 
         var openSourceId = Guid.NewGuid(); // deterministic CDCI id with no Drugs row
         var request = new SaveConsultationDraftRequest(
@@ -252,7 +231,7 @@ public class Section4PharmacyAuditFixesTests
                 new(openSourceId, "Paracetamol", "Dolo", "Tablet", "650mg", null, "1-0-1", 5, "Days", null, 10, null, null, true)
             });
 
-        var result = await controller.SaveDraft(appointment.Id, request, CancellationToken.None);
+        var result = await controller.SaveDraft(visit.AppointmentId, request, CancellationToken.None);
         Assert.IsType<OkObjectResult>(result);
 
         var item = await db.PrescriptionItems.FirstAsync();
@@ -267,8 +246,9 @@ public class Section4PharmacyAuditFixesTests
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        db.Clinics.Add(new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Licensed", PharmacyLicenceNumber20 = "DL-20" });
-        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Dr. Real", Role = UserRole.Doctor };
+        var clinic = new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Licensed", PharmacyLicenceNumber20 = "DL-20" };
+        db.Clinics.Add(clinic);
+        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinic.Id, Name = "Dr. Real", Role = UserRole.Doctor };
         db.Users.Add(doctor);
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Dispense Patient", Phone = "9876543210" };
         db.Patients.Add(patient);
@@ -276,6 +256,7 @@ public class Section4PharmacyAuditFixesTests
         {
             Id = Guid.NewGuid(),
             TenantId = tenantId,
+            ClinicId = clinic.Id,
             DoctorId = doctor.Id,
             PatientId = patient.Id,
             Date = DateOnly.FromDateTime(DateTime.UtcNow),
@@ -285,6 +266,7 @@ public class Section4PharmacyAuditFixesTests
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = appointment.Id,
             DoctorId = doctor.Id,
             Status = ConsultationStatus.Finalized,
@@ -316,7 +298,7 @@ public class Section4PharmacyAuditFixesTests
         };
         db.DrugBatches.Add(batch);
 
-        var rx = new Prescription { Id = Guid.NewGuid(), ConsultationId = consultation.Id, CreatedAt = DateTimeOffset.UtcNow };
+        var rx = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consultation.Id, CreatedAt = DateTimeOffset.UtcNow };
         var rxItem = new PrescriptionItem
         {
             Id = Guid.NewGuid(),
@@ -339,7 +321,7 @@ public class Section4PharmacyAuditFixesTests
         };
 
         var result = await controller.DispensePrescription(
-            new DispensePrescriptionRequest(rx.Id, null, null, null, null, null, null), CancellationToken.None);
+            new DispensePrescriptionRequest(rx.Id, IdempotencyKey: "generic-match"), CancellationToken.None);
 
         Assert.IsType<ObjectResult>(result);
         Assert.True(rxItem.IsDispensed);
@@ -363,13 +345,14 @@ public class Section4PharmacyAuditFixesTests
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = visit.AppointmentId,
             DoctorId = visit.DoctorId,
             Status = ConsultationStatus.Finalized
         };
         db.Consultations.Add(consultation);
 
-        var rx = new Prescription { Id = Guid.NewGuid(), ConsultationId = consultation.Id };
+        var rx = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consultation.Id };
         rx.Items.Add(new PrescriptionItem
         {
             Id = Guid.NewGuid(),
@@ -388,7 +371,7 @@ public class Section4PharmacyAuditFixesTests
         };
 
         var result = await controller.DispensePrescription(
-            new DispensePrescriptionRequest(rx.Id, null, null, null, null, null, null), CancellationToken.None);
+            new DispensePrescriptionRequest(rx.Id, IdempotencyKey: "ndps-no-match"), CancellationToken.None);
 
         var badRequest = Assert.IsType<BadRequestObjectResult>(result);
         Assert.Contains("ndps_digital_dispensing_prohibited", JsonSerializer.Serialize(badRequest.Value));
@@ -408,7 +391,7 @@ public class Section4PharmacyAuditFixesTests
         var visit = await SeedVisitAsync(db, otherTenantId);
         var consultation = new Consultation
         {
-            Id = Guid.NewGuid(), AppointmentId = visit.AppointmentId, DoctorId = visit.DoctorId,
+            Id = Guid.NewGuid(), TenantId = otherTenantId, AppointmentId = visit.AppointmentId, DoctorId = visit.DoctorId,
             Status = ConsultationStatus.Finalized
         };
         var drug = new Drug
@@ -422,7 +405,7 @@ public class Section4PharmacyAuditFixesTests
             ExpiryDate = DateOnly.FromDateTime(DateTime.UtcNow.AddYears(1)), QuantityReceived = 10,
             QuantityRemaining = 10, Mrp = 100m, PurchaseRate = 60m
         };
-        var prescription = new Prescription { Id = Guid.NewGuid(), ConsultationId = consultation.Id };
+        var prescription = new Prescription { Id = Guid.NewGuid(), TenantId = otherTenantId, ConsultationId = consultation.Id };
         prescription.Items.Add(new PrescriptionItem
         {
             Id = Guid.NewGuid(), PrescriptionId = prescription.Id, DrugId = drug.Id,
@@ -559,7 +542,8 @@ public class Section4PharmacyAuditFixesTests
         await db.SaveChangesAsync();
 
         var controller = new PharmacyPosController(
-            db, NullLogger<PharmacyPosController>.Instance, new TimezoneService());
+            db, NullLogger<PharmacyPosController>.Instance, new TimezoneService(), Part1SaleReadinessTests.Config,
+            new RazorpayOrderClient(new HttpClient(), Part1SaleReadinessTests.Config));
         controller.ControllerContext = new ControllerContext
         {
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Pharmacist") }
@@ -567,7 +551,7 @@ public class Section4PharmacyAuditFixesTests
 
         // Client claims 18% GST and a different price; the server must use 5% of the printed MRP.
         var req = new PosCheckoutRequest(
-            "Walk-in", "9876543210", null, null, null, null, null, "Cash", 100m, null,
+            "Walk-in", "9876543210", null, null, null, null, null, "Cash", 100m, "IDEMP-INV-authoritative-gst",
             new List<PosCheckoutItem> { new(drug.Id, batch.Id, 1, 80m, 18m, "3004") });
 
         var result = await controller.CheckoutPos(req, CancellationToken.None);
@@ -604,7 +588,8 @@ public class Section4PharmacyAuditFixesTests
         await db.SaveChangesAsync();
 
         var controller = new PharmacyPosController(
-            db, NullLogger<PharmacyPosController>.Instance, new TimezoneService());
+            db, NullLogger<PharmacyPosController>.Instance, new TimezoneService(), Part1SaleReadinessTests.Config,
+            new RazorpayOrderClient(new HttpClient(), Part1SaleReadinessTests.Config));
         controller.ControllerContext = new ControllerContext
         {
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Pharmacist") }
@@ -612,7 +597,7 @@ public class Section4PharmacyAuditFixesTests
 
         var checkout = await controller.CheckoutPos(
             new PosCheckoutRequest(
-                "Walk-in", "9876543210", null, null, null, null, null, "Cash", 224m, null,
+                "Walk-in", "9876543210", null, null, null, null, null, "Cash", 224m, "IDEMP-INV-return-sale",
                 new List<PosCheckoutItem> { new(drug.Id, batch.Id, 2, 112m, 12m, "3004") }),
             CancellationToken.None);
         var checkoutDoc = JsonSerializer.Deserialize<JsonElement>(
@@ -628,7 +613,7 @@ public class Section4PharmacyAuditFixesTests
         Assert.Equal(0m, paidInvoice.BalanceDue);
 
         var returned = await controller.ProcessReturn(
-            invoiceId, new ReturnRequest("Wrong strength", "Pharmacist", "ret-key-1"), CancellationToken.None);
+            invoiceId, new ReturnRequest("Wrong strength", "Pharmacist", "ret-key-1", "CASH-VOUCHER-1"), CancellationToken.None);
         Assert.IsType<ObjectResult>(returned);
 
         var invoice = await db.Invoices.FindAsync(invoiceId);

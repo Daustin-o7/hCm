@@ -20,7 +20,7 @@ public class Section5IndianFyNumberingTests
             .UseInMemoryDatabase(databaseName: dbName ?? Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static InvoicesController CreateController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "ClinicAdmin")

@@ -27,7 +27,7 @@ public class Section2StaffRosterTests
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static JsonElement ToJson(object? value)
@@ -142,6 +142,7 @@ public class Section2StaffRosterTests
         db.Tenants.Add(tenant);
         db.Clinics.Add(clinic);
         db.Users.Add(admin);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -149,6 +150,7 @@ public class Section2StaffRosterTests
         {
             new Claim("sub", adminId.ToString()),
             new Claim("role", "ClinicAdmin"),
+            new Claim("clinicId", clinicId.ToString()),
             new Claim("tenant_id", tenantId.ToString())
         };
         var httpContext = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth")) };
@@ -189,6 +191,7 @@ public class Section2StaffRosterTests
         var admin = new User { Id = adminId, TenantId = tenantId, ClinicId = clinicId, Email = "admin@hospital.com", Role = UserRole.ClinicAdmin, Name = "Admin" };
         db.Clinics.Add(clinic);
         db.Users.Add(admin);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -196,6 +199,7 @@ public class Section2StaffRosterTests
         {
             new Claim("sub", adminId.ToString()),
             new Claim("role", "ClinicAdmin"),
+            new Claim("clinicId", clinicId.ToString()),
             new Claim("tenant_id", tenantId.ToString())
         };
         controller.ControllerContext = new ControllerContext
@@ -247,6 +251,7 @@ public class Section2StaffRosterTests
         db.Users.AddRange(nurseUserA, nurseUserB, adminUser);
         db.NurseProfiles.AddRange(nurseProfileA, nurseProfileB);
         db.NurseShifts.AddRange(shiftA, shiftB);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -257,6 +262,7 @@ public class Section2StaffRosterTests
             HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity([
                 new Claim("sub", nurseUserA.Id.ToString()),
                 new Claim("role", "Nurse"),
+                new Claim("clinicId", clinicId.ToString()),
                 new Claim("tenant_id", tenantId.ToString())
             ], "TestAuth")) }
         };
@@ -278,6 +284,7 @@ public class Section2StaffRosterTests
             HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity([
                 new Claim("sub", nurseUserB.Id.ToString()),
                 new Claim("role", "Nurse"),
+                new Claim("clinicId", clinicId.ToString()),
                 new Claim("tenant_id", tenantId.ToString())
             ], "TestAuth")) }
         };
@@ -291,6 +298,7 @@ public class Section2StaffRosterTests
             HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity([
                 new Claim("sub", adminUser.Id.ToString()),
                 new Claim("role", "ClinicAdmin"),
+                new Claim("clinicId", clinicId.ToString()),
                 new Claim("tenant_id", tenantId.ToString())
             ], "TestAuth")) }
         };
@@ -360,6 +368,7 @@ public class Section2StaffRosterTests
             TargetNurseProfileId = Guid.NewGuid()
         };
         db.ShiftChangeRequests.Add(swap);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -421,6 +430,7 @@ public class Section2StaffRosterTests
         db.NurseProfiles.Add(nurseProfile);
         db.NurseShifts.Add(assignedShift);
         db.LeaveRequests.Add(leave);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var nurseController = new NurseController(db, NullLogger<NurseController>.Instance);
@@ -429,6 +439,7 @@ public class Section2StaffRosterTests
             HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity([
                 new Claim("sub", adminId.ToString()),
                 new Claim("role", "ClinicAdmin"),
+                new Claim("clinicId", clinicId.ToString()),
                 new Claim("tenant_id", tenantId.ToString())
             ], "TestAuth")) }
         };
@@ -445,6 +456,14 @@ public class Section2StaffRosterTests
         Assert.Null(shiftAfter.NurseProfileId);
         Assert.Equal(ShiftStatus.Open, shiftAfter.Status);
         Assert.Contains("Coverage needed: Nurse on approved leave", shiftAfter.Notes);
+    }
+
+    private static void SeedMemberships(HospitalCrmDbContext db, Guid tenantId, Guid clinicId)
+    {
+        if (!db.Clinics.Local.Any(c => c.Id == clinicId))
+            db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId });
+        foreach (var user in db.Users.Local.Where(u => u.ClinicId == clinicId).ToArray())
+            db.TenantMemberships.Add(new TenantMembership { UserId = user.Id, TenantId = tenantId, ClinicId = clinicId, Role = user.Role });
     }
 
     private static void SetCaller(ControllerBase controller, Guid userId, string role, Guid tenantId, Guid? clinicId = null)
@@ -494,6 +513,7 @@ public class Section2StaffRosterTests
         var nurse = new User { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, Email = "nurse@clinic.com", Role = UserRole.Nurse, Name = "Nurse" };
         var designee = new User { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, Email = "designee@clinic.com", Role = UserRole.Nurse, Name = "Designee" };
         db.Users.AddRange(admin, nurse, designee);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -557,6 +577,7 @@ public class Section2StaffRosterTests
             TargetShiftId = shiftB.Id
         };
         db.ShiftChangeRequests.Add(swap);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -617,6 +638,7 @@ public class Section2StaffRosterTests
             TargetShiftId = targetShift.Id
         };
         db.ShiftChangeRequests.Add(swap);
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);
@@ -648,6 +670,7 @@ public class Section2StaffRosterTests
         db.NurseShifts.AddRange(
             new NurseShift { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, Date = day, ShiftType = ShiftType.Morning, Status = ShiftStatus.Assigned, NurseProfileId = nurseProfile.Id, ShiftTemplateId = template.Id },
             new NurseShift { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, Date = day, ShiftType = ShiftType.Morning, Status = ShiftStatus.Assigned, NurseProfileId = otherProfile.Id, ShiftTemplateId = template.Id });
+        SeedMemberships(db, tenantId, clinicId);
         await db.SaveChangesAsync();
 
         var controller = new StaffRosterController(db, NullLogger<StaffRosterController>.Instance);

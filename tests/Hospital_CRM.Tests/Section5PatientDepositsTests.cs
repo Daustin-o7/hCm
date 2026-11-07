@@ -21,7 +21,7 @@ public class Section5PatientDepositsTests
             .UseInMemoryDatabase(databaseName: dbName ?? Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static PatientDepositsController CreateController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "Receptionist")
@@ -101,7 +101,8 @@ public class Section5PatientDepositsTests
             Amount: 5000m,
             Method: PaymentMethod.UPI,
             ReferenceNumber: "UPI-DEP-998811",
-            Notes: "Advance for planned surgery"
+            Notes: "Advance for planned surgery",
+            IdempotencyKey: $"DEP-{Guid.NewGuid():N}"
         );
         var res1 = await controller.CollectDeposit(patient.Id, req1, CancellationToken.None);
         var obj1 = Assert.IsType<ObjectResult>(res1);
@@ -117,7 +118,8 @@ public class Section5PatientDepositsTests
         var req2 = new CreatePatientDepositRequest(
             Amount: 3000m,
             Method: PaymentMethod.Cash,
-            Notes: "Second cash advance"
+            Notes: "Second cash advance",
+            IdempotencyKey: $"DEP-{Guid.NewGuid():N}"
         );
         var res2 = await controller.CollectDeposit(patient.Id, req2, CancellationToken.None);
         var obj2 = Assert.IsType<ObjectResult>(res2);
@@ -238,7 +240,7 @@ public class Section5PatientDepositsTests
 
         // Apply full invoice balance (₹2,500) from patient advance
         // FIFO must consume dep1 (₹1,000 fully) and ₹1,500 from dep2 (leaving ₹500 balance)
-        var res = await controller.ApplyAdvanceToInvoice(invoice.Id, new ApplyAdvanceRequest(2500m), CancellationToken.None);
+        var res = await controller.ApplyAdvanceToInvoice(invoice.Id, new ApplyAdvanceRequest(2500m, IdempotencyKey: $"ADV-{Guid.NewGuid():N}"), CancellationToken.None);
         var ok = Assert.IsType<OkObjectResult>(res);
 
         var doc = ToJsonDoc(ok.Value);
@@ -302,12 +304,12 @@ public class Section5PatientDepositsTests
         var controller = CreateController(db, tenantId, receptionistId);
 
         // Requesting ₹800 exceeds available advance of ₹400
-        var res1 = await controller.ApplyAdvanceToInvoice(invoice.Id, new ApplyAdvanceRequest(800m), CancellationToken.None);
+        var res1 = await controller.ApplyAdvanceToInvoice(invoice.Id, new ApplyAdvanceRequest(800m, IdempotencyKey: $"ADV-{Guid.NewGuid():N}"), CancellationToken.None);
         var bad1 = Assert.IsType<BadRequestObjectResult>(res1);
         Assert.Contains("amount_exceeds_available_advance", bad1.Value?.ToString() ?? "");
 
         // Requesting ₹1,500 exceeds invoice balance due of ₹1,000
-        var res2 = await controller.ApplyAdvanceToInvoice(invoice.Id, new ApplyAdvanceRequest(1500m), CancellationToken.None);
+        var res2 = await controller.ApplyAdvanceToInvoice(invoice.Id, new ApplyAdvanceRequest(1500m, IdempotencyKey: $"ADV-{Guid.NewGuid():N}"), CancellationToken.None);
         var bad2 = Assert.IsType<BadRequestObjectResult>(res2);
         Assert.Contains("amount_exceeds_balance", bad2.Value?.ToString() ?? "");
     }

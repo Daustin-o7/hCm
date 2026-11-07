@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Hospital_CRM.Api.Services;
 using Xunit;
 
@@ -92,5 +93,43 @@ public class PaymentWebhookCodecTests
     public void Malformed_Json_Returns_Null()
     {
         Assert.Null(PaymentWebhookCodec.TryParse("paytm", "not-json"));
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("[]")]
+    [InlineData("{\"event\":42}")]
+    [InlineData("{\"event\":null}")]
+    [InlineData("{\"event\":{},\"payload\":{}}")]
+    public void Malformed_Razorpay_Envelope_Does_Not_Throw(string body) =>
+        Assert.Null(PaymentWebhookCodec.TryParse("razorpay", body));
+
+    [Theory]
+    [InlineData("authorized", "INR", "10000")]
+    [InlineData("captured", "USD", "10000")]
+    [InlineData("captured", "INR", "0")]
+    [InlineData("captured", "INR", "-1")]
+    [InlineData("captured", "INR", "100.5")]
+    [InlineData("captured", "INR", "null")]
+    [InlineData("captured", "INR", "\"not-money\"")]
+    public void Razorpay_Requires_Positive_Whole_Paise_Captured_Inr(string status, string currency, string amount)
+    {
+        using var amountJson = JsonDocument.Parse(amount);
+        var body = JsonSerializer.Serialize(new { @event = "payment.captured", payload = new { payment = new { entity = new { id = "pay_test", status, currency, amount = amountJson.RootElement } } } });
+        Assert.Null(PaymentWebhookCodec.TryParse("razorpay", body));
+    }
+
+    [Theory]
+    [InlineData("\"id\":null,")]
+    [InlineData("\"status\":null,")]
+    [InlineData("\"currency\":null,")]
+    [InlineData("\"amount\":null,")]
+    public void Razorpay_Notes_Cannot_Supply_Missing_Authoritative_Fields(string missing)
+    {
+        var fields = "\"id\":\"pay_test\",\"status\":\"captured\",\"currency\":\"INR\",\"amount\":10000,";
+        var name = missing.Split(':')[0];
+        fields = string.Join(',', fields.Split(',').Where(f => f.Length > 0 && !f.StartsWith(name, StringComparison.Ordinal))) + ',';
+        var body = "{\"event\":\"payment.captured\",\"payload\":{\"payment\":{\"entity\":{" + fields + missing + "\"notes\":{\"id\":\"pay_notes\",\"status\":\"captured\",\"currency\":\"INR\",\"amount\":10000}}}}}";
+        Assert.Null(PaymentWebhookCodec.TryParse("razorpay", body));
     }
 }

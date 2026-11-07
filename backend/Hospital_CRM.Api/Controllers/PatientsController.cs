@@ -1,5 +1,9 @@
 using System.ComponentModel.DataAnnotations;
+using System.Data;
 using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Api.Services;
@@ -30,142 +34,205 @@ public class PatientsController : ControllerBase
     [HttpPost]
     [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
     [RequirePermission(Permissions.PatientWrite)]
-    public async Task<IActionResult> Register([FromBody] PatientRegisterRequest request, CancellationToken ct)
+    public Task<IActionResult> Register([FromBody] PatientRegisterRequest request, CancellationToken ct) =>
+        RegisterPatientAsync(request, ct);
+
+    internal async Task<IActionResult> RegisterPatientAsync(PatientRegisterRequest request, CancellationToken ct, Guid? clientId = null)
     {
         var userId = User.GetUserId();
-        if (!userId.HasValue)
+        var tenantId = User.GetTenantId();
+        if (!userId.HasValue || userId == Guid.Empty || !tenantId.HasValue || tenantId == Guid.Empty)
             return Unauthorized(new { error = "invalid_token" });
 
-        if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Phone))
+        if (request == null || string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Phone))
             return BadRequest(new { error = "name_and_phone_required" });
+        request = request with { Name = request.Name.Trim(), Phone = request.Phone.Trim(), Address = request.Address?.Trim() };
+        if (request.Name.Length is < 2 or > 100 || !Regex.IsMatch(request.Phone, @"^[6-9][0-9]{9}$")
+            || request.ApproxAge is < 0 or > 130 || request.Address?.Length > 500
+            || !string.IsNullOrWhiteSpace(request.Gender) && request.Gender.ToLowerInvariant() is not ("male" or "female" or "other" or "prefernottosay"))
+            return BadRequest(new { error = "invalid_patient_demographics" });
+        if (request.IdempotencyKey?.Length > 128 || !string.IsNullOrWhiteSpace(request.IdempotencyKey)
+            && !Regex.IsMatch(request.IdempotencyKey, @"^IDEMP-PAT-[a-zA-Z0-9\-]+$") && !Guid.TryParse(request.IdempotencyKey, out _))
+            return BadRequest(new { error = "invalid_idempotency_key" });
 
         if (request.Dob is null && request.ApproxAge is null)
             return BadRequest(new { error = "either_dob_or_approxAge_required" });
 
-        if (request.Consent is null || !request.Consent.Accepted)
+        if (request.Consent is null || !request.Consent.Accepted || string.IsNullOrWhiteSpace(request.Consent.Purpose)
+            || request.Consent.Purpose.Length > 200)
             return BadRequest(new { error = "consent_required" });
+        if (request.Consent.Purpose.Trim() is not ("care_delivery" or "direct_care"))
+            return BadRequest(new { error = "care_delivery_consent_required" });
+        if (request.GuardianName?.Length > 100 || request.GuardianRelationship?.Length > 50 || request.NoticeVersion?.Length > 50
+            || request.Language?.Length > 10 || request.CaptureMethod?.Length > 50)
+            return BadRequest(new { error = "invalid_consent_metadata" });
 
-        // 1. Same person = phone AND name AND date of birth. Name alone is not enough:
-        //    Indian families share one phone and relatives can share a name.
-        var sameNameAndPhone = await _db.Patients
-            .FirstOrDefaultAsync(p => p.Phone == request.Phone && p.Name.ToLower() == request.Name.Trim().ToLower(), ct);
-
-        if (sameNameAndPhone is not null && request.Dob.HasValue && sameNameAndPhone.Dob == request.Dob)
-            return Ok(new { patientId = sameNameAndPhone.Id, possibleDuplicateOf = sameNameAndPhone.Id, uhid = sameNameAndPhone.Uhid });
-
-        // 2. Family phone sharing check: allow multiple patients per phone if confirmed
-        if (!request.ConfirmDifferentPersonOnSamePhone)
+        await using var transaction = _db.Database.IsRelational() && _db.Database.CurrentTransaction == null
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            var familyMember = sameNameAndPhone
-                ?? await _db.Patients.FirstOrDefaultAsync(p => p.Phone == request.Phone, ct);
-
-            if (familyMember is not null)
+            var requestHash = RegistrationRequestHash(request);
+            Patient? saved = null;
+            // A registration is immutable even when its demographics or consent state later change.
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
             {
-                return Ok(new
+                saved = await _db.Patients.Include(p => p.Consents)
+                    .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.IdempotencyKey == request.IdempotencyKey, ct);
+                if (saved is not null)
                 {
-                    patientId = (Guid?)null,
-                    sharedPhoneDetected = true,
-                    existingFamilyMemberName = familyMember.Name,
-                    existingPatientId = familyMember.Id,
-                    message = $"Phone number {request.Phone} is already registered under '{familyMember.Name}'. Pass confirmDifferentPersonOnSamePhone: true to register as a family member."
-                });
+                    var originalHash = await _db.PatientAuditLogs.Where(a => a.PatientId == saved.Id
+                        && a.FieldName == "REGISTRATION_REQUEST_V1" && a.OldValue == request.IdempotencyKey)
+                        .Select(a => a.NewValue).FirstOrDefaultAsync(ct);
+                    if (originalHash is not null)
+                        return originalHash == requestHash
+                            ? Ok(RegistrationResult(saved, idempotentReplay: true))
+                            : Conflict(new { error = "idempotency_key_conflict" });
+                }
             }
-        }
+            var timezone = await _db.Clinics.Where(c => c.TenantId == tenantId).Select(c => c.Timezone).FirstOrDefaultAsync(ct);
+            var today = new TimezoneService().GetClinicToday(timezone);
+            if (request.Dob > today || request.Dob < today.AddYears(-130))
+                return BadRequest(new { error = "invalid_patient_date_of_birth" });
+            var age = request.ApproxAge ?? 0;
+            if (request.Dob is { } dob)
+            {
+                age = today.Year - dob.Year;
+                if (dob > today.AddYears(-age)) age--;
+            }
+            if (age < 18 && (string.IsNullOrWhiteSpace(request.GuardianName) || string.IsNullOrWhiteSpace(request.GuardianRelationship)))
+                return BadRequest(new { error = "guardian_consent_required", message = "Record the guardian's name and relationship for a minor." });
 
-        // 3. Idempotency check
-        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
-        {
-            var existing = await _db.Patients
-                .FirstOrDefaultAsync(p => p.IdempotencyKey == request.IdempotencyKey, ct);
-            if (existing is not null)
-                return Ok(new { patientId = existing.Id, possibleDuplicateOf = (Guid?)null, uhid = existing.Uhid });
-        }
+            // A lost response must replay the registration, not trigger the family-phone warning.
+            if (saved is { } existing)
+            {
+                if (existing.Name != request.Name || existing.Phone != request.Phone || existing.Dob != request.Dob
+                    || existing.ApproxAge != request.ApproxAge || existing.Gender != ParseGender(request.Gender)
+                    || existing.Address != request.Address || !existing.Consents.Any(c => c.Purpose == request.Consent.Purpose.Trim()
+                        && c.GuardianName == request.GuardianName?.Trim() && c.GuardianRelationship == request.GuardianRelationship?.Trim()
+                        && c.NoticeVersion == (string.IsNullOrWhiteSpace(request.NoticeVersion) ? "v1.0" : request.NoticeVersion.Trim())
+                        && c.Language == (string.IsNullOrWhiteSpace(request.Language) ? "en" : request.Language.Trim())
+                        && c.CaptureMethod == (string.IsNullOrWhiteSpace(request.CaptureMethod) ? "receptionist_assisted" : request.CaptureMethod.Trim()))
+                    || request.WhatsAppOptIn != existing.Consents.Any(c => c.Purpose == "whatsapp_opt_in"))
+                    return Conflict(new { error = "idempotency_key_conflict" });
+                // shortcut: legacy registrations have no original hash; use their persisted evidence until manually reconciled.
+                return Ok(RegistrationResult(existing, idempotentReplay: true));
+            }
+            if (clientId.HasValue && await _db.Patients.AnyAsync(p => p.Id == clientId, ct))
+                return Conflict(new { error = "patient_id_conflict" });
 
-        // 4. Generate per-clinic human-readable UHID (sequential per tenant + month)
-        var uhid = await NextUhidAsync(ct);
+            // 1. Same person = phone AND name AND date of birth. Name alone is not enough:
+            //    Indian families share one phone and relatives can share a name.
+            var samePerson = request.Dob.HasValue
+                ? await _db.Patients.Include(p => p.Consents).FirstOrDefaultAsync(p => p.TenantId == tenantId
+                    && p.Phone == request.Phone && p.Name.ToLower() == request.Name.ToLower() && p.Dob == request.Dob, ct)
+                : null;
 
-        var patient = new Patient
-        {
-            Id = Guid.NewGuid(),
-            Name = request.Name,
-            Uhid = uhid,
-            Phone = request.Phone,
-            DobHasValue = request.Dob.HasValue,
-            Dob = request.Dob,
-            ApproxAge = request.ApproxAge,
-            Gender = ParseGender(request.Gender),
-            Address = request.Address,
-            CreatedBy = userId.Value,
-            CreatedAt = DateTimeOffset.UtcNow,
-            IdempotencyKey = request.IdempotencyKey
-        };
+            if (samePerson is not null)
+                return Ok(RegistrationResult(samePerson, possibleDuplicateOf: samePerson.Id));
 
-        // 5. Versioned DPDP Treatment Consent record
-        var consent = new PatientConsent
-        {
-            Id = Guid.NewGuid(),
-            PatientId = patient.Id,
-            Purpose = request.Consent.Purpose,
-            NoticeVersion = string.IsNullOrWhiteSpace(request.NoticeVersion) ? "v1.0" : request.NoticeVersion,
-            Language = string.IsNullOrWhiteSpace(request.Language) ? "en" : request.Language,
-            CaptureMethod = string.IsNullOrWhiteSpace(request.CaptureMethod) ? "receptionist_assisted" : request.CaptureMethod,
-            GuardianName = request.GuardianName,
-            GuardianRelationship = request.GuardianRelationship,
-            CapturedBy = userId.Value,
-            CapturedAt = DateTimeOffset.UtcNow
-        };
+            // 2. Family phone sharing check: allow multiple patients per phone if confirmed
+            if (!request.ConfirmDifferentPersonOnSamePhone)
+            {
+                var familyMember = await _db.Patients.FirstOrDefaultAsync(p => p.TenantId == tenantId && p.Phone == request.Phone, ct);
 
-        _db.Patients.Add(patient);
-        _db.PatientConsents.Add(consent);
+                if (familyMember is not null)
+                {
+                    return Ok(new
+                    {
+                        patientId = (Guid?)null,
+                        sharedPhoneDetected = true,
+                        existingFamilyMemberName = familyMember.Name,
+                        existingPatientId = familyMember.Id,
+                        message = $"Phone number {request.Phone} is already registered under '{familyMember.Name}'. Pass confirmDifferentPersonOnSamePhone: true to register as a family member."
+                    });
+                }
+            }
 
-        // Separate WhatsApp opt-in consent record
-        if (request.WhatsAppOptIn)
-        {
-            var whatsappConsent = new PatientConsent
+            // 4. Generate per-clinic human-readable UHID (sequential per tenant + month)
+            var uhid = await NextUhidAsync(tenantId.Value, ct);
+
+            var patient = new Patient
+            {
+                Id = clientId ?? Guid.NewGuid(),
+                TenantId = tenantId.Value,
+                Name = request.Name,
+                Uhid = uhid,
+                Phone = request.Phone,
+                DobHasValue = request.Dob.HasValue,
+                Dob = request.Dob,
+                ApproxAge = request.ApproxAge,
+                Gender = ParseGender(request.Gender),
+                Address = request.Address,
+                CreatedBy = userId.Value,
+                CreatedAt = DateTimeOffset.UtcNow,
+                IdempotencyKey = request.IdempotencyKey
+            };
+
+            // 5. Versioned DPDP Treatment Consent record
+            var consent = new PatientConsent
             {
                 Id = Guid.NewGuid(),
                 PatientId = patient.Id,
-                Purpose = "whatsapp_opt_in",
-                NoticeVersion = string.IsNullOrWhiteSpace(request.NoticeVersion) ? "v1.0" : request.NoticeVersion,
-                Language = string.IsNullOrWhiteSpace(request.Language) ? "en" : request.Language,
-                CaptureMethod = string.IsNullOrWhiteSpace(request.CaptureMethod) ? "receptionist_assisted" : request.CaptureMethod,
-                GuardianName = request.GuardianName,
-                GuardianRelationship = request.GuardianRelationship,
+                TenantId = tenantId.Value,
+                Purpose = request.Consent.Purpose.Trim(),
+                NoticeVersion = string.IsNullOrWhiteSpace(request.NoticeVersion) ? "v1.0" : request.NoticeVersion.Trim(),
+                Language = string.IsNullOrWhiteSpace(request.Language) ? "en" : request.Language.Trim(),
+                CaptureMethod = string.IsNullOrWhiteSpace(request.CaptureMethod) ? "receptionist_assisted" : request.CaptureMethod.Trim(),
+                GuardianName = request.GuardianName?.Trim(),
+                GuardianRelationship = request.GuardianRelationship?.Trim(),
                 CapturedBy = userId.Value,
                 CapturedAt = DateTimeOffset.UtcNow
             };
-            _db.PatientConsents.Add(whatsappConsent);
-        }
 
-        // A concurrent registration can take the same number between read and write;
-        // the unique index rejects it, so take the next one instead of failing the desk.
-        for (var attempt = 1; ; attempt++)
-        {
-            try
-            {
-                await _db.SaveChangesAsync(ct);
-                break;
-            }
-            catch (DbUpdateException ex) when (ex.IsUniqueViolation() && attempt < 3)
-            {
-                patient.Uhid = await NextUhidAsync(ct);
-            }
-        }
+            _db.Patients.Add(patient);
+            _db.PatientConsents.Add(consent);
 
-        return StatusCode(201, new
+            // Separate WhatsApp opt-in consent record
+            if (request.WhatsAppOptIn)
+            {
+                var whatsappConsent = new PatientConsent
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId.Value,
+                    PatientId = patient.Id,
+                    Purpose = "whatsapp_opt_in",
+                    NoticeVersion = consent.NoticeVersion,
+                    Language = consent.Language,
+                    CaptureMethod = consent.CaptureMethod,
+                    GuardianName = consent.GuardianName,
+                    GuardianRelationship = consent.GuardianRelationship,
+                    CapturedBy = userId.Value,
+                    CapturedAt = DateTimeOffset.UtcNow
+                };
+                _db.PatientConsents.Add(whatsappConsent);
+            }
+
+            _db.PatientAuditLogs.Add(new PatientAuditLog
+            {
+                Id = Guid.NewGuid(),
+                PatientId = patient.Id,
+                ChangedBy = userId.Value,
+                FieldName = "REGISTRATION_REQUEST_V1",
+                OldValue = request.IdempotencyKey ?? "",
+                NewValue = requestHash,
+                ChangedAt = patient.CreatedAt
+            });
+
+            await _db.SaveChangesAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
+
+            // Sync owns its outer transaction and must index only after that transaction commits.
+            if (!clientId.HasValue && (transaction != null || _db.Database.CurrentTransaction == null))
+                await _search.IndexAsync(patient, ct);
+
+            return StatusCode(201, RegistrationResult(patient));
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex) || ex is DbUpdateException update && update.IsUniqueViolation())
         {
-            id = patient.Id,
-            uhid = patient.Uhid,
-            name = patient.Name,
-            phone = patient.Phone,
-            gender = patient.Gender.ToString(),
-            dob = patient.Dob?.ToString("yyyy-MM-dd"),
-            approxAge = patient.ApproxAge,
-            address = patient.Address,
-            createdAt = patient.CreatedAt,
-            patientId = patient.Id,
-            possibleDuplicateOf = (Guid?)null
-        });
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "patient_changed_concurrently", message = "Retry registration with the same key." });
+        }
     }
 
     [HttpGet]
@@ -176,7 +243,7 @@ public class PatientsController : ControllerBase
         var userId = User.GetUserId();
         if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var patients = await _db.Patients.AsNoTracking()
+        var patients = await _db.Patients.AsNoTracking().Include(p => p.Consents)
             .OrderByDescending(p => p.CreatedAt)
             .Take(1000)
             .ToListAsync(ct);
@@ -192,7 +259,8 @@ public class PatientsController : ControllerBase
             approxAge = patient.ApproxAge,
             address = patient.Address,
             createdAt = patient.CreatedAt,
-            patientId = patient.Id
+            patientId = patient.Id,
+            consents = ConsentEvidence(patient)
         }));
     }
 
@@ -203,30 +271,37 @@ public class PatientsController : ControllerBase
     public async Task<IActionResult> Search([FromQuery] string? q, CancellationToken ct)
     {
         var userId = User.GetUserId();
-        if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
-
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
+        var tenantId = User.GetTenantId();
+        if (!userId.HasValue || userId == Guid.Empty || !tenantId.HasValue || tenantId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_token" });
 
         if (string.IsNullOrWhiteSpace(q) || q.Trim().Length < 2)
             return BadRequest(new { error = "query_too_short_min_2_chars", message = "Patient search query must be at least 2 characters." });
+        if (tenantId != _db.CurrentTenantId)
+            return StatusCode(403, new { error = "tenant_scope_mismatch" });
 
         var term = q.Trim();
         if (term.Length > 255) term = term[..255];
 
-        // PHI access audit log
-        _db.PatientAuditLogs.Add(new PatientAuditLog
+        // Search authorizes a collection read; there is no single patient FK to audit.
+        _db.AuthAuditLogs.Add(new AuthAuditLog
         {
-            Id = Guid.NewGuid(),
-            PatientId = Guid.Empty,
-            FieldName = "SEARCH",
-            OldValue = string.Empty,
-            NewValue = term,
-            ChangedBy = userId.Value,
-            ChangedAt = DateTimeOffset.UtcNow
+            TenantId = tenantId.Value,
+            UserId = userId.Value,
+            EventType = "patient_search_authorized",
+            Outcome = "success"
         });
         await _db.SaveChangesAsync(ct);
 
-        var hits = await _search.SearchAsync(term, tenantId, limit: 10, ct);
+        List<PatientSearchHit> hits;
+        try
+        {
+            hits = await _search.SearchAsync(term, tenantId.Value, limit: 10, ct);
+        }
+        catch (SearchUnavailableException ex) when (!ct.IsCancellationRequested)
+        {
+            return StatusCode(503, new { error = "search_unavailable", message = ex.Message });
+        }
 
         // Composite dropdown format: name + DOB + last 4 phone (Zero excess PHI)
         var results = hits.Select(h => new
@@ -274,13 +349,24 @@ public class PatientsController : ControllerBase
     public async Task<IActionResult> CheckDuplicate([FromBody] CheckDuplicateRequest request, CancellationToken ct)
     {
         var userId = User.GetUserId();
-        if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
+        var tenantId = User.GetTenantId();
+        if (!userId.HasValue || userId == Guid.Empty || !tenantId.HasValue || tenantId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_token" });
 
         if (string.IsNullOrWhiteSpace(request.Name))
             return BadRequest(new { error = "name_required" });
 
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
-        var hits = await _search.CheckDuplicatesAsync(request.Name, request.Phone, request.Dob, tenantId, ct);
+        if (tenantId != _db.CurrentTenantId)
+            return StatusCode(403, new { error = "tenant_scope_mismatch" });
+        List<PatientSearchHit> hits;
+        try
+        {
+            hits = await _search.CheckDuplicatesAsync(request.Name, request.Phone, request.Dob, tenantId.Value, ct);
+        }
+        catch (SearchUnavailableException ex) when (!ct.IsCancellationRequested)
+        {
+            return StatusCode(503, new { error = "search_unavailable", message = ex.Message });
+        }
 
         var potentialMatches = hits.Select(h => new
         {
@@ -346,7 +432,7 @@ public class PatientsController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.ReasonCode))
             return BadRequest(new { error = "reason_code_required" });
 
-        var patient = await _db.Patients.FirstOrDefaultAsync(p => p.Id == id, ct);
+        var patient = await _db.Patients.Include(p => p.Consents).FirstOrDefaultAsync(p => p.Id == id, ct);
         if (patient is null)
             return NotFound(new { error = "patient_not_found" });
 
@@ -375,12 +461,12 @@ public class PatientsController : ControllerBase
     /// 9000 random 4-digit values collide long before a clinic's monthly volume.
     /// Tenant scope comes from the global query filter, not a hand-written predicate.
     /// </summary>
-    private async Task<string> NextUhidAsync(CancellationToken ct)
+    private async Task<string> NextUhidAsync(Guid tenantId, CancellationToken ct)
     {
         var prefix = $"UHID-{DateTime.UtcNow:yyyyMM}-";
         var last = await _db.Patients
-            .Where(p => p.Uhid != null && p.Uhid.StartsWith(prefix))
-            .OrderByDescending(p => p.Uhid)
+            .Where(p => p.TenantId == tenantId && p.Uhid != null && p.Uhid.StartsWith(prefix))
+            .OrderByDescending(p => p.Uhid!.Length).ThenByDescending(p => p.Uhid)
             .Select(p => p.Uhid)
             .FirstOrDefaultAsync(ct);
 
@@ -414,6 +500,7 @@ public class PatientsController : ControllerBase
         var result = new Dictionary<string, object?>
         {
             ["id"] = patient.Id,
+            ["uhid"] = patient.Uhid,
             ["name"] = patient.Name,
             ["phone"] = patient.Phone,
             ["dobHasValue"] = patient.DobHasValue,
@@ -421,7 +508,8 @@ public class PatientsController : ControllerBase
             ["approxAge"] = patient.ApproxAge,
             ["gender"] = patient.Gender.ToString().ToLower(),
             ["address"] = patient.Address,
-            ["createdAt"] = patient.CreatedAt
+            ["createdAt"] = patient.CreatedAt,
+            ["consents"] = ConsentEvidence(patient)
         };
 
         if (!isReceptionist)
@@ -499,9 +587,7 @@ public class PatientsController : ControllerBase
 
         await _db.SaveChangesAsync(ct);
 
-        // Typesense write-through is handled asynchronously by the nightly Hangfire reindex job.
-        // Removed fire-and-forget IndexAsync to avoid cancellation-on-request-end issues;
-        // the reindex job will reconcile any unsynced patients.
+        await _search.IndexAsync(patient, ct);
 
         return Ok(new { patientId = patient.Id, updatedAt = now });
     }
@@ -516,6 +602,58 @@ public class PatientsController : ControllerBase
             _ => Gender.PreferNotToSay
         };
     }
+
+    private static string RegistrationRequestHash(PatientRegisterRequest request) =>
+        Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            request.Name,
+            request.Phone,
+            request.Dob,
+            request.ApproxAge,
+            Gender = ParseGender(request.Gender),
+            request.Address,
+            Purpose = request.Consent!.Purpose.Trim(),
+            request.WhatsAppOptIn,
+            GuardianName = request.GuardianName?.Trim(),
+            GuardianRelationship = request.GuardianRelationship?.Trim(),
+            NoticeVersion = string.IsNullOrWhiteSpace(request.NoticeVersion) ? "v1.0" : request.NoticeVersion.Trim(),
+            Language = string.IsNullOrWhiteSpace(request.Language) ? "en" : request.Language.Trim(),
+            CaptureMethod = string.IsNullOrWhiteSpace(request.CaptureMethod) ? "receptionist_assisted" : request.CaptureMethod.Trim(),
+            request.ConfirmDifferentPersonOnSamePhone
+        })));
+
+    private static object ConsentEvidence(Patient patient) => patient.Consents.OrderBy(c => c.CapturedAt).ThenBy(c => c.Id).Select(c => new
+    {
+        id = c.Id,
+        patientId = c.PatientId,
+        purpose = c.Purpose,
+        noticeVersion = c.NoticeVersion,
+        language = c.Language,
+        captureMethod = c.CaptureMethod,
+        guardianName = c.GuardianName,
+        guardianRelationship = c.GuardianRelationship,
+        capturedBy = c.CapturedBy,
+        capturedAt = c.CapturedAt,
+        withdrawnAt = c.WithdrawnAt
+    }).ToArray();
+
+    private static object RegistrationResult(Patient patient, bool idempotentReplay = false, Guid? possibleDuplicateOf = null) => new
+    {
+        id = patient.Id,
+        patientId = patient.Id,
+        uhid = patient.Uhid,
+        name = patient.Name,
+        phone = patient.Phone,
+        gender = patient.Gender.ToString(),
+        dob = patient.Dob?.ToString("yyyy-MM-dd"),
+        approxAge = patient.ApproxAge,
+        address = patient.Address,
+        createdAt = patient.CreatedAt,
+        idempotencyKey = patient.IdempotencyKey,
+        possibleDuplicateOf,
+        idempotentReplay,
+        consents = ConsentEvidence(patient)
+    };
 }
 
 public record PatientRegisterRequest(
@@ -538,7 +676,7 @@ public record PatientRegisterRequest(
     [Required(ErrorMessage = "Patient consent is mandatory for registration")]
     ConsentRequest? Consent,
 
-    [RegularExpression(@"^IDEMP-PAT-[a-zA-Z0-9\-]+$", ErrorMessage = "IdempotencyKey must follow format IDEMP-PAT-{UUID}")]
+    [MaxLength(128), RegularExpression(@"^(IDEMP-PAT-[a-zA-Z0-9\-]+|[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$", ErrorMessage = "IdempotencyKey must follow format IDEMP-PAT-{UUID} or be a UUID")]
     string? IdempotencyKey,
 
     bool WhatsAppOptIn = false,

@@ -55,7 +55,7 @@ public class Section2AuthTokenTests
     private static HospitalCrmDbContext CreateInMemoryDb(ITenantContext? tenantContext = null) =>
         new(new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase($"Sec2Tokens_{Guid.NewGuid()}")
-            .Options, tenantContext);
+            .Options, tenantContext ?? TestMaintenanceTenantContext.Instance);
 
     private static T Json<T>(IActionResult result)
     {
@@ -66,8 +66,9 @@ public class Section2AuthTokenTests
     [Fact]
     public async Task Invite_StoresADigestOnly_AndNeverLogsTheRawToken()
     {
-        var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
+        var tenantContext = new StubTenantContext { CurrentTenantId = tenantId };
+        var db = CreateInMemoryDb(tenantContext);
         var adminId = Guid.NewGuid();
         var admin = new User
         {
@@ -80,10 +81,16 @@ public class Section2AuthTokenTests
             PasswordHash = "x"
         };
         db.Users.Add(admin);
+        db.Clinics.Add(new Clinic { Id = admin.ClinicId!.Value, TenantId = tenantId, Name = "Selected clinic" });
+        db.TenantMemberships.Add(new TenantMembership
+        {
+            UserId = adminId, TenantId = tenantId, ClinicId = admin.ClinicId,
+            Role = UserRole.ClinicAdmin, Status = "active"
+        });
         await db.SaveChangesAsync();
 
         var logger = new CapturingLogger();
-        var controller = new StaffController(db, new StubTenantContext(), logger)
+        var controller = new StaffController(db, tenantContext, logger)
         {
             ControllerContext = new ControllerContext
             {
@@ -93,6 +100,7 @@ public class Section2AuthTokenTests
                     [
                         new Claim("sub", adminId.ToString()),
                         new Claim("tenant_id", tenantId.ToString()),
+                        new Claim("clinicId", admin.ClinicId.Value.ToString()),
                         new Claim(ClaimTypes.Role, "ClinicAdmin")
                     ], "TestAuth"))
                 }
@@ -105,6 +113,8 @@ public class Section2AuthTokenTests
         var body = Json<InviteResponse>(result);
         var invite = await db.StaffInvites.SingleAsync(i => i.Id == body.InviteId);
         Assert.Equal(body.InviteToken.HashToken(), invite.TokenHash);
+        Assert.Equal(tenantId, invite.TenantId);
+        Assert.Equal(admin.ClinicId, invite.ClinicId);
         Assert.DoesNotContain(body.InviteToken, invite.TokenHash);
         Assert.DoesNotContain(logger.Messages, m => m.Contains(body.InviteToken));
     }

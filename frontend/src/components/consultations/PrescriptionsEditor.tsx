@@ -16,31 +16,48 @@ export default function PrescriptionsEditor({
   const [medQuery, setMedQuery] = useState('')
   const [medHits, setMedHits] = useState<MedicineHit[]>([])
   const [isSearchingMeds, setIsSearchingMeds] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
 
   // Debounced Medicine Search
   useEffect(() => {
+    setMedHits([])
+    setSearchError(null)
+    setIsSearchingMeds(false)
     if (!medQuery.trim() || medQuery.length < 2) return
 
+    const controller = new AbortController()
     const timer = setTimeout(async () => {
       setIsSearchingMeds(true)
       try {
-        const res = await api.get(`/medicines/search?q=${encodeURIComponent(medQuery.trim())}&limit=8`)
-        setMedHits(res.data || [])
+        const res = await api.get(`/medicines/search?q=${encodeURIComponent(medQuery.trim())}&limit=8`, { signal: controller.signal })
+        if (!controller.signal.aborted) setMedHits(res.data || [])
       } catch {
-        // Search error handled gracefully
+        if (!controller.signal.aborted) setSearchError('Medicine search failed. Try again.')
       } finally {
-        setIsSearchingMeds(false)
+        if (!controller.signal.aborted) setIsSearchingMeds(false)
       }
     }, 200)
 
-    return () => clearTimeout(timer)
+    return () => { clearTimeout(timer); controller.abort() }
   }, [medQuery])
 
   const handleSelectMedicine = useCallback((hit: MedicineHit) => {
-    const medName = `${hit.dosageForm || 'Tab'}. ${hit.name} ${hit.strength || ''}`.trim()
+    const medName = [hit.dosageForm, hit.name, hit.strength].filter(Boolean).join(' ')
     onChangePrescriptions(prev => [
       ...prev,
-      { medicine: medName, dosage: '1 Tab', frequency: 'BID (Morning & Night)', duration: '5 Days' }
+      {
+        drugId: hit.id,
+        medicine: medName,
+        genericName: hit.genericName ?? hit.name,
+        brandName: hit.name,
+        dosageForm: hit.dosageForm,
+        strength: hit.strength,
+        dosage: hit.strength ?? '',
+        frequency: '',
+        duration: '',
+        scheduleClass: hit.scheduleClass,
+        isUnverified: hit.isUnverified
+      }
     ])
     setMedQuery('')
     setMedHits([])
@@ -88,16 +105,15 @@ export default function PrescriptionsEditor({
           )}
         </div>
 
+        {searchError && <p role="alert" className="text-xs text-rose-700 mt-2">{searchError}</p>}
         {medHits.length > 0 && (
           <div className="absolute left-0 right-0 mt-1 bg-white rounded-xl shadow-xl border border-slate-200 p-2 z-50 animate-fadein max-h-60 overflow-y-auto">
             {medHits.map((hit) => (
-              <div
+              <button
+                type="button"
                 key={hit.id}
                 onClick={() => handleSelectMedicine(hit)}
-                className="p-2 hover:bg-slate-50 rounded-lg cursor-pointer flex items-center justify-between text-xs transition-colors"
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleSelectMedicine(hit) }}
+                className="w-full min-h-11 p-2 hover:bg-slate-50 rounded-lg flex items-center justify-between text-left text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-teal-600"
               >
                 <div className="flex items-center gap-2">
                   <div className={`w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-bold ${hit.isUnverified ? 'bg-amber-50 border border-amber-200 text-amber-800' : 'bg-teal-50 border border-teal-200 text-teal-800'}`}>
@@ -123,9 +139,9 @@ export default function PrescriptionsEditor({
                   {hit.scheduleClass && (
                     <span className="badge badge-subtle text-[9px] py-0">{hit.scheduleClass}</span>
                   )}
-                  <span className="badge badge-brand text-[10px]">{hit.dosageForm || 'Oral'}</span>
+                  <span className="badge badge-brand text-[10px]">{hit.dosageForm || 'Form not recorded'}</span>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
         )}
@@ -153,9 +169,10 @@ export default function PrescriptionsEditor({
             <thead>
               <tr>
                 <th>Medicine / Drug</th>
-                <th>Dosage</th>
+                <th>Strength / dose</th>
                 <th>Frequency</th>
                 <th>Duration</th>
+                <th>Quantity</th>
                 <th className="text-right">Action</th>
               </tr>
             </thead>
@@ -166,12 +183,13 @@ export default function PrescriptionsEditor({
                   <td>
                     <input
                       type="text"
-                      value={rx.dosage}
+                      value={rx.strength || rx.dosage}
                       onChange={(e) => {
                         const val = e.target.value
-                        onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, dosage: val } : p))
+                        onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, dosage: val, strength: val } : p))
                       }}
                       className="form-input text-xs py-1"
+                      aria-label={`Strength or dose for ${rx.medicine}`}
                     />
                   </td>
                   <td>
@@ -183,6 +201,7 @@ export default function PrescriptionsEditor({
                         onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, frequency: val } : p))
                       }}
                       className="form-input text-xs py-1"
+                      aria-label={`Frequency for ${rx.medicine}`}
                     />
                   </td>
                   <td>
@@ -191,9 +210,21 @@ export default function PrescriptionsEditor({
                       value={rx.duration}
                       onChange={(e) => {
                         const val = e.target.value
-                        onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, duration: val } : p))
+                        onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, duration: val, durationCount: undefined, durationUnit: undefined } : p))
                       }}
                       className="form-input text-xs py-1"
+                      aria-label={`Duration for ${rx.medicine}`}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={rx.totalQuantity ?? ''}
+                      onChange={e => onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, totalQuantity: e.target.value === '' ? undefined : Number(e.target.value) } : p))}
+                      className="form-input text-xs py-1"
+                      aria-label={`Quantity for ${rx.medicine}`}
                     />
                   </td>
                   <td className="text-right">

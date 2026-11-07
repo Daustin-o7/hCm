@@ -20,7 +20,7 @@ public class Section5BillingLedgerTests
             .UseInMemoryDatabase(databaseName: $"Sec5Db_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static ClaimsPrincipal CreateUserPrincipal(Guid userId, Guid tenantId, string role)
@@ -234,6 +234,8 @@ public class Section5BillingLedgerTests
     {
         var db = CreateInMemoryDb();
         var (tenantId, clinicId, doctorId, patientId, appointmentId) = await SeedClinicAndAppointment(db);
+        db.TenantMemberships.Add(new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor });
+        await db.SaveChangesAsync();
 
         var config = new ConfigurationBuilder().Build();
         var razorpay = new RazorpayOrderClient(new HttpClient(), config);
@@ -242,6 +244,8 @@ public class Section5BillingLedgerTests
         {
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(doctorId, tenantId, "Doctor") }
         };
+
+        ((ClaimsIdentity)controller.User.Identity!).AddClaim(new Claim("clinicId", clinicId.ToString()));
 
         // Create auto-finalized invoice
         var genResult = await controller.GenerateInvoice(new GenerateInvoiceRequest(

@@ -69,7 +69,8 @@ export function friendlyError(raw: unknown): string {
     }
   }
 
-  const msg = typeof raw === 'string' ? raw : data?.message || data?.error || ''
+  const candidate = typeof raw === 'string' ? raw : data?.message || data?.error || (raw instanceof Error ? raw.message : '')
+  const msg = typeof candidate === 'string' ? candidate : ''
   const lower = msg.toLowerCase()
   if (KNOWN_ERROR_MAP[lower]) return KNOWN_ERROR_MAP[lower]
   if (lower.includes('401') || lower.includes('unauthorized')) return "We couldn't sign you in. Check your email and password and try again."

@@ -1,4 +1,5 @@
 using System.Data;
+using System.Text.Json;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Api.Services;
@@ -20,15 +21,21 @@ public class PharmacyPosController : ControllerBase
     private readonly HospitalCrmDbContext _db;
     private readonly ILogger<PharmacyPosController> _logger;
     private readonly ITimezoneService _timezoneService;
+    private readonly IConfiguration _config;
+    private readonly RazorpayOrderClient _razorpay;
 
     public PharmacyPosController(
         HospitalCrmDbContext db,
         ILogger<PharmacyPosController> logger,
-        ITimezoneService timezoneService)
+        ITimezoneService timezoneService,
+        IConfiguration config,
+        RazorpayOrderClient razorpay)
     {
         _db = db;
         _logger = logger;
         _timezoneService = timezoneService;
+        _config = config;
+        _razorpay = razorpay;
     }
 
     private Guid TenantId => User.GetTenantId()!.Value;
@@ -36,7 +43,7 @@ public class PharmacyPosController : ControllerBase
     /// <summary>Fail-closed Form 20/21 gate: a missing clinic row or licence is "not licensed".</summary>
     private async Task<Clinic?> GetLicensedClinicAsync(CancellationToken ct)
     {
-        var clinic = await _db.Clinics.FirstOrDefaultAsync(ct);
+        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.TenantId == TenantId, ct);
         return clinic != null &&
                (!string.IsNullOrWhiteSpace(clinic.PharmacyLicenceNumber20) ||
                 !string.IsNullOrWhiteSpace(clinic.PharmacyLicenceNumber21))
@@ -49,58 +56,62 @@ public class PharmacyPosController : ControllerBase
     public async Task<IActionResult> CheckoutPos([FromBody] PosCheckoutRequest req, CancellationToken ct)
     {
         var tenantId = TenantId;
+        var currentUserId = User.GetUserId();
+        if (!currentUserId.HasValue || tenantId == Guid.Empty) return Unauthorized();
+        if (req.Items is not { Count: > 0 and <= 50 })
+            return BadRequest(new { error = "invalid_cart_size" });
+        if (req.Items.Any(i => i is null || i.DrugId == Guid.Empty || i.DrugBatchId == Guid.Empty || i.Quantity is < 1 or > 1000))
+            return BadRequest(new { error = "invalid_line_quantity_or_batch" });
+        var paymentMethod = PaymentMethod.Cash;
+        if (!string.IsNullOrWhiteSpace(req.PaymentMethod) && !Enum.TryParse(req.PaymentMethod, true, out paymentMethod)
+            || paymentMethod is not (PaymentMethod.Cash or PaymentMethod.UPI or PaymentMethod.Card or PaymentMethod.NetBanking))
+            return BadRequest(new { error = "unsupported_counter_payment_method" });
+        if (req.TenderedAmount < 0 || req.TenderedAmount > 1000000m || decimal.Round(req.TenderedAmount, 2) != req.TenderedAmount
+            || req.PaymentReference?.Length > 64)
+            return BadRequest(new { error = "invalid_payment_metadata" });
+        if (string.IsNullOrWhiteSpace(req.IdempotencyKey) || req.IdempotencyKey.Length > 128)
+            return BadRequest(new { error = "idempotency_key_required", message = "Use the same key when retrying this checkout." });
+        if (paymentMethod != PaymentMethod.Cash && string.IsNullOrWhiteSpace(req.PaymentReference))
+            return BadRequest(new { error = "payment_reference_required", message = "Record the actual terminal/bank receipt reference." });
 
-        // 1. Regulatory Licence Gate (Form 20 / Form 21). Fail closed: no clinic row or no
-        // licence number means no checkout.
-        if (await GetLicensedClinicAsync(ct) is null)
+        await using var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            return StatusCode(403, new
+
+            // 1. Regulatory Licence Gate (Form 20 / Form 21). Fail closed: no clinic row or no
+            // licence number means no checkout.
+            if (await GetLicensedClinicAsync(ct) is null)
             {
-                error = "pharmacy_licence_missing",
-                message = "Clinic must register Form 20 or Form 21 Retail Drug Licence before dispensing medications."
-            });
-        }
-
-        if (req.Items == null || req.Items.Count == 0)
-            return BadRequest(new { error = "no_items_in_cart" });
-
-        // Idempotency check
-        if (!string.IsNullOrWhiteSpace(req.IdempotencyKey))
-        {
-            var existing = await _db.Invoices
-                .Include(i => i.LineItems)
-                .Include(i => i.Payments)
-                .FirstOrDefaultAsync(i => i.TenantId == tenantId && i.IdempotencyKey == req.IdempotencyKey, ct);
-
-            if (existing != null)
-            {
-                return Ok(new
+                return StatusCode(403, new
                 {
-                    invoiceId = existing.Id,
-                    invoiceNumber = $"PHARM-{existing.CreatedAt.Year}-{existing.InvoiceNumber:D6}",
-                    subtotal = existing.Subtotal,
-                    gstAmount = existing.GstAmount,
-                    total = existing.Total,
-                    status = existing.Status.ToString(),
-                    message = "idempotent_duplicate"
+                    error = "pharmacy_licence_missing",
+                    message = "Clinic must register Form 20 or Form 21 Retail Drug Licence before dispensing medications."
                 });
             }
-        }
 
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        var currentUserId = User.GetUserId() ?? Guid.Empty;
+            if (req.PatientId.HasValue && !await _db.Patients.AnyAsync(p => p.Id == req.PatientId && p.TenantId == tenantId, ct))
+                return BadRequest(new { error = "invalid_patient" });
 
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
-        {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+            var requestHash = PharmacyCommon.RequestHash(req);
+            var existing = await _db.Invoices.AsNoTracking()
+                .FirstOrDefaultAsync(i => i.TenantId == tenantId && i.IdempotencyKey == req.IdempotencyKey, ct);
+            if (existing != null)
+            {
+                if (existing.InvoiceType != InvoiceType.Pharmacy || existing.CheckoutRequestHash != requestHash)
+                    return Conflict(new { error = "idempotency_key_conflict", message = "This key belongs to another checkout payload, or a historical checkout without saved retry evidence. Review the original invoice; do not submit it as a new sale." });
+                if (existing.CheckoutResultJson is null)
+                    return Conflict(new { error = "saved_checkout_receipt_unavailable" });
+                return Ok(JsonSerializer.Deserialize<JsonElement>(existing.CheckoutResultJson));
+            }
 
+            var today = DateOnly.FromDateTime(DateTime.UtcNow);
             // Fetch and validate batches
             var batchIds = req.Items.Select(i => i.DrugBatchId).Distinct().ToList();
             var batches = new List<DrugBatch>();
             foreach (var bId in batchIds)
             {
-                var b = await _db.DrugBatches.Include(x => x.Drug).FirstOrDefaultAsync(x => x.Id == bId, ct);
+                var b = await _db.DrugBatches.Include(x => x.Drug).FirstOrDefaultAsync(x => x.Id == bId && x.TenantId == tenantId, ct);
                 if (b != null) batches.Add(b);
             }
 
@@ -124,10 +135,14 @@ public class PharmacyPosController : ControllerBase
                 if (batch.ExpiryDate < today)
                     return BadRequest(new { error = $"cannot_dispense_expired_batch: {batch.BatchNumber}" });
 
-                if (batch.QuantityRemaining < item.Quantity)
+                if (batch.QuantityRemaining < req.Items.Where(i => i.DrugBatchId == batch.Id).Sum(i => (long)i.Quantity))
                     return BadRequest(new { error = $"insufficient_stock_for_batch: {batch.BatchNumber} (Available: {batch.QuantityRemaining}, Requested: {item.Quantity})" });
 
                 var drug = batch.Drug!;
+                if (drug == null || drug.TenantId != tenantId || batch.Mrp <= 0 || batch.Mrp > 500000m
+                    || decimal.Round(batch.Mrp, 2) != batch.Mrp || drug.GstRate < 0 || drug.GstRate > 28
+                    || decimal.Round(drug.GstRate, 2) != drug.GstRate)
+                    return BadRequest(new { error = "invalid_catalogue_price_or_tax" });
 
                 // 2. Regulatory Check: Hard-block NDPS digital dispensing
                 if (drug.ScheduleClass == ScheduleClass.NDPS)
@@ -148,7 +163,7 @@ public class PharmacyPosController : ControllerBase
                 // The patient pays the printed MRP and the catalogue decides the tax rate; the
                 // client's price and GST fields are not trusted.
                 var lineGross = batch.Mrp * item.Quantity;
-                var lineTaxable = Math.Round(lineGross / (1m + (drug.GstRate / 100m)), 2);
+                var lineTaxable = decimal.Round(lineGross / (1m + (drug.GstRate / 100m)), 2, MidpointRounding.AwayFromZero);
                 var lineGst = lineGross - lineTaxable;
 
                 subtotal += lineTaxable;
@@ -184,6 +199,10 @@ public class PharmacyPosController : ControllerBase
                 .MaxAsync(i => (int?)i.InvoiceNumber, ct) ?? 0;
 
             var invoiceTotal = subtotal + totalGst;
+            if (invoiceTotal > 1000000m || req.TenderedAmount > 0 && req.TenderedAmount < invoiceTotal)
+                return BadRequest(new { error = "insufficient_tendered_amount_or_total_limit" });
+            if (paymentMethod != PaymentMethod.Cash && req.TenderedAmount > 0 && req.TenderedAmount != invoiceTotal)
+                return BadRequest(new { error = "electronic_payment_amount_mismatch" });
 
             var invoice = new Invoice
             {
@@ -200,10 +219,14 @@ public class PharmacyPosController : ControllerBase
                 Subtotal = subtotal,
                 GstAmount = totalGst,
                 Total = invoiceTotal,
-                // POS is paid at the counter; PaidAmount drives the invoice list, ledger and PDF.
-                PaidAmount = invoiceTotal,
-                Status = InvoiceStatus.Paid,
+                PaidAmount = 0m,
+                BalanceDue = invoiceTotal,
+                Status = InvoiceStatus.Finalized,
+                DocumentType = totalGst > 0 ? InvoiceDocumentType.TaxInvoice : InvoiceDocumentType.BillOfSupply,
+                FinalizedAt = DateTimeOffset.UtcNow,
+                FinalizedByUserId = currentUserId,
                 IdempotencyKey = req.IdempotencyKey,
+                CheckoutRequestHash = requestHash,
                 CreatedAt = DateTimeOffset.UtcNow
             };
 
@@ -225,12 +248,12 @@ public class PharmacyPosController : ControllerBase
                     ReferenceType = "Dispense",
                     ReferenceId = invoice.Id,
                     Note = $"POS Checkout Inv #{invoice.FormatInvoiceNumber()}",
-                    RecordedBy = currentUserId,
+                    RecordedBy = currentUserId.Value,
                     RecordedAt = DateTimeOffset.UtcNow
                 });
 
                 var lineGross = batch.Mrp * item.Quantity;
-                var lineTaxable = Math.Round(lineGross / (1m + (drug.GstRate / 100m)), 2);
+                var lineTaxable = decimal.Round(lineGross / (1m + (drug.GstRate / 100m)), 2, MidpointRounding.AwayFromZero);
 
                 invoice.LineItems.Add(new InvoiceLineItem
                 {
@@ -240,6 +263,7 @@ public class PharmacyPosController : ControllerBase
                     Quantity = item.Quantity,
                     UnitPrice = batch.Mrp,
                     Amount = lineTaxable,
+                    TaxAmount = lineGross - lineTaxable,
                     GstRate = drug.GstRate,
                     TaxCategory = drug.GstRate > 0 ? TaxCategory.Taxable : TaxCategory.Exempt,
                     HsnCode = drug.HsnCode,
@@ -252,12 +276,6 @@ public class PharmacyPosController : ControllerBase
 
             _db.Invoices.Add(invoice);
 
-            var paymentMethod = PaymentMethod.Cash;
-            if (!string.IsNullOrWhiteSpace(req.PaymentMethod))
-            {
-                Enum.TryParse<PaymentMethod>(req.PaymentMethod, true, out paymentMethod);
-            }
-
             var payment = new Payment
             {
                 Id = Guid.NewGuid(),
@@ -265,6 +283,8 @@ public class PharmacyPosController : ControllerBase
                 InvoiceId = invoice.Id,
                 Amount = invoiceTotal,
                 Method = paymentMethod,
+                Utr = req.PaymentReference?.Trim(),
+                IdempotencyKey = $"POS-PAY-{invoice.Id:N}",
                 Status = PaymentStatus.Completed,
                 VerificationStatus = PaymentVerificationStatus.Confirmed,
                 ConfirmedByUserId = currentUserId,
@@ -272,6 +292,8 @@ public class PharmacyPosController : ControllerBase
                 ConfirmedAt = DateTimeOffset.UtcNow
             };
             _db.Payments.Add(payment);
+            InvoiceAccounting.PostFinalization(_db, invoice, currentUserId);
+            InvoiceAccounting.ConfirmPayment(_db, invoice, payment, currentUserId);
 
             var dispenserUser = await _db.Users.FindAsync([currentUserId], ct);
             var dispenserName = dispenserUser?.Name ?? "Pharmacist";
@@ -292,230 +314,70 @@ public class PharmacyPosController : ControllerBase
                     PatientAddress = req.PatientAddress ?? "Local",
                     PrescriberName = req.PrescriberName!,
                     PrescriberRegNo = req.PrescriberRegNo!,
-                    DispensedBy = currentUserId,
+                    DispensedBy = currentUserId.Value,
                     DispenserName = dispenserName,
                     DispensedAt = DateTimeOffset.UtcNow
                 });
             }
 
-            await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
-
             var tendered = req.TenderedAmount > 0 ? req.TenderedAmount : invoiceTotal;
             var changeDue = Math.Max(0, tendered - invoiceTotal);
-
-            return StatusCode(201, new
+            var result = new
             {
+                idempotencyKey = req.IdempotencyKey,
                 invoiceId = invoice.Id,
                 invoiceNumber = invoice.FormatInvoiceNumber(),
                 subtotal = invoice.Subtotal,
                 gstAmount = invoice.GstAmount,
                 total = invoice.Total,
+                paidAmount = invoice.PaidAmount,
+                balanceDue = invoice.BalanceDue,
+                status = invoice.Status.ToString(),
                 tenderedAmount = tendered,
                 changeDue,
                 paymentMethod = paymentMethod.ToString(),
+                paymentId = payment.Id,
+                paymentReference = payment.Utr,
+                paymentStatus = payment.Status.ToString(),
+                verificationStatus = payment.VerificationStatus.ToString(),
+                confirmedAt = payment.ConfirmedAt,
                 createdAt = invoice.CreatedAt,
                 itemCount = req.Items.Count,
                 items = invoice.LineItems.Select(li => new
                 {
+                    lineItemId = li.Id,
+                    drugBatchId = li.DrugBatchId,
                     description = li.Description,
                     quantity = li.Quantity,
                     unitPrice = li.UnitPrice,
                     amount = li.Amount,
+                    taxAmount = li.TaxAmount,
+                    grossAmount = li.GrossAmount(invoice.InvoiceType),
                     gstRate = li.GstRate,
                     hsnCode = li.HsnCode
-                })
-            });
-        });
+                }).ToArray()
+            };
+            invoice.CheckoutResultJson = JsonSerializer.Serialize(result);
+            await _db.SaveChangesAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
+            return StatusCode(201, result);
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex)
+            || ex is DbUpdateException update && (InvoiceAccounting.IsIdempotencyConflict(update) || InvoiceAccounting.IsNumberingConflict(update)))
+        {
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "checkout_changed_concurrently", message = "Retry checkout with the same key after reloading stock." });
+        }
     }
 
     [HttpPost("returns/{invoiceId:guid}")]
     [AuthorizeRoles("ClinicAdmin", "Pharmacist", "Receptionist", "Doctor")]
-    public async Task<IActionResult> ProcessReturn(Guid invoiceId, [FromBody] ReturnRequest req, CancellationToken ct)
+    [RequirePermission(Permissions.PaymentRecord)]
+    public Task<IActionResult> ProcessReturn(Guid invoiceId, [FromBody] ReturnRequest req, CancellationToken ct)
     {
-        var tenantId = TenantId;
-        var invoice = await _db.Invoices
-            .Include(i => i.LineItems)
-                .ThenInclude(li => li.DrugBatch!)
-                    .ThenInclude(db => db.Drug)
-            .Include(i => i.Payments)
-            .FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == tenantId, ct);
-
-        if (invoice == null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        if (invoice.InvoiceType != InvoiceType.Pharmacy)
-            return BadRequest(new { error = "not_a_pharmacy_invoice" });
-
-        if (invoice.Status == InvoiceStatus.Refunded)
-            return BadRequest(new { error = "already_refunded" });
-
-        // Idempotency check
-        if (!string.IsNullOrWhiteSpace(req.IdempotencyKey))
-        {
-            var existing = await _db.Payments
-                .FirstOrDefaultAsync(p => p.InvoiceId == invoiceId && p.TenantId == tenantId && p.IdempotencyKey == req.IdempotencyKey, ct);
-            if (existing != null)
-                return Ok(new { refundId = existing.Id, message = "idempotent_duplicate", status = existing.Status.ToString().ToLower() });
-        }
-
-        var currentUserId = User.GetUserId() ?? Guid.Empty;
-
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
-        {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
-
-            // A concurrent return can pass the pre-transaction check; the fresh read inside the
-            // serialisable transaction (with retry) makes the second one a no-op.
-            var currentStatus = await _db.Invoices.AsNoTracking()
-                .Where(i => i.Id == invoiceId)
-                .Select(i => (InvoiceStatus?)i.Status)
-                .FirstOrDefaultAsync(ct);
-            if (currentStatus == InvoiceStatus.Refunded)
-                return BadRequest(new { error = "already_refunded" });
-
-            // Restore batch quantities & log stock movements
-            foreach (var lineItem in invoice.LineItems)
-            {
-                if (lineItem.DrugBatchId.HasValue)
-                {
-                    var batch = await _db.DrugBatches.FindAsync([lineItem.DrugBatchId.Value], ct);
-                    if (batch != null)
-                    {
-                        batch.QuantityRemaining += lineItem.Quantity;
-
-                        _db.DrugStockMovements.Add(new DrugStockMovement
-                        {
-                            Id = Guid.NewGuid(),
-                            TenantId = tenantId,
-                            DrugId = batch.DrugId,
-                            DrugBatchId = batch.Id,
-                            Quantity = lineItem.Quantity,
-                            Direction = MovementDirection.In,
-                            ReferenceType = "Return",
-                            ReferenceId = invoice.Id,
-                            Note = $"Return for Inv #{invoice.InvoiceNumber}: {req.Reason ?? "Customer return"}",
-                            RecordedBy = currentUserId,
-                            RecordedAt = DateTimeOffset.UtcNow
-                        });
-                    }
-                }
-            }
-
-            var originalPayment = invoice.Payments.FirstOrDefault(p => p.Status == PaymentStatus.Completed);
-            var refundMethod = originalPayment?.Method ?? PaymentMethod.Cash;
-            var refundAmount = invoice.Total;
-            var now = DateTimeOffset.UtcNow;
-
-            var refundPayment = new Payment
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                InvoiceId = invoice.Id,
-                Amount = -refundAmount,
-                Method = refundMethod,
-                Status = PaymentStatus.Refunded,
-                // A counter return is decided and paid out by the pharmacist on the spot.
-                VerificationStatus = PaymentVerificationStatus.Confirmed,
-                ConfirmedByUserId = currentUserId,
-                ConfirmedAt = now,
-                RefundReason = req.Reason ?? "Customer return",
-                RazorpayPaymentId = originalPayment?.RazorpayPaymentId,
-                IdempotencyKey = req.IdempotencyKey,
-                CreatedAt = now,
-                PaidAt = now
-            };
-            _db.Payments.Add(refundPayment);
-
-            if (refundMethod == PaymentMethod.Razorpay && !string.IsNullOrEmpty(originalPayment?.RazorpayPaymentId))
-            {
-                refundPayment.RazorpayPaymentId = $"refund_{Guid.NewGuid():N}";
-            }
-
-            invoice.Status = InvoiceStatus.Refunded;
-            invoice.PaidAmount = Math.Max(0m, invoice.PaidAmount - refundAmount);
-            invoice.RecalculateBalance();
-            invoice.UpdatedAt = now;
-
-            // Append-only reversal entries, same shape as InvoicesController.ProcessRefund.
-            var invoiceRef = invoice.FormatInvoiceNumber();
-            var cashOrBank = refundMethod == PaymentMethod.Cash ? "Cash" : "Bank";
-
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                EntryType = FinanceEntryType.RefundProcessed,
-                ReferenceType = "Refund",
-                ReferenceId = refundPayment.Id,
-                ReferenceNumber = invoiceRef,
-                AccountCategory = cashOrBank,
-                DebitAmount = 0.0m,
-                CreditAmount = refundAmount,
-                Narration = $"Pharmacy return of ₹{refundAmount:F2} for {invoiceRef} via {refundMethod}. Reason: {refundPayment.RefundReason}",
-                PostedByUserId = currentUserId,
-                CreatedAt = now
-            });
-
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                EntryType = FinanceEntryType.RefundProcessed,
-                ReferenceType = "Invoice",
-                ReferenceId = invoice.Id,
-                ReferenceNumber = invoiceRef,
-                AccountCategory = "AccountsReceivable",
-                DebitAmount = refundAmount,
-                CreditAmount = 0.0m,
-                Narration = $"Receivable reinstatement from pharmacy return {refundPayment.Id:N} on {invoiceRef}",
-                PostedByUserId = currentUserId,
-                CreatedAt = now
-            });
-
-            // Reverse ControlledSubstanceRegister entries
-            var scheduledRegisters = await _db.ControlledSubstanceRegisters
-                .Where(r => r.InvoiceId == invoiceId)
-                .ToListAsync(ct);
-
-            foreach (var reg in scheduledRegisters)
-            {
-                _db.ControlledSubstanceRegisters.Add(new ControlledSubstanceRegister
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = tenantId,
-                    InvoiceId = invoice.Id,
-                    DrugId = reg.DrugId,
-                    ScheduleClass = reg.ScheduleClass,
-                    DrugName = reg.DrugName,
-                    BatchNumber = reg.BatchNumber,
-                    Quantity = -reg.Quantity,
-                    PatientName = reg.PatientName,
-                    PatientAddress = reg.PatientAddress,
-                    PrescriberName = reg.PrescriberName,
-                    PrescriberRegNo = reg.PrescriberRegNo,
-                    DispensedBy = currentUserId,
-                    DispenserName = req.ReturnedByName ?? "Return Processor",
-                    DispensedAt = DateTimeOffset.UtcNow
-                });
-            }
-
-            await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
-
-            return StatusCode(201, new
-            {
-                refundId = refundPayment.Id,
-                originalInvoiceId = invoice.Id,
-                invoiceNumber = invoiceRef,
-                refundAmount,
-                refundMethod = refundMethod.ToString(),
-                status = "refunded",
-                createdAt = refundPayment.CreatedAt,
-                reason = refundPayment.RefundReason
-            });
-        });
+        var controller = new InvoicesController(_db, _config, _razorpay) { ControllerContext = ControllerContext };
+        return controller.ProcessPharmacyReturnAsync(invoiceId, req, ct);
     }
 
     [HttpGet("stats")]

@@ -13,20 +13,22 @@ public class Invoice : ITenantScoped
     public InvoiceType InvoiceType { get; set; } = InvoiceType.Consultation;
     public string? WalkInCustomerName { get; set; }
     public string? WalkInCustomerPhone { get; set; }
-    
+
     public int InvoiceNumber { get; set; }
-    
+
     [Column(TypeName = "decimal(18,2)")]
     public decimal Subtotal { get; set; }
-    
+
     [Column(TypeName = "decimal(18,2)")]
     public decimal GstAmount { get; set; }
-    
+
     [Column(TypeName = "decimal(18,2)")]
     public decimal Total { get; set; }
-    
+
     public InvoiceStatus Status { get; set; }
     public string? IdempotencyKey { get; set; }
+    public string? CheckoutRequestHash { get; set; }
+    public string? CheckoutResultJson { get; set; }
 
     [MaxLength(20)]
     public string FinancialYear { get; set; } = Utils.IndianFinancialYearUtils.GetFinancialYear(DateTime.UtcNow);
@@ -65,11 +67,11 @@ public class Invoice : ITenantScoped
 
     public DateTimeOffset? FinalizedAt { get; set; }
     public Guid? FinalizedByUserId { get; set; }
-    
+
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     [ConcurrencyCheck]
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
-    
+
     // Navigation
     public virtual Appointment? Appointment { get; set; }
     public virtual Patient? Patient { get; set; }
@@ -77,4 +79,4 @@ public class Invoice : ITenantScoped
     public virtual ICollection<Payment> Payments { get; set; } = [];
     public virtual ICollection<CreditNote> CreditNotes { get; set; } = [];
     public virtual ICollection<InvoicePrintLog> PrintLogs { get; set; } = [];
-}
+}

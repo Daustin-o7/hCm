@@ -1,4 +1,5 @@
-import { UserManager, WebStorageStateStore } from 'oidc-client-ts'
+import { InMemoryWebStorage, UserManager, WebStorageStateStore, type StateStore } from 'oidc-client-ts'
+import { assertSessionGeneration, getSessionGeneration } from './api'
 
 const isCapacitorOrWebView = typeof window !== 'undefined' && (
   !!(window as any).Capacitor ||
@@ -51,6 +52,26 @@ export const isOidcConfigured = Boolean(
 // Backward-compatible alias
 export const isEntraConfigured = isOidcConfigured
 
+// Only redirect correlation/PKCE state survives navigation. Storage access failures reject
+// the OIDC operation so its caller can show an error instead of restoring a cookie identity.
+export const oidcStateStore: StateStore = {
+  async set(key, value) { window.sessionStorage.setItem(`oidc.${key}`, value) },
+  async get(key) { return window.sessionStorage.getItem(`oidc.${key}`) },
+  async remove(key) {
+    const value = window.sessionStorage.getItem(`oidc.${key}`)
+    window.sessionStorage.removeItem(`oidc.${key}`)
+    return value
+  },
+  async getAllKeys() {
+    const store = window.sessionStorage
+    return Array.from({ length: store.length }, (_, i) => store.key(i))
+      .filter((key): key is string => key !== null && key.startsWith('oidc.'))
+      .map(key => key.slice(5))
+  },
+}
+
+export const oidcUserStore = new WebStorageStateStore({ store: new InMemoryWebStorage() })
+
 export const userManager: UserManager | null = isOidcConfigured
   ? new UserManager({
       authority,
@@ -58,8 +79,39 @@ export const userManager: UserManager | null = isOidcConfigured
       redirect_uri: redirectUri,
       response_type: 'code',
       scope: `openid profile email ${apiScope}`.trim(),
-      userStore: typeof window !== 'undefined' ? new WebStorageStateStore({ store: window.sessionStorage }) : undefined,
-      automaticSilentRenew: true,
+      userStore: oidcUserStore,
+      stateStore: oidcStateStore,
+      automaticSilentRenew: false,
       loadUserInfo: true,
     })
   : null
+
+if (userManager) {
+  const manager = userManager
+  // Serialize token-producing operations so storage writes belong to exactly one generation.
+  let pending: Promise<unknown> = Promise.resolve()
+  let operationGeneration: number | null = null
+  const storeUser = manager.storeUser.bind(manager)
+  manager.storeUser = user => {
+    if (user && operationGeneration !== null) assertSessionGeneration(operationGeneration)
+    return storeUser(user)
+  }
+  function currentResult<T>(operation: () => Promise<T>): Promise<T> {
+    const generation = getSessionGeneration()
+    const result = pending.then(async () => {
+      assertSessionGeneration(generation)
+      operationGeneration = generation
+      try {
+        const value = await operation()
+        assertSessionGeneration(generation)
+        return value
+      } finally { operationGeneration = null }
+    })
+    pending = result.catch(() => undefined)
+    return result
+  }
+  const callback = manager.signinRedirectCallback.bind(manager)
+  manager.signinRedirectCallback = (...args) => currentResult(() => callback(...args))
+  const silent = manager.signinSilent.bind(manager)
+  manager.signinSilent = (...args) => currentResult(() => silent(...args))
+}

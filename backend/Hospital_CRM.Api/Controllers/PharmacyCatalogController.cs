@@ -1,12 +1,14 @@
 using System.Text;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services.Typesense;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Hospital_CRM.Api.Controllers;
 
@@ -18,15 +20,19 @@ public class PharmacyCatalogController : ControllerBase
     private readonly HospitalCrmDbContext _db;
     private readonly Hospital_CRM.Api.Services.ICdciMedicineCatalogService _cdci;
     private readonly ILogger<PharmacyCatalogController> _logger;
+    private readonly IPatientSearchService? _search;
 
+    [ActivatorUtilitiesConstructor]
     public PharmacyCatalogController(
         HospitalCrmDbContext db,
         Hospital_CRM.Api.Services.ICdciMedicineCatalogService cdci,
-        ILogger<PharmacyCatalogController> logger)
+        ILogger<PharmacyCatalogController> logger,
+        IPatientSearchService? search = null)
     {
         _db = db;
         _cdci = cdci;
         _logger = logger;
+        _search = search;
     }
 
     public PharmacyCatalogController(
@@ -109,6 +115,14 @@ public class PharmacyCatalogController : ControllerBase
                 expiringBatchesCount,
                 expiredStock,
                 nextExpiringBatch = nextExpiringBatch == null ? null : new
+                {
+                    batchId = nextExpiringBatch.Id,
+                    batchNumber = nextExpiringBatch.BatchNumber,
+                    expiryDate = nextExpiringBatch.ExpiryDate.ToString("yyyy-MM-dd"),
+                    mrp = nextExpiringBatch.Mrp,
+                    quantityRemaining = nextExpiringBatch.QuantityRemaining
+                },
+                earliestBatch = nextExpiringBatch == null ? null : new
                 {
                     batchId = nextExpiringBatch.Id,
                     batchNumber = nextExpiringBatch.BatchNumber,
@@ -266,6 +280,7 @@ public class PharmacyCatalogController : ControllerBase
 
         _db.Drugs.Add(drug);
         await _db.SaveChangesAsync(ct);
+        await IndexCommittedMedicinesAsync([drug], ct);
 
         return StatusCode(201, new { id = drug.Id, message = "drug_created" });
     }
@@ -459,6 +474,14 @@ public class PharmacyCatalogController : ControllerBase
                     expiryDate = nextExpiringBatch.ExpiryDate.ToString("yyyy-MM-dd"),
                     mrp = nextExpiringBatch.Mrp,
                     quantityRemaining = nextExpiringBatch.QuantityRemaining
+                },
+                earliestBatch = nextExpiringBatch == null ? null : new
+                {
+                    batchId = nextExpiringBatch.Id,
+                    batchNumber = nextExpiringBatch.BatchNumber,
+                    expiryDate = nextExpiringBatch.ExpiryDate.ToString("yyyy-MM-dd"),
+                    mrp = nextExpiringBatch.Mrp,
+                    quantityRemaining = nextExpiringBatch.QuantityRemaining
                 }
             };
         }).ToList();
@@ -482,33 +505,48 @@ public class PharmacyCatalogController : ControllerBase
         CancellationToken ct = default)
     {
         var tenantId = User.GetTenantId() ?? Guid.Empty;
+        var changedDrugs = new HashSet<Drug>();
+        void CaptureChangedDrugs(object? sender, SavingChangesEventArgs args)
+        {
+            foreach (var entry in _db.ChangeTracker.Entries<Drug>())
+                if (entry.Entity.TenantId == tenantId && entry.State is EntityState.Added or EntityState.Modified)
+                    changedDrugs.Add(entry.Entity);
+        }
+        _db.SavingChanges += CaptureChangedDrugs;
+        FormularySyncResult result;
         try
         {
-            var result = await HospitalFormularySeeder.SyncFormularyAsync(
+            result = await HospitalFormularySeeder.SyncFormularyAsync(
                 _db,
                 tenantId,
                 seedBatches: req?.SeedBatches ?? true,
                 ct);
 
-            _logger.LogInformation("Synchronized official hospital formulary for tenant {TenantId}: {Added} added, {Updated} updated, {Batches} batches",
-                tenantId, result.AddedCount, result.UpdatedCount, result.BatchesAdded);
-
-            return Ok(new
-            {
-                success = true,
-                message = "Official Hospital Formulary synchronized successfully.",
-                totalProcessed = result.TotalProcessed,
-                addedCount = result.AddedCount,
-                updatedCount = result.UpdatedCount,
-                batchesAdded = result.BatchesAdded,
-                source = Path.GetFileName(result.SourcePath)
-            });
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _logger.LogError(ex, "Failed to synchronize official hospital formulary.");
-            return StatusCode(500, new { error = "formulary_sync_failed", message = ex.Message });
+            _logger.LogError("Failed to synchronize official hospital formulary for tenant {TenantId} ({FailureType})", tenantId, ex.GetType().Name);
+            return StatusCode(500, new { error = "formulary_sync_failed" });
         }
+        finally
+        {
+            _db.SavingChanges -= CaptureChangedDrugs;
+        }
+
+        await IndexCommittedMedicinesAsync(changedDrugs, ct);
+        _logger.LogInformation("Synchronized official hospital formulary for tenant {TenantId}: {Added} added, {Updated} updated, {Batches} batches",
+            tenantId, result.AddedCount, result.UpdatedCount, result.BatchesAdded);
+
+        return Ok(new
+        {
+            success = true,
+            message = "Official Hospital Formulary synchronized successfully.",
+            totalProcessed = result.TotalProcessed,
+            addedCount = result.AddedCount,
+            updatedCount = result.UpdatedCount,
+            batchesAdded = result.BatchesAdded,
+            source = Path.GetFileName(result.SourcePath)
+        });
     }
 
     [HttpGet("cdci/search")]
@@ -626,6 +664,7 @@ public class PharmacyCatalogController : ControllerBase
 
         await _db.SaveChangesAsync(ct);
 
+        await IndexCommittedMedicinesAsync([drug], ct);
         return StatusCode(201, new
         {
             id = drug.Id,
@@ -637,4 +676,26 @@ public class PharmacyCatalogController : ControllerBase
         });
     }
 
+    private async Task IndexCommittedMedicinesAsync(IEnumerable<Drug> drugs, CancellationToken ct)
+    {
+        foreach (var drug in drugs)
+        {
+            if (_search == null || ct.IsCancellationRequested || _db.Database.CurrentTransaction != null
+                || System.Transactions.Transaction.Current != null)
+            {
+                _logger.LogWarning("Medicine index deferred for tenant {TenantId}; reconciliation required", drug.TenantId);
+                return;
+            }
+            try
+            {
+                await _search.IndexMedicineAsync(drug, ct);
+            }
+            catch (Exception ex)
+            {
+                // Indexing is derived work: even cancellation must not misreport a committed catalogue mutation.
+                _logger.LogWarning("Medicine index failed for tenant {TenantId}, record {DrugId} ({FailureType}); reconciliation required",
+                    drug.TenantId, drug.Id, ex.GetType().Name);
+            }
+        }
+    }
 }

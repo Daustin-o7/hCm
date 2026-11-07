@@ -18,17 +18,18 @@ public class ConsultationsControllerTests
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
-    private ConsultationsController CreateController(HospitalCrmDbContext db, Guid doctorId, Guid? tenantId = null)
+    private ConsultationsController CreateController(HospitalCrmDbContext db, Guid doctorId, Guid tenantId, Guid clinicId)
     {
         var controller = new ConsultationsController(db);
         var claims = new[]
         {
             new Claim("sub", doctorId.ToString()),
             new Claim("role", "Doctor"),
-            new Claim("tenant_id", (tenantId ?? Guid.Empty).ToString())
+            new Claim("tenant_id", tenantId.ToString()),
+            new Claim("clinicId", clinicId.ToString())
         };
         var identity = new ClaimsIdentity(claims, "TestAuth");
         controller.ControllerContext = new ControllerContext
@@ -64,6 +65,9 @@ public class ConsultationsControllerTests
         var doctorId = Guid.NewGuid();
         var clinicId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
+
+        db.Tenants.Add(new Tenant { Id = tenantId, Name = "Synthetic clinic tenant" });
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId, Name = "Synthetic clinic" });
 
         var doctor = new User
         {
@@ -103,7 +107,7 @@ public class ConsultationsControllerTests
         db.TenantMemberships.Add(new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor, RegistrationNumber = "TEST-REG", Qualifications = "TEST-QUAL" });
         await db.SaveChangesAsync();
 
-        var controller = CreateController(db, doctorId, tenantId);
+        var controller = CreateController(db, doctorId, tenantId, clinicId);
 
         // 1. Initial Consultation (v1)
         var createRequest = new CreateConsultationRequest(
@@ -121,6 +125,9 @@ public class ConsultationsControllerTests
         Assert.NotNull(savedConsultation);
         Assert.Equal(1, savedConsultation.Version);
         Assert.Equal("Fever and sore throat", savedConsultation.ChiefComplaint);
+        Assert.Equal(ConsultationStatus.Finalized, savedConsultation.Status);
+        var originalSeal = savedConsultation.DigitalSignatureHash;
+        Assert.StartsWith("v2:", originalSeal);
 
         // 2. Amend Consultation (v2) - Non-destructive clinical amendment
         var amendRequest = new AmendConsultationRequest(
@@ -148,28 +155,34 @@ public class ConsultationsControllerTests
         Assert.Equal(1, allVersions[0].Version);
         Assert.Equal(2, allVersions[1].Version);
         Assert.Equal(allVersions[0].Id, allVersions[1].PreviousVersionId);
+        Assert.Equal("Fever and sore throat", allVersions[0].ChiefComplaint);
+        Assert.Equal("Acute Pharyngitis", allVersions[0].Diagnosis);
+        Assert.Equal(originalSeal, allVersions[0].DigitalSignatureHash);
+        Assert.Equal("Acute Viral Pharyngitis", allVersions[1].Diagnosis);
+        Assert.Equal(amendRequest.AmendmentReason, allVersions[1].AmendmentReason);
     }
 
     [Fact]
     public async Task AddPrescription_AttachesPrescriptionItems()
     {
         var db = CreateInMemoryDb();
-        var doctorId = Guid.NewGuid();
+        var (doctor, _, appointment, tenantId) = Part1SaleReadinessTests.Seed(db);
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
-            AppointmentId = Guid.NewGuid(),
-            DoctorId = doctorId,
+            TenantId = tenantId,
+            AppointmentId = appointment.Id,
+            DoctorId = doctor.Id,
             ChiefComplaint = "Cough",
             Diagnosis = "Bronchitis",
+            Status = ConsultationStatus.Draft,
             Version = 1,
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.Consultations.Add(consultation);
-        db.Appointments.Add(new Appointment { Id = consultation.AppointmentId, DoctorId = doctorId, Status = AppointmentStatus.CheckedIn, TimeSlot = "10:30" });
         await db.SaveChangesAsync();
 
-        var controller = CreateController(db, doctorId);
+        var controller = CreateController(db, doctor.Id, tenantId, appointment.ClinicId);
 
         var rxRequest = new AddPrescriptionRequest(new List<PrescriptionItemRequest>
         {
@@ -186,5 +199,11 @@ public class ConsultationsControllerTests
 
         var items = await db.PrescriptionItems.Where(pi => pi.PrescriptionId == prescription.Id).ToListAsync();
         Assert.Equal(2, items.Count);
+        Assert.Equal(tenantId, prescription.TenantId);
+        Assert.Contains(items, i => i.MedicineText == "Tab. Azithromycin 500mg" && i.DosageText == "1 Tab" && i.FrequencyText == "OD" && i.DurationText == "3 Days");
+        Assert.Contains(items, i => i.MedicineText == "Syp. CoughRelief" && i.DosageText == "10ml" && i.FrequencyText == "TID" && i.DurationText == "5 Days");
+        Assert.Equal(ConsultationStatus.Draft, consultation.Status);
+        Assert.Null(consultation.SignedAt);
+        Assert.NotNull(consultation.UpdatedAt);
     }
 }

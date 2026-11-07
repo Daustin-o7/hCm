@@ -3,6 +3,7 @@ using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
+using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -32,11 +33,11 @@ public class ClinicController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.Name))
             return BadRequest(new { error = "name_required" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: true, ct);
+        if (membership is null)
             return Forbid();
 
-        var clinic = await _db.Clinics.FindAsync([user.ClinicId], ct);
+        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.Id == membership.ClinicId && c.TenantId == membership.TenantId, ct);
         if (clinic is null)
             return NotFound(new { error = "clinic_not_found" });
 
@@ -112,15 +113,15 @@ public class ClinicController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "not_authenticated" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: false, ct);
+        if (membership is null)
             return Forbid();
 
         var clinic = await _db.Clinics
             .Include(c => c.WorkingHours)
             .Include(c => c.Holidays)
             .Include(c => c.SpecialHours)
-            .FirstOrDefaultAsync(c => c.Id == user.ClinicId, ct);
+            .FirstOrDefaultAsync(c => c.Id == membership.ClinicId && c.TenantId == membership.TenantId, ct);
 
         if (clinic is null)
             return NotFound(new { error = "clinic_not_found" });
@@ -222,11 +223,11 @@ public class ClinicController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: true, ct);
+        if (membership is null)
             return Forbid();
 
-        var clinicId = user.ClinicId.Value;
+        var clinicId = membership.ClinicId!.Value;
         var executionStrategy = _db.Database.CreateExecutionStrategy();
         return await executionStrategy.ExecuteAsync<IActionResult>(async () =>
         {
@@ -274,8 +275,8 @@ public class ClinicController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: true, ct);
+        if (membership is null)
             return Forbid();
 
         if (string.IsNullOrWhiteSpace(request.StartDate) || string.IsNullOrWhiteSpace(request.EndDate))
@@ -287,7 +288,7 @@ public class ClinicController : ControllerBase
         var holiday = new ClinicHoliday
         {
             Id = Guid.NewGuid(),
-            ClinicId = user.ClinicId.Value,
+            ClinicId = membership.ClinicId!.Value,
             Name = request.Name ?? "Holiday",
             StartDate = request.StartDate,
             EndDate = request.EndDate,
@@ -311,12 +312,12 @@ public class ClinicController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: true, ct);
+        if (membership is null)
             return Forbid();
 
         var holiday = await _db.ClinicHolidays
-            .FirstOrDefaultAsync(h => h.Id == id && h.ClinicId == user.ClinicId, ct);
+            .FirstOrDefaultAsync(h => h.Id == id && h.ClinicId == membership.ClinicId, ct);
         if (holiday is null)
             return NotFound(new { error = "holiday_not_found" });
 
@@ -334,8 +335,8 @@ public class ClinicController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: true, ct);
+        if (membership is null)
             return Forbid();
 
         if (string.IsNullOrWhiteSpace(request.Date))
@@ -344,7 +345,7 @@ public class ClinicController : ControllerBase
         var special = new ClinicSpecialHour
         {
             Id = Guid.NewGuid(),
-            ClinicId = user.ClinicId.Value,
+            ClinicId = membership.ClinicId!.Value,
             Date = request.Date,
             OpenTime = request.Open,
             CloseTime = request.Close,
@@ -367,12 +368,12 @@ public class ClinicController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var membership = await SelectedMembershipAsync(admin: true, ct);
+        if (membership is null)
             return Forbid();
 
         var special = await _db.ClinicSpecialHours
-            .FirstOrDefaultAsync(s => s.Id == id && s.ClinicId == user.ClinicId, ct);
+            .FirstOrDefaultAsync(s => s.Id == id && s.ClinicId == membership.ClinicId, ct);
         if (special is null)
             return NotFound(new { error = "special_hour_not_found" });
 
@@ -380,6 +381,19 @@ public class ClinicController : ControllerBase
         await _db.SaveChangesAsync(ct);
 
         return Ok(new { message = "special_hour_deleted" });
+    }
+
+    private Task<TenantMembership?> SelectedMembershipAsync(bool admin, CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        if (userId is null || tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty)
+            return Task.FromResult<TenantMembership?>(null);
+        return _db.TenantMemberships.AsNoTracking().SingleOrDefaultAsync(m =>
+            m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active"
+            && (!admin || m.Role == UserRole.ClinicAdmin) && m.Role != UserRole.PlatformAdmin
+            && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
     }
 
     private static int? ParseDayOfWeek(string day)

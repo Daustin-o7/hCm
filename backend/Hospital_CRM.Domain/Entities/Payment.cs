@@ -9,12 +9,12 @@ public class Payment : ITenantScoped
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
     public Guid InvoiceId { get; set; }
-    
+
     public PaymentMethod Method { get; set; }
-    
+
     [Column(TypeName = "decimal(18,2)")]
     public decimal Amount { get; set; }
-    
+
     [MaxLength(255)]
     public string? RazorpayPaymentId { get; set; }
 
@@ -25,7 +25,7 @@ public class Payment : ITenantScoped
     /// <summary>Bank UTR / PSP reference captured on a manual or webhook-confirmed payment.</summary>
     [MaxLength(64)]
     public string? Utr { get; set; }
-    
+
     public PaymentStatus Status { get; set; }
     public PaymentVerificationStatus VerificationStatus { get; set; } = PaymentVerificationStatus.Confirmed;
     public string? IdempotencyKey { get; set; }
@@ -35,6 +35,9 @@ public class Payment : ITenantScoped
     public Guid? ConfirmedByUserId { get; set; }
     public Guid? SecondApprovedByUserId { get; set; }
 
+    public Guid? RefundSourcePaymentId { get; set; }
+    public bool IsPharmacyReturn { get; set; }
+
     [MaxLength(100)]
     public string? RefundReference { get; set; }
 
@@ -42,11 +45,11 @@ public class Payment : ITenantScoped
     public string? RefundReason { get; set; }
 
     public Guid? PayeeAccountId { get; set; }
-    
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? PaidAt { get; set; }
 
     // Navigation
     public virtual Invoice Invoice { get; set; } = null!;
     public virtual PayeeAccount? PayeeAccount { get; set; }
-}
+}

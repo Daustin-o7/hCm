@@ -3,7 +3,7 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import api from '../services/api'
-import { Modal } from '../components/ui/Modal'
+import { Modal, Confirm } from '../components/ui/Modal'
 import { Alert, friendlyError } from '../components/ui/Alert'
 import { Badge } from '../components/ui/Badge'
 import { EmptyState } from '../components/ui/EmptyState'
@@ -145,6 +145,10 @@ export default function Staff() {
   const [showMatrix, setShowMatrix]   = useState(false)
   const [submitError, setSubmitError] = useState('')
   const [toast, setToast]             = useState<string | null>(null)
+  const [inviteResult, setInviteResult] = useState<{ email: string; inviteToken?: string; expiresAt?: string; emailStatus?: string } | null>(null)
+  const [copyStatus, setCopyStatus] = useState('')
+  const [revoking, setRevoking] = useState<StaffMember | null>(null)
+  const [revokeBusy, setRevokeBusy] = useState(false)
 
   const showToast = (msg: string) => {
     setToast(msg)
@@ -325,12 +329,17 @@ export default function Staff() {
   }, [])
 
   const handleRevokeInvite = async (inviteId: string, email: string) => {
+    if (revokeBusy) return
+    setRevokeBusy(true)
     try {
       await api.delete(`/staff/invites/${inviteId}`)
       showToast(`Invitation for ${email} has been revoked`)
+      setRevoking(null)
       fetchStaff()
     } catch (err) {
       showToast(friendlyError(err) || 'Failed to revoke invite')
+    } finally {
+      setRevokeBusy(false)
     }
   }
 
@@ -345,24 +354,9 @@ export default function Staff() {
     }
     try {
       const res = await api.post('/staff/invite', payload)
-      setStaff(prev => [{
-        id: `st-${Date.now()}`,
-        name: data.name,
-        email: data.email,
-        role: data.role,
-        specialty: data.role === 'Doctor' ? (data.specialty || 'general') : undefined,
-        status: 'Invited',
-        joinedAt: new Date().toISOString(),
-      }, ...prev])
+      setInviteResult({ ...res.data, email: data.email })
+      setCopyStatus('')
       reset({ name: '', email: '', role: 'Doctor', specialty: 'general' })
-      const token = res.data?.inviteToken
-      if (token) {
-        const link = `${window.location.origin}/accept-invite?token=${encodeURIComponent(token)}`
-        navigator.clipboard?.writeText(link).catch(() => {})
-        showToast(`Invitation sent & link copied to clipboard for ${data.email}`)
-      } else {
-        showToast(`Invitation sent to ${data.email}`)
-      }
       setShowModal(false)
       fetchStaff()
     } catch (err) {
@@ -370,8 +364,15 @@ export default function Staff() {
     }
   }, [reset, fetchStaff])
 
-  const copyInviteLink = (email: string) => {
-    showToast(`Invite token for ${email} was securely hashed upon generation. Re-invite to issue a new onboarding link.`)
+  const inviteLink = inviteResult?.inviteToken
+    ? `${window.location.origin}/accept-invite?token=${encodeURIComponent(inviteResult.inviteToken)}` : ''
+  const copyInviteLink = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteLink)
+      setCopyStatus('Invite link copied.')
+    } catch {
+      setCopyStatus('Could not copy. Select the link and copy it manually.')
+    }
   }
 
   // ── Nurse profile detail ──
@@ -640,18 +641,16 @@ export default function Staff() {
                         {s.status === 'Invited' ? (
                           <div className="flex items-center justify-end gap-1.5">
                             <button
-                              onClick={() => handleRevokeInvite(s.id, s.email)}
+                              onClick={() => setRevoking(s)}
                               className="btn btn-ghost btn-xs text-rose-600 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40"
                               title="Revoke and invalidate this invitation"
                             >
                               Revoke
                             </button>
-                            <button
-                              onClick={() => copyInviteLink(s.email)}
-                              className="btn btn-secondary btn-xs cursor-pointer"
-                            >
-                              Copy Link
-                            </button>
+                            <details className="text-sm text-left max-w-64">
+                              <summary className="btn btn-secondary btn-xs cursor-pointer">Recover link</summary>
+                              <p className="mt-2 text-[var(--color-text-muted)]">Saved links cannot be recovered. Revoke this pending invitation, then invite the same person again to create a new link.</p>
+                            </details>
                           </div>
                         ) : s.role === 'Nurse' ? (
                           <button
@@ -674,17 +673,57 @@ export default function Staff() {
       </div>
 
       {/* ── Invite Modal ── */}
+      <Confirm
+        open={revoking !== null}
+        onClose={() => { if (!revokeBusy) setRevoking(null) }}
+        onConfirm={() => { if (revoking) void handleRevokeInvite(revoking.id, revoking.email) }}
+        title="Revoke invitation?"
+        description={`The current link for ${revoking?.email ?? ''} will stop working. You can then invite this person again.`}
+        confirmLabel="Revoke invitation"
+        variant="danger"
+        loading={revokeBusy}
+      />
+      <Modal
+        open={inviteResult !== null}
+        onClose={() => setInviteResult(null)}
+        title="Invitation created"
+        description={`Pending invitation for ${inviteResult?.email ?? ''}.`}
+        footer={<button className="btn btn-primary" onClick={() => setInviteResult(null)}>Done</button>}
+      >
+        <div className="space-y-4">
+          <p role="status" className="text-sm text-[var(--color-text)]">
+            {inviteResult?.emailStatus === 'handoff'
+              ? 'The mail server accepted the invitation email. This does not confirm inbox delivery.'
+              : inviteResult?.emailStatus === 'failed'
+                ? 'Email handoff failed. The invitation is still valid; share the link directly.'
+                : inviteResult?.emailStatus === 'not_configured'
+                  ? 'Email is not configured. Share the invitation link directly.'
+                  : 'Email handoff could not be confirmed. Check with the recipient or share this same link directly.'}
+          </p>
+          {inviteLink && <div>
+            <label htmlFor="staff-invite-link" className="form-label">Single-use invitation link</label>
+            <input id="staff-invite-link" className="form-input mono text-base" readOnly value={inviteLink} onFocus={e => e.currentTarget.select()} />
+            <button className="btn btn-secondary mt-2" onClick={copyInviteLink}>Copy invite link</button>
+            <p role="status" className="text-sm mt-2">{copyStatus}</p>
+          </div>}
+          <p className="text-sm text-[var(--color-text-muted)]">
+            {inviteResult?.expiresAt && <>Expires {fmtDate(inviteResult.expiresAt)}. </>}
+            Keep this link private. After closing this dialog, it cannot be retrieved. If it is lost or expires,
+            revoke the pending invitation and invite the person again.
+          </p>
+        </div>
+      </Modal>
       <Modal
         open={showModal}
-        onClose={() => { setShowModal(false); reset({ name: '', email: '', role: 'Doctor', specialty: 'general' }); setSubmitError('') }}
+        onClose={() => { if (isSubmitting) return; setShowModal(false); reset({ name: '', email: '', role: 'Doctor', specialty: 'general' }); setSubmitError('') }}
         title="Invite Clinic Team Member"
-        description="An invitation email with Single Sign-On onboarding will be dispatched."
+        description="Create a single-use onboarding link. Email handoff status will appear after creation."
         footer={
           <>
             <button className="btn btn-secondary" onClick={() => { setShowModal(false); reset() }} disabled={isSubmitting}>Cancel</button>
             <button form="invite-staff-form" type="submit" className="btn btn-primary" disabled={isSubmitting}>
               {isSubmitting && <span className="spinner spinner-sm" />}
-              {isSubmitting ? 'Sending…' : 'Send invitation'}
+              {isSubmitting ? 'Creating…' : 'Create invitation'}
             </button>
           </>
         }

@@ -1,4 +1,5 @@
 using System.IO;
+using System.Runtime.CompilerServices;
 using Xunit;
 
 namespace Hospital_CRM.Tests;
@@ -16,10 +17,11 @@ public class PasswordFlowRemovedTests
         Assert.DoesNotContain("Permissions.GrantTypes.Password", source);
     }
 
-    private static string RepoFile(string relativePath)
+    private static string RepoFile(string relativePath, [CallerFilePath] string sourceFile = "")
     {
         var candidateRoots = new[]
         {
+            Path.GetDirectoryName(sourceFile)!,
             AppContext.BaseDirectory,
             Directory.GetCurrentDirectory(),
             AppDomain.CurrentDomain.BaseDirectory
@@ -35,16 +37,6 @@ public class PasswordFlowRemovedTests
                     return candidate;
                 dir = dir.Parent;
             }
-        }
-
-        // Try walking up from current directory looking for repo markers
-        var cur = new DirectoryInfo(Directory.GetCurrentDirectory());
-        while (cur is not null)
-        {
-            var candidate = Path.Combine(cur.FullName, relativePath);
-            if (File.Exists(candidate))
-                return candidate;
-            cur = cur.Parent;
         }
 
         throw new FileNotFoundException($"Could not locate repository file '{relativePath}' from '{AppContext.BaseDirectory}' or '{Directory.GetCurrentDirectory()}'.");

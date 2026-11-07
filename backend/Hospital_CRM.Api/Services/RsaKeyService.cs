@@ -18,6 +18,9 @@ public interface IRsaKeyService
 /// </summary>
 public interface IPersistentKeyService : IRsaKeyService
 {
+    /// <summary>Current and explicitly retained public keys; only the current key signs.</summary>
+    IReadOnlyList<RsaSecurityKey> GetValidationKeys() => [GetPublicKey()];
+
     /// <summary>Load or generate the key. Called once at startup.</summary>
     Task LoadAsync(CancellationToken ct = default);
 
@@ -26,7 +29,7 @@ public interface IPersistentKeyService : IRsaKeyService
 
     /// <summary>
     /// Sign the given data with RS256. For PemFile this signs in-memory;
-    /// for AzureKeyVault this calls CryptographyClient.SignAsync and the
+    /// for AzureKeyVault this calls CryptographyClient.SignDataAsync and the
     /// private key never leaves the vault.
     /// </summary>
     Task<byte[]> SignAsync(byte[] data, CancellationToken ct = default);

@@ -13,10 +13,9 @@ public class AzureKeyVaultKeyService : IPersistentKeyService
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<AzureKeyVaultKeyService> _logger;
 
-    private Azure.Security.KeyVault.Keys.JsonWebKey? _jwk;
-    private RSA? _publicRsa;
+    private RsaSecurityKey? _publicKey;
+    private IReadOnlyList<RsaSecurityKey>? _validationKeys;
     private CryptographyClient? _cryptoClient;
-    private string? _keyId;
 
     public string KeySource => "AzureKeyVault";
 
@@ -41,13 +40,12 @@ public class AzureKeyVaultKeyService : IPersistentKeyService
             ExcludeVisualStudioCredential = !_env.IsDevelopment()
         });
 
-        var keyClient = new KeyClient(new Uri(vaultUrl), credential);
-        _cryptoClient = new CryptographyClient(new Uri($"{vaultUrl.TrimEnd('/')}/keys/{keyName}"), credential);
+        var keyClient = CreateKeyClient(new Uri(vaultUrl), credential);
 
         KeyVaultKey vaultKey;
         try
         {
-            vaultKey = await keyClient.GetKeyAsync(keyName, cancellationToken: ct);
+            vaultKey = await keyClient.GetKeyAsync(keyName, _config["Jwt:AzureKeyVault:KeyVersion"], ct);
         }
         catch (Exception ex)
         {
@@ -56,54 +54,41 @@ public class AzureKeyVaultKeyService : IPersistentKeyService
                 "Ensure the key exists, Managed Identity has Key Vault GET and sign permissions, and the vault URL is correct.", ex);
         }
 
-        _jwk = vaultKey.Key;
-        _keyId = _config["Jwt:KeyId"] ?? vaultKey.Properties.Version ?? "hospital-crm-rsa-key-1";
+        var keyId = _config["Jwt:KeyId"] ?? vaultKey.Properties.Version
+            ?? throw new InvalidOperationException("The signing key must have a version.");
 
-        _publicRsa = _jwk.ToRSA(false);
+        using var publicRsa = vaultKey.Key.ToRSA(false);
+        if (publicRsa.KeySize < 2048)
+            throw new InvalidOperationException("The RS256 signing key must be at least 2048 bits.");
+        var publicKey = new RsaSecurityKey(publicRsa.ExportParameters(false)) { KeyId = keyId };
+        var validationKeys = JwtValidationKeys.Load(_config, _env, publicKey);
+        // Pin signing to the exact version whose public key is advertised in JWKS.
+        _cryptoClient = CreateCryptographyClient(vaultKey.Id, credential);
+        _publicKey = publicKey;
+        _validationKeys = validationKeys;
 
         _logger.LogInformation(
             "Loaded RS256 key '{KeyName}' from Azure Key Vault (kid={Kid}, vault={VaultUrl})",
-            keyName, _keyId, vaultUrl);
+            keyName, keyId, vaultUrl);
     }
+
+    protected virtual KeyClient CreateKeyClient(Uri vaultUri, TokenCredential credential) => new(vaultUri, credential);
+    protected virtual CryptographyClient CreateCryptographyClient(Uri keyId, TokenCredential credential) => new(keyId, credential);
 
     public RsaSecurityKey GetPrivateKey() =>
         throw new NotSupportedException(
             "AzureKeyVaultKeyService does not expose the private key. Use SignAsync() for signing — the private key never leaves the vault.");
 
-    public RsaSecurityKey GetPublicKey()
-    {
-        if (_publicRsa == null || _keyId == null)
-            throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
-        var parameters = _publicRsa.ExportParameters(false);
-        return new RsaSecurityKey(parameters) { KeyId = _keyId };
-    }
+    public RsaSecurityKey GetPublicKey() => _publicKey ?? throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
+    public IReadOnlyList<RsaSecurityKey> GetValidationKeys() => _validationKeys ?? throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
 
     public async Task<byte[]> SignAsync(byte[] data, CancellationToken ct = default)
     {
         if (_cryptoClient == null)
             throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
-        var result = await _cryptoClient.SignAsync(SignatureAlgorithm.RS256, data, ct);
+        var result = await _cryptoClient.SignDataAsync(SignatureAlgorithm.RS256, data, ct);
         return result.Signature;
     }
 
-    public object GetJwks()
-    {
-        if (_jwk == null || _keyId == null)
-            throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
-        return new
-        {
-            keys = new[]
-            {
-                new
-                {
-                    kty = "RSA",
-                    use = "sig",
-                    alg = "RS256",
-                    kid = _keyId,
-                    n = Base64UrlEncoder.Encode(_jwk.N!),
-                    e = Base64UrlEncoder.Encode(_jwk.E!)
-                }
-            }
-        };
-    }
+    public object GetJwks() => JwtValidationKeys.GetJwks(GetValidationKeys());
 }

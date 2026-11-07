@@ -1,6 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import api from '../services/api'
+import { downloadPdf } from '../services/downloadPdf'
 import { useAuth } from '../context/AuthContext'
 import { Alert, friendlyError } from '../components/ui/Alert'
 import { consultationSoapSchema } from '../schemas'
@@ -12,7 +13,8 @@ import {
 } from '../components/icons/Index'
 import {
   SPECIALTIES,
-  INITIAL_TEETH
+  INITIAL_TEETH,
+  toPrescriptionItem
 } from '../components/consultations/consultationTypes'
 import type {
   SpecialtyId,
@@ -30,41 +32,12 @@ import PatientContextPanel from '../components/consultations/PatientContextPanel
 import FinalizeSuccessModal from '../components/consultations/FinalizeSuccessModal'
 import AmendmentModal from '../components/consultations/AmendmentModal'
 
-// Development-only demo queue. Dropped in production builds.
-const DEMO_APPOINTMENTS: AppointmentItem[] = import.meta.env.DEV
-  ? [
-      {
-        id: 'apt-demo-1',
-        patientId: 'pat-1',
-        patientName: 'Pooja Sharma 5603',
-        patientPhone: '+91 98765 43210',
-        patientGender: 'Female',
-        patientAge: 28,
-        doctorName: 'Dr. Practitioner',
-        status: 'CheckedIn',
-        appointmentDate: new Date().toISOString().split('T')[0],
-        queueNumber: 1,
-        priority: 'Normal',
-        type: 'Scheduled'
-      },
-      {
-        id: 'apt-demo-2',
-        patientId: 'pat-2',
-        patientName: 'Aarav Verma',
-        patientPhone: '+91 98111 22233',
-        patientGender: 'Male',
-        patientAge: 35,
-        doctorName: 'Dr. Practitioner',
-        status: 'InConsultation',
-        appointmentDate: new Date().toISOString().split('T')[0],
-        queueNumber: 2,
-        priority: 'Normal',
-        type: 'Walk-In'
-      }
-    ]
-  : []
-
 export default function Consultations() {
+  const { sessionGeneration } = useAuth()
+  return <ConsultationDesk key={sessionGeneration} />
+}
+
+function ConsultationDesk() {
   const [searchParams] = useSearchParams()
   const { user } = useAuth()
   const isDoctor = user?.role === 'doctor'
@@ -77,8 +50,10 @@ export default function Consultations() {
     if (querySpecialty && SPECIALTIES.some(s => s.id === querySpecialty)) {
       return querySpecialty
     }
-    const saved = localStorage.getItem('hospital_crm_doctor_specialty')
-    return (saved as SpecialtyId) || 'general'
+    try {
+      const saved = localStorage.getItem('hospital_crm_doctor_specialty')
+      return SPECIALTIES.some(s => s.id === saved) ? saved as SpecialtyId : 'general'
+    } catch { return 'general' }
   })
 
   // ── Appointment Queue ──
@@ -136,6 +111,17 @@ export default function Consultations() {
   const [toast, setToast] = useState<{ msg: string; type?: 'success' | 'err' } | null>(null)
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({})
   const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null)
+  const [draftLoaded, setDraftLoaded] = useState(false)
+  const [chartRead, setChartRead] = useState(0)
+  const [draftError, setDraftError] = useState<string | null>(null)
+  const [savingDraft, setSavingDraft] = useState(false)
+  const [savedPayload, setSavedPayload] = useState<string | null>(null)
+  const [clinicalMetadata, setClinicalMetadata] = useState({ icdCode: null as string | null, icdTitle: null as string | null,
+    templateId: null as string | null, templateVersion: null as number | null, structuredObservationsJson: null as string | null })
+  const draftRevision = useRef({ expectedConsultationId: null as string | null, expectedVersion: 0, expectedUpdatedAt: null as string | null })
+  const encounter = useRef(new AbortController())
+  const saveInFlight = useRef(false)
+  useEffect(() => () => encounter.current.abort(), [])
 
   // Refs for smooth autofocus
   const complaintInputRef = useRef<HTMLTextAreaElement>(null)
@@ -152,6 +138,23 @@ export default function Consultations() {
 
   // Switching patient must never carry the previous chart into the next one.
   const selectAppointment = useCallback((appointment: AppointmentItem | null) => {
+    encounter.current.abort()
+    encounter.current = new AbortController()
+    saveInFlight.current = false
+    setDraftLoaded(false)
+    setDraftError(null)
+    setSavingDraft(false)
+    setSubmitting(false)
+    setSavedPayload(null)
+    draftRevision.current = { expectedConsultationId: null, expectedVersion: 0, expectedUpdatedAt: null }
+    setClinicalMetadata({ icdCode: null, icdTitle: null, templateId: null, templateVersion: null, structuredObservationsJson: null })
+    setPatientDetails(null)
+    setClinicalContext(null)
+    setPrecheck(null)
+    setFinalizeData(null)
+    setIsFinalizeModalOpen(false)
+    setIsAmendmentModalOpen(false)
+    setToast(null)
     setSelectedAppointment(appointment)
     setActiveConsultationId(null)
     setVersionNumber(1)
@@ -171,19 +174,20 @@ export default function Consultations() {
   }, [])
 
   // ── Fetch Appointments Queue ──
-  const fetchAppointments = useCallback(async () => {
+  const fetchAppointments = useCallback(async (signal: AbortSignal) => {
     setLoading(true)
     try {
       const todayISO = new Date().toISOString().split('T')[0]
-      const res = await api.get(`/appointments?date=${todayISO}`)
+      const res = await api.get(`/appointments?date=${todayISO}`, { signal })
+      if (signal.aborted) return
       if (Array.isArray(res.data) && res.data.length > 0) {
         const mapped: AppointmentItem[] = res.data.map((a: any, idx: number) => ({
           id: a.id || a.appointmentId,
           patientId: a.patientId,
           patientName: a.patientName || a.patient?.name || `Patient #${idx + 1}`,
-          patientPhone: a.patientPhone || a.patient?.phone || '+91 98765 43210',
+          patientPhone: a.patientPhone || a.patient?.phone || 'Not recorded',
           patientGender: a.patientGender || a.patient?.gender || 'Unknown',
-          patientAge: a.patientAge ?? a.patient?.approxAge ?? 30,
+          patientAge: a.patientAge ?? a.patient?.approxAge,
           patientDob: a.patientDob || a.patient?.dob,
           doctorName: a.doctorName || a.doctor?.name || 'Dr. Practitioner',
           status: a.status || 'Waiting',
@@ -197,21 +201,23 @@ export default function Consultations() {
         const pMatch = queryPatientId ? mapped.find(m => m.patientId === queryPatientId) : null
         selectAppointment(match || pMatch || mapped[0])
       } else {
-        setAppointments(DEMO_APPOINTMENTS)
-        const match = queryAppointmentId ? DEMO_APPOINTMENTS.find(m => m.id === queryAppointmentId) : null
-        const pMatch = queryPatientId ? DEMO_APPOINTMENTS.find(m => m.patientId === queryPatientId) : null
-        selectAppointment(match || pMatch || DEMO_APPOINTMENTS[0] || null)
+        setAppointments([])
+        selectAppointment(null)
       }
     } catch {
-      setAppointments(DEMO_APPOINTMENTS.slice(0, 1))
-      selectAppointment(DEMO_APPOINTMENTS[0] || null)
+      if (signal.aborted) return
+      setAppointments([])
+      selectAppointment(null)
+      showToast('Unable to load the appointment queue. Reload to try again.', 'err')
     } finally {
-      setLoading(false)
+      if (!signal.aborted) setLoading(false)
     }
-  }, [queryAppointmentId, queryPatientId, selectAppointment])
+  }, [queryAppointmentId, queryPatientId, selectAppointment, showToast])
 
   useEffect(() => {
-    fetchAppointments()
+    const controller = new AbortController()
+    void fetchAppointments(controller.signal)
+    return () => controller.abort()
   }, [fetchAppointments])
 
   // ── Fetch Full Patient Demographics & Comprehensive Clinical Context (Section 3) ──
@@ -219,16 +225,17 @@ export default function Consultations() {
     if (!selectedAppointment?.patientId) return
 
     let isMounted = true
+    const { signal } = encounter.current
     const fallbackDetails: PatientDetails = {
       id: selectedAppointment.patientId,
       name: selectedAppointment.patientName,
       phone: selectedAppointment.patientPhone && selectedAppointment.patientPhone !== '—'
         ? selectedAppointment.patientPhone
-        : '+91 98765 43210',
-      gender: selectedAppointment.patientGender || 'Female',
-      approxAge: selectedAppointment.patientAge || 28,
-      bloodGroup: 'B+',
-      allergies: 'NKDA (No known drug allergies)'
+        : 'Not recorded',
+      gender: selectedAppointment.patientGender,
+      approxAge: selectedAppointment.patientAge,
+      bloodGroup: 'Not recorded',
+      allergies: 'Not recorded'
     }
 
     const loadClinicalContext = async () => {
@@ -238,38 +245,7 @@ export default function Consultations() {
       if (!isGuid) {
         if (isMounted) {
           setPatientDetails(fallbackDetails)
-          setClinicalContext({
-            patient: {
-              id: selectedAppointment.patientId,
-              name: selectedAppointment.patientName,
-              phone: selectedAppointment.patientPhone || '+91 98765 43210',
-              approxAge: selectedAppointment.patientAge || 28,
-              gender: selectedAppointment.patientGender || 'Female',
-              uhid: 'UHID-DEMO-001',
-              allergies: ['Penicillin', 'Sulfa drugs']
-            },
-            todayVitals: {
-              systolicBp: 120,
-              diastolicBp: 80,
-              heartRate: 74,
-              temperature: 98.6,
-              spO2: 99,
-              weightKg: 62.5,
-              bmi: 22.4,
-              recordedAt: new Date().toISOString()
-            },
-            lastConsultation: {
-              consultationId: 'demo-last-c1',
-              date: new Date(Date.now() - 14 * 86400000).toISOString(),
-              doctorName: 'Dr. Anita Desai',
-              diagnosis: 'Acute Bronchitis',
-              prescriptions: [
-                { brandName: 'Augmentin 625', dosageForm: 'Tablet', strength: '625mg', frequency: '1-0-1', duration: '5 Days' },
-                { brandName: 'Pan 40', dosageForm: 'Tablet', strength: '40mg', frequency: '1-0-0', duration: '5 Days' }
-              ]
-            },
-            totalCompletedVisits: 3
-          })
+          setClinicalContext(null)
           setIsContextLoading(false)
         }
         return
@@ -277,11 +253,11 @@ export default function Consultations() {
 
       try {
         const [patientRes, contextRes] = await Promise.allSettled([
-          api.get(`/patients/${selectedAppointment.patientId}`),
-          api.get(`/patients/${selectedAppointment.patientId}/clinical-context`)
+          api.get(`/patients/${selectedAppointment.patientId}`, { signal }),
+          api.get(`/patients/${selectedAppointment.patientId}/clinical-context`, { signal })
         ])
 
-        if (isMounted) {
+        if (isMounted && !signal.aborted) {
           if (patientRes.status === 'fulfilled' && patientRes.value.data) {
             const p = patientRes.value.data
             setPatientDetails({
@@ -307,9 +283,9 @@ export default function Consultations() {
           }
         }
       } catch {
-        if (isMounted) setPatientDetails(fallbackDetails)
+        if (isMounted && !signal.aborted) setPatientDetails(fallbackDetails)
       } finally {
-        if (isMounted) setIsContextLoading(false)
+        if (isMounted && !signal.aborted) setIsContextLoading(false)
       }
     }
 
@@ -324,86 +300,105 @@ export default function Consultations() {
     if (!appointmentId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(appointmentId)) return
 
     let isMounted = true
-    api.get(`/appointments/${appointmentId}/precheck`)
-      .then(res => { if (isMounted) setPrecheck(res.data) })
+    const { signal } = encounter.current
+    api.get(`/appointments/${appointmentId}/precheck`, { signal })
+      .then(res => { if (isMounted && !signal.aborted) setPrecheck(res.data) })
       .catch(() => { /* Precheck module off or nothing submitted — the panel simply hides. */ })
     return () => { isMounted = false }
   }, [selectedAppointment])
 
-  // ── Auto-save Draft to LocalStorage & Server (Non-Binding Autosave) ──
+  // Legacy browser draft bytes remain untouched pending authorized recovery.
+  const encounterSignal = encounter.current.signal
   useEffect(() => {
-    if (!selectedAppointment?.id) return
-    const key = `hospital_crm_draft_${selectedAppointment.id}`
-
-    const saved = localStorage.getItem(key)
-    if (saved) {
+    const appointmentId = selectedAppointment?.id
+    if (!appointmentId) return
+    const signal = encounterSignal
+    const load = async () => {
       try {
-        const parsed = JSON.parse(saved)
-        if (parsed.chiefComplaint && !chiefComplaint) setChiefComplaint(parsed.chiefComplaint)
-        if (parsed.observations && !observations) setObservations(parsed.observations)
-        if (parsed.diagnosis && !diagnosis) setDiagnosis(parsed.diagnosis)
-        if (parsed.advisedInvestigations && !advisedInvestigations) setAdvisedInvestigations(parsed.advisedInvestigations)
-        if (parsed.followUpDate && !followUpDate) setFollowUpDate(parsed.followUpDate)
-        if (parsed.followUpNotes && !followUpNotes) setFollowUpNotes(parsed.followUpNotes)
-        if (parsed.teeth && Array.isArray(parsed.teeth) && parsed.teeth.length > 0) setTeeth(parsed.teeth)
-        if (parsed.prescriptions && prescriptions.length === 0) setPrescriptions(parsed.prescriptions)
+        const list = await api.get('/consultations', { params: { appointmentId, pageSize: 1 }, signal })
+        if (signal.aborted) return
+        if (!Array.isArray(list.data?.data)) throw new Error('Invalid consultation list')
+        const latest = list.data.data[0]
+        if (latest) {
+          const { data } = await api.get(`/consultations/${latest.consultationId}`, { signal })
+          if (signal.aborted) return
+          if (data.appointmentId !== appointmentId || data.consultationId !== latest.consultationId ||
+              !Number.isInteger(data.version) || data.version < 1 || (data.updatedAt != null && !Number.isFinite(Date.parse(data.updatedAt))) ||
+              !['draft', 'finalized', 'amended'].includes(data.status)) throw new Error('Invalid consultation detail')
+          const restoredTeeth = data.odontogramJson == null ? INITIAL_TEETH : JSON.parse(data.odontogramJson)
+          if (!Array.isArray(restoredTeeth)) throw new Error('Invalid saved odontogram')
+          const restoredLabTests = data.orderedLabTests ?? []
+          if (!Array.isArray(restoredLabTests) || restoredLabTests.some((test: unknown) => typeof test !== 'string' || !test.trim() || test.length > 200)) {
+            throw new Error('Invalid saved lab selections')
+          }
+          setChiefComplaint(data.chiefComplaint ?? '')
+          setObservations(data.observations ?? '')
+          setDiagnosis(data.diagnosis ?? '')
+          setAdvisedInvestigations(data.advisedInvestigations ?? '')
+          setOrderedLabTests(restoredLabTests)
+          setFollowUpDate(data.followUpDate ?? '')
+          setFollowUpNotes(data.followUpNotes ?? '')
+          setTeeth(restoredTeeth)
+          setPrescriptions((data.prescriptions ?? []).flatMap((rx: { items: PrescriptionDraft[] }) => rx.items.map(p => ({
+            ...p, medicine: p.brandName || p.genericName || '', dosage: p.dosage ?? p.strength ?? '',
+            frequency: p.frequency ?? '', duration: p.duration ?? ''
+          }))))
+          setClinicalMetadata({ icdCode: data.icdCode ?? null, icdTitle: data.icdTitle ?? null, templateId: data.templateId ?? null,
+            templateVersion: data.templateVersion ?? null, structuredObservationsJson: data.structuredObservationsJson ?? null })
+          setActiveConsultationId(data.consultationId)
+          setVersionNumber(data.version)
+          setConsultationStatus(data.status)
+          draftRevision.current = { expectedConsultationId: data.consultationId, expectedVersion: data.version, expectedUpdatedAt: data.updatedAt ?? null }
+          setDraftSavedAt(data.updatedAt ? new Date(data.updatedAt).toLocaleTimeString() : null)
+        }
+        setDraftLoaded(true)
       } catch {
-        // Ignore JSON error
+        if (!signal.aborted) setDraftError('Unable to load the server chart. Reload before editing or saving.')
       }
     }
-  }, [selectedAppointment?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+    void load()
+  }, [selectedAppointment?.id, encounterSignal, chartRead])
+
+  const draftPayload = useMemo(() => ({ ...clinicalMetadata, chiefComplaint, observations, diagnosis, advisedInvestigations,
+    orderedLabTests,
+    followUpDate: followUpDate || null, followUpNotes: followUpNotes || null,
+    odontogramJson: JSON.stringify(teeth), prescriptionItems: prescriptions.map(toPrescriptionItem)
+  }), [clinicalMetadata, chiefComplaint, observations, diagnosis, advisedInvestigations, orderedLabTests, followUpDate, followUpNotes, teeth, prescriptions])
+  const serializedPayload = JSON.stringify(draftPayload)
+
+  const saveDraft = useCallback(async () => {
+    if (!selectedAppointment || !draftLoaded || consultationStatus !== 'draft' || saveInFlight.current || submitting) return
+    const { signal } = encounter.current
+    saveInFlight.current = true
+    setSavingDraft(true)
+    setDraftError(null)
+    try {
+      const { data } = await api.post(`/appointments/${selectedAppointment.id}/consultation/draft`, { ...draftPayload, ...draftRevision.current }, { signal })
+      if (signal.aborted) return
+      if (!data.consultationId || !Number.isFinite(Date.parse(data.updatedAt)) || data.status !== 'draft' ||
+          !Number.isInteger(data.version) || data.version < 1 ||
+          (draftRevision.current.expectedConsultationId && data.consultationId !== draftRevision.current.expectedConsultationId)) {
+        throw new Error('Draft acknowledgement missing or invalid')
+      }
+      draftRevision.current = { expectedConsultationId: data.consultationId, expectedVersion: data.version, expectedUpdatedAt: data.updatedAt }
+      setActiveConsultationId(data.consultationId)
+      setVersionNumber(data.version)
+      setSavedPayload(serializedPayload)
+      setDraftSavedAt(new Date(data.updatedAt).toLocaleTimeString())
+    } catch (err) {
+      if (!signal.aborted) setDraftError(`Draft not saved. ${friendlyError(err)} Your current edits are still on this screen.`)
+    } finally {
+      if (!signal.aborted) { saveInFlight.current = false; setSavingDraft(false) }
+    }
+  }, [selectedAppointment, draftLoaded, consultationStatus, submitting, draftPayload, serializedPayload])
 
   useEffect(() => {
-    if (!selectedAppointment?.id) return
-    if (!chiefComplaint && !observations && !diagnosis) return
-
-    const key = `hospital_crm_draft_${selectedAppointment.id}`
-    const timer = setTimeout(async () => {
-      // 1. LocalStorage draft
-      localStorage.setItem(key, JSON.stringify({
-        chiefComplaint,
-        observations,
-        diagnosis,
-        advisedInvestigations,
-        followUpDate,
-        followUpNotes,
-        teeth,
-        prescriptions,
-        savedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      }))
-      setDraftSavedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
-
-      // 2. Server draft (non-binding, carries zero legal weight)
-      const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selectedAppointment.id)
-      if (isGuid && consultationStatus !== 'finalized') {
-        try {
-          await api.post(`/appointments/${selectedAppointment.id}/consultation/draft`, {
-            chiefComplaint,
-            observations,
-            diagnosis,
-            advisedInvestigations,
-            prescriptionItems: prescriptions.map(p => ({
-              genericName: p.genericName || p.medicine,
-              brandName: p.brandName,
-              dosageForm: p.dosageForm,
-              strength: p.strength,
-              frequency: p.frequency,
-              duration: p.durationCount || 5,
-              durationUnit: p.durationUnit || 'Days',
-              timing: p.timing || 'After food',
-              totalQuantity: p.totalQuantity || 10,
-              scheduleClass: p.scheduleClass,
-              isUnverified: p.isUnverified ?? false
-            }))
-          })
-        } catch {
-          // Background draft autosave silently retries
-        }
-      }
-    }, 1200)
-
-    return () => clearTimeout(timer)
-  }, [chiefComplaint, observations, diagnosis, prescriptions, advisedInvestigations, selectedAppointment?.id, consultationStatus])
+    if (!draftLoaded) return
+    if (savedPayload === null) { setSavedPayload(serializedPayload); return }
+    if (serializedPayload === savedPayload || consultationStatus !== 'draft' || savingDraft || submitting || draftError) return
+    const timer = window.setTimeout(() => void saveDraft(), 1200)
+    return () => window.clearTimeout(timer)
+  }, [draftLoaded, savedPayload, serializedPayload, consultationStatus, savingDraft, submitting, draftError, saveDraft])
 
   // ── Fetch Specialty Templates from Backend ──
   const fetchTemplateForSpecialty = useCallback(async (spec: SpecialtyId) => {
@@ -489,7 +484,7 @@ export default function Consultations() {
 
   const handleSelectSpecialty = useCallback((spec: SpecialtyId) => {
     setSelectedSpecialty(spec)
-    localStorage.setItem('hospital_crm_doctor_specialty', spec)
+    try { localStorage.setItem('hospital_crm_doctor_specialty', spec) } catch { /* Optional preference. */ }
     const cfg = SPECIALTIES.find(s => s.id === spec)
     showToast(`Switched consultation context to ${cfg?.name || spec}. Existing notes preserved.`)
   }, [showToast])
@@ -497,106 +492,58 @@ export default function Consultations() {
   // ── Atomic Queue Controls: Claim, Park, Recall ──
   const handleClaimPatient = useCallback(async () => {
     if (!selectedAppointment) return
-    const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selectedAppointment.id)
-
-    if (!isGuid) {
-      setSelectedAppointment(prev => prev ? { ...prev, status: 'InConsultation' } : null)
-      showToast('Patient claimed for consultation (Demo mode).')
-      return
-    }
+    const { signal } = encounter.current
 
     try {
-      await api.post(`/appointments/${selectedAppointment.id}/claim`)
+      await api.post(`/appointments/${selectedAppointment.id}/claim`, {}, { signal })
+      if (signal.aborted) return
       setSelectedAppointment(prev => prev ? { ...prev, status: 'InConsultation' } : null)
       setAppointments(prev => prev.map(a => a.id === selectedAppointment.id ? { ...a, status: 'InConsultation' } : a))
       showToast('Patient claimed atomically. Consultation session active.')
     } catch (err: any) {
+      if (signal.aborted) return
       showToast(err?.response?.data?.error || friendlyError(err) || 'Failed to claim patient.', 'err')
     }
   }, [selectedAppointment, showToast])
 
   const handleParkPatient = useCallback(async () => {
     if (!selectedAppointment) return
-    const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selectedAppointment.id)
-
-    if (!isGuid) {
-      setSelectedAppointment(prev => prev ? { ...prev, status: 'Parked' } : null)
-      showToast('Patient parked (Demo mode).')
-      return
-    }
+    const { signal } = encounter.current
 
     try {
-      await api.post(`/appointments/${selectedAppointment.id}/park`)
+      await api.post(`/appointments/${selectedAppointment.id}/park`, {}, { signal })
+      if (signal.aborted) return
       setSelectedAppointment(prev => prev ? { ...prev, status: 'Parked' } : null)
       setAppointments(prev => prev.map(a => a.id === selectedAppointment.id ? { ...a, status: 'Parked' } : a))
       showToast('Patient parked. Queue moved to next patient.')
     } catch (err: any) {
+      if (signal.aborted) return
       showToast(err?.response?.data?.error || friendlyError(err) || 'Failed to park patient.', 'err')
     }
   }, [selectedAppointment, showToast])
 
   const handleRecallPatient = useCallback(async () => {
     if (!selectedAppointment) return
-    const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selectedAppointment.id)
-
-    if (!isGuid) {
-      setSelectedAppointment(prev => prev ? { ...prev, status: 'InConsultation' } : null)
-      showToast('Patient recalled (Demo mode).')
-      return
-    }
+    const { signal } = encounter.current
 
     try {
-      await api.post(`/appointments/${selectedAppointment.id}/recall`)
+      await api.post(`/appointments/${selectedAppointment.id}/recall`, {}, { signal })
+      if (signal.aborted) return
       setSelectedAppointment(prev => prev ? { ...prev, status: 'InConsultation' } : null)
       setAppointments(prev => prev.map(a => a.id === selectedAppointment.id ? { ...a, status: 'InConsultation' } : a))
       showToast('Patient recalled back to consultation room.')
     } catch (err: any) {
+      if (signal.aborted) return
       showToast(err?.response?.data?.error || friendlyError(err) || 'Failed to recall patient.', 'err')
     }
   }, [selectedAppointment, showToast])
 
   // ── Manual Draft Save (Non-Binding) ──
-  const handleSaveDraft = useCallback(async () => {
-    if (!selectedAppointment) return
-    setSubmitting(true)
-    try {
-      const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selectedAppointment.id)
-      if (isGuid) {
-        await api.post(`/appointments/${selectedAppointment.id}/consultation/draft`, {
-          chiefComplaint,
-          observations,
-          diagnosis,
-          advisedInvestigations,
-          followUpDate: followUpDate || null,
-          followUpNotes: followUpNotes || null,
-          odontogramJson: JSON.stringify(teeth),
-          prescriptionItems: prescriptions.map(p => ({
-            genericName: p.genericName || p.medicine,
-            brandName: p.brandName,
-            dosageForm: p.dosageForm,
-            strength: p.strength,
-            frequency: p.frequency,
-            duration: p.durationCount || 5,
-            durationUnit: p.durationUnit || 'Days',
-            timing: p.timing || 'After food',
-            totalQuantity: p.totalQuantity || 10,
-            scheduleClass: p.scheduleClass,
-            isUnverified: p.isUnverified ?? false
-          }))
-        })
-      }
-      const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      setDraftSavedAt(timeStr)
-      showToast(`Draft note saved (${timeStr}). Carrying zero legal weight until finalized.`)
-    } catch (err: any) {
-      showToast(friendlyError(err) || 'Failed to save draft.', 'err')
-    } finally {
-      setSubmitting(false)
-    }
-  }, [selectedAppointment, chiefComplaint, observations, diagnosis, advisedInvestigations, followUpDate, followUpNotes, prescriptions, teeth, showToast])
+  const handleSaveDraft = saveDraft
 
   // ── Finalize & Sign (Single Atomic Transaction) ──
   const handleFinalizeConsultation = useCallback(async () => {
+    if (!draftLoaded || saveInFlight.current || submitting || consultationStatus !== 'draft') return
     if (!selectedAppointment) {
       showToast('Please select a patient appointment first.', 'err')
       return
@@ -628,60 +575,31 @@ export default function Consultations() {
       return
     }
 
-    const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selectedAppointment.id)
-
-    if (!isGuid) {
-      // Demo mode finalize
-      setConsultationStatus('finalized')
-      setActiveConsultationId('demo-sealed-1')
-      setFinalizeData({
-        consultationId: 'demo-sealed-1',
-        version: 1,
-        status: 'finalized',
-        doctorRegistrationNumber: 'MCI-2015-88941',
-        doctorQualifications: 'MBBS, MD (Medicine)',
-        digitalSignatureHash: '0x889f1c7d24a0e9b31f56...sealed',
-        verificationQrCode: 'RX-DEMO-2026-FINAL',
-        followUpDate: followUpDate || undefined
-      })
-      setIsFinalizeModalOpen(true)
-      setSelectedAppointment(prev => prev ? { ...prev, status: 'Completed' } : null)
-      showToast('Consultation sealed and signed (Demo session).')
-      return
-    }
-
+    const { signal } = encounter.current
     setSubmitting(true)
     try {
       const payload = {
-        chiefComplaint,
-        observations,
-        diagnosis,
-        advisedInvestigations,
-        followUpDate: followUpDate || null,
-        followUpNotes: followUpNotes || null,
-        odontogramJson: JSON.stringify(teeth),
-        prescriptionItems: prescriptions.map(p => ({
-          genericName: p.genericName || p.medicine,
-          brandName: p.brandName,
-          dosageForm: p.dosageForm,
-          strength: p.strength,
-          route: p.route || 'Oral',
-          frequency: p.frequency,
-          duration: p.durationCount || 5,
-          durationUnit: p.durationUnit || 'Days',
-          timing: p.timing || 'After food',
-          totalQuantity: p.totalQuantity || 10,
-          scheduleClass: p.scheduleClass,
-          isUnverified: p.isUnverified ?? false
-        })),
-        orderedLabTests
+        ...draftPayload,
+        ...draftRevision.current
       }
 
-      const res = await api.post(`/appointments/${selectedAppointment.id}/consultation/finalize`, payload)
+      const res = await api.post(`/appointments/${selectedAppointment.id}/consultation/finalize`, payload, { signal })
+      if (signal.aborted) return
       const data = res.data
+      const prescriptionConfirmed = typeof data.prescriptionId === 'string' && data.prescriptionId.length > 0 ||
+        (data.prescriptionId === null && prescriptions.length === 0)
+      if (!data.consultationId || !prescriptionConfirmed || data.status !== 'finalized' || !Number.isInteger(data.version) || data.version < 1 ||
+          (draftRevision.current.expectedConsultationId && data.consultationId !== draftRevision.current.expectedConsultationId)) {
+        setDraftLoaded(false)
+        setDraftError('Unable to confirm finalization. Reload the server chart before continuing.')
+        return
+      }
       setActiveConsultationId(data.consultationId)
-      setVersionNumber(data.version || 1)
+      setVersionNumber(data.version)
       setConsultationStatus('finalized')
+      setDraftLoaded(false)
+      setSavedPayload(null)
+      setChartRead(value => value + 1)
       setFinalizeData(data)
       setIsFinalizeModalOpen(true)
 
@@ -689,91 +607,90 @@ export default function Consultations() {
       setSelectedAppointment(prev => prev ? { ...prev, status: 'Completed' } : null)
       setAppointments(prev => prev.map(a => a.id === selectedAppointment.id ? { ...a, status: 'Completed' } : a))
 
-      // Clear draft storage
-      localStorage.removeItem(`hospital_crm_draft_${selectedAppointment.id}`)
       setDraftSavedAt(null)
       showToast('Consultation sealed, signed, and appointment marked Completed.')
     } catch (err: any) {
+      if (signal.aborted) return
       const errCode = err?.response?.data?.error
       if (errCode === 'pediatric_weight_required') {
-        showToast('Safety block: Pediatric prescribing requires weight on today\'s vitals.', 'err')
+        showToast('Safety block: Record a positive weight today for this encounter before prescribing.', 'err')
       } else if (errCode === 'ndps_digital_prescribing_prohibited') {
         showToast('Legal block: NDPS electronic prescribing is disabled per drug control rules.', 'err')
       } else {
         showToast(err?.response?.data?.message || friendlyError(err) || 'Failed to finalize consultation.', 'err')
       }
     } finally {
-      setSubmitting(false)
+      if (!signal.aborted) setSubmitting(false)
     }
-  }, [selectedAppointment, chiefComplaint, observations, diagnosis, advisedInvestigations, followUpDate, followUpNotes, prescriptions, orderedLabTests, showToast])
+  }, [selectedAppointment, chiefComplaint, observations, diagnosis, prescriptions, orderedLabTests, showToast, draftLoaded, submitting, consultationStatus, draftPayload])
 
   // ── Clinical Amendment (FR-14 & FR-15 Non-destructive v2) ──
   const handleConfirmAmendment = useCallback(async (amendmentReason: string) => {
-    if (!activeConsultationId) return
-    const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(activeConsultationId)
-
-    if (!isGuid) {
-      setVersionNumber(v => v + 1)
-      setConsultationStatus('amended')
-      showToast(`Consultation record amended (Version ${versionNumber + 1}).`)
-      return
-    }
+    if (!activeConsultationId || !draftLoaded || submitting || consultationStatus === 'draft') throw new Error('Reload the current chart before amending.')
 
     const payload = {
       amendmentReason,
-      chiefComplaint,
-      observations,
-      diagnosis,
-      advisedInvestigations,
-      followUpDate: followUpDate || null,
-      followUpNotes: followUpNotes || null,
-      odontogramJson: JSON.stringify(teeth),
-      prescriptionItems: prescriptions.map(p => ({
-        genericName: p.genericName || p.medicine,
-        brandName: p.brandName,
-        dosageForm: p.dosageForm,
-        strength: p.strength,
-        frequency: p.frequency,
-        duration: p.durationCount || 5,
-        durationUnit: p.durationUnit || 'Days',
-        timing: p.timing || 'After food',
-        totalQuantity: p.totalQuantity || 10,
-        scheduleClass: p.scheduleClass,
-        isUnverified: p.isUnverified ?? false
-      }))
+      replaceClinicalFields: true,
+      ...draftPayload
     }
 
-    const res = await api.post(`/consultations/${activeConsultationId}/amend`, payload)
-    setActiveConsultationId(res.data.consultationId)
-    setVersionNumber(res.data.version)
-    setConsultationStatus('amended')
-    showToast(`Consultation amended successfully (Version ${res.data.version}). Prior version preserved.`)
-  }, [activeConsultationId, chiefComplaint, observations, diagnosis, advisedInvestigations, followUpDate, followUpNotes, prescriptions, teeth, versionNumber, showToast])
+    const { signal } = encounter.current
+    setSubmitting(true)
+    try {
+      const { data } = await api.post(`/consultations/${activeConsultationId}/amend`, payload, { signal })
+      signal.throwIfAborted()
+      if (!data.consultationId || data.previousVersionId !== activeConsultationId || data.version !== versionNumber + 1 || data.status !== 'amended') {
+        setDraftLoaded(false)
+        setDraftError('Unable to confirm amendment. Reload the server chart before continuing.')
+        throw new Error('Amendment acknowledgement missing or invalid.')
+      }
+      setActiveConsultationId(data.consultationId)
+      setVersionNumber(data.version)
+      setConsultationStatus('amended')
+      setDraftLoaded(false)
+      setSavedPayload(null)
+      setChartRead(value => value + 1)
+      showToast(`Consultation amended successfully (Version ${data.version}). Prior version preserved.`)
+    } finally {
+      if (!signal.aborted) setSubmitting(false)
+    }
+  }, [activeConsultationId, draftLoaded, submitting, consultationStatus, versionNumber, draftPayload, showToast])
 
   // ── Copy Previous Prescription into Current Draft ──
   const handleCopyPreviousRx = useCallback((previousItems: any[]) => {
+    if (!draftLoaded) return
     if (!previousItems || previousItems.length === 0) return
     const formatted: PrescriptionDraft[] = previousItems.map(p => ({
-      medicine: p.brandName || p.genericName || 'Medicine',
+      medicine: p.brandName || p.genericName || '',
+      drugId: p.drugId,
       genericName: p.genericName,
       brandName: p.brandName,
-      dosage: p.dosage || '1 Tab',
-      frequency: p.frequency || '1-0-1',
-      duration: p.duration || '5 Days',
-      dosageForm: p.dosageForm || 'Tablet',
-      strength: p.strength || ''
+      dosage: p.dosage || p.strength || '',
+      frequency: p.frequency || '',
+      duration: typeof p.duration === 'number' ? `${p.duration} ${p.durationUnit ?? ''}`.trim() : p.duration || '',
+      dosageForm: p.dosageForm,
+      strength: p.strength || p.dosage || '',
+      route: p.route,
+      durationCount: p.durationCount,
+      durationUnit: p.durationUnit,
+      timing: p.timing,
+      totalQuantity: p.totalQuantity,
+      specialInstructions: p.specialInstructions,
+      scheduleClass: p.scheduleClass,
+      isUnverified: p.isUnverified
     }))
     setPrescriptions(prev => [...prev, ...formatted])
     setActiveTab('rx')
     showToast(`Copied ${formatted.length} medicines from previous visit into prescription.`)
-  }, [showToast])
+  }, [showToast, draftLoaded])
 
   // ── Keyboard Shortcuts (Ctrl+S for Finalize, Alt+1/2/3/4) ──
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
-        if (consultationStatus === 'finalized' || activeConsultationId) {
+        if (!draftLoaded || submitting || savingDraft) return
+        if (consultationStatus !== 'draft') {
           setIsAmendmentModalOpen(true)
         } else {
           handleFinalizeConsultation()
@@ -795,7 +712,7 @@ export default function Consultations() {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleFinalizeConsultation, consultationStatus, activeConsultationId])
+  }, [handleFinalizeConsultation, consultationStatus, draftLoaded, submitting, savingDraft])
 
   // ── Queue Navigation ──
   const currentQueueIndex = useMemo(() => {
@@ -841,11 +758,11 @@ export default function Consultations() {
                     : 'bg-emerald-50 text-emerald-700 border-emerald-200'
                 }`}>
                   <span className={`w-1.5 h-1.5 rounded-full ${consultationStatus === 'finalized' ? 'bg-slate-400' : 'bg-emerald-500 animate-pulse-soft'}`} />
-                  {consultationStatus === 'finalized' ? `Finalized v${versionNumber}` : 'Draft (Editable)'}
+                   {consultationStatus !== 'draft' ? `Finalized v${versionNumber}` : 'Draft (Editable)'}
                 </span>
               </div>
               <p className="text-xs text-slate-500 hidden sm:block">
-                EMR codification, drug formulary checks, and atomic digital signature signing
+                Clinical notes, medicine checks, and versioned content seals
               </p>
             </div>
           </div>
@@ -869,18 +786,17 @@ export default function Consultations() {
             </select>
           </div>
 
-          {draftSavedAt && (
-            <span className="text-[11px] text-slate-500 hidden xl:inline font-mono">
-              Auto-saved {draftSavedAt}
-            </span>
-          )}
+          <span role="status" className="text-xs text-slate-500">
+            {!draftLoaded ? (selectedAppointment ? 'Loading server chart…' : 'Select an appointment') : savingDraft ? 'Saving draft…' :
+              draftError || serializedPayload !== savedPayload ? 'Unsaved changes' : draftSavedAt ? `Saved on server ${draftSavedAt}` : 'Server chart loaded'}
+          </span>
 
           {/* Save Draft Button (Non-Binding) */}
-          {consultationStatus !== 'finalized' && (
+          {consultationStatus === 'draft' && (
             <button
               type="button"
               onClick={handleSaveDraft}
-              disabled={submitting}
+              disabled={submitting || savingDraft || !draftLoaded}
               className="btn btn-secondary btn-sm flex items-center gap-1 text-slate-700"
               title="Save non-binding draft"
             >
@@ -889,23 +805,15 @@ export default function Consultations() {
           )}
 
           {/* Finalize & Sign (Atomic Lock) OR Amend Button */}
-          {consultationStatus === 'finalized' && activeConsultationId && (
+          {consultationStatus !== 'draft' && activeConsultationId && prescriptions.length > 0 && (
             <button
               type="button"
-              onClick={async () => {
-                try {
-                  const res = await api.get(`/consultations/${activeConsultationId}/prescription/pdf`, { responseType: 'blob' });
-                  const blob = new Blob([res.data], { type: 'application/pdf' });
-                  const url = window.URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url;
-                  a.download = `Prescription_${selectedAppointment?.patientName || 'Patient'}_v${versionNumber}.pdf`;
-                  document.body.appendChild(a);
-                  a.click();
-                  window.URL.revokeObjectURL(url);
-                  document.body.removeChild(a);
-                } catch {
-                  window.open(`/api/v1/consultations/${activeConsultationId}/prescription/pdf`, '_blank');
+               onClick={async () => {
+                 const { signal } = encounter.current
+                 try {
+                   await downloadPdf(`/consultations/${activeConsultationId}/prescription/pdf`, `Prescription_v${versionNumber}.pdf`, signal)
+                 } catch (err) {
+                   if (!signal.aborted) showToast(friendlyError(err), 'err')
                 }
               }}
               className="btn btn-secondary btn-sm flex items-center gap-1.5"
@@ -916,11 +824,11 @@ export default function Consultations() {
             </button>
           )}
 
-          {consultationStatus === 'finalized' || activeConsultationId ? (
+          {consultationStatus !== 'draft' ? (
             <button
               type="button"
               onClick={() => setIsAmendmentModalOpen(true)}
-              disabled={submitting}
+              disabled={submitting || !draftLoaded}
               className="btn btn-secondary btn-sm flex items-center gap-1.5"
               title="Amend sealed note (Ctrl+S)"
             >
@@ -931,7 +839,7 @@ export default function Consultations() {
             <button
               type="button"
               onClick={handleFinalizeConsultation}
-              disabled={submitting}
+              disabled={submitting || savingDraft || !draftLoaded}
               className="btn btn-primary btn-sm flex items-center gap-1.5 shadow-sm"
               title="Finalize & Sign (Ctrl+S)"
             >
@@ -953,6 +861,7 @@ export default function Consultations() {
       </div>
 
       {/* Toast Alert */}
+      {draftError && <Alert variant="error">{draftError}</Alert>}
       {toast && (
         <div className="animate-fadein">
           <Alert variant={toast.type === 'err' ? 'error' : 'success'} onDismiss={() => setToast(null)}>
@@ -989,6 +898,7 @@ export default function Consultations() {
       />
 
       {/* ── 4. WORKSPACE NAVIGATION TABS ── */}
+      <fieldset disabled={!draftLoaded || submitting} className="min-w-0 space-y-4">
       <div className="flex items-center gap-1 border-b border-[var(--color-border)] pb-0 overflow-x-auto">
         <button
           onClick={() => setActiveTab('soap')}
@@ -1150,12 +1060,15 @@ export default function Consultations() {
 
             {/* Lab orders land in the Lab Worklist (Module 08) on finalize. */}
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
+              <label htmlFor="consultation-lab-test" className="block text-xs font-medium text-slate-600 mb-1">
                 Order Lab Tests (sent to Lab Worklist on signing)
               </label>
+              <p className="text-xs text-slate-500 mb-2">Selections are included in draft saves. Orders are sent to the Lab Worklist only when you finalize.</p>
               <div className="flex gap-2">
                 <input
+                  id="consultation-lab-test"
                   type="text"
+                  maxLength={200}
                   value={labTestInput}
                   onChange={(e) => setLabTestInput(e.target.value)}
                   onKeyDown={(e) => {
@@ -1207,6 +1120,7 @@ export default function Consultations() {
       {/* ── TAB 2: SPECIALIZED CLINICAL TOOLS ── */}
       {activeTab === 'tools' && (
         <SpecialtyToolsPanel
+          key={selectedAppointment?.id}
           selectedSpecialty={selectedSpecialty}
           onInsertFindings={handleInsertFindingsFromTools}
           teeth={teeth}
@@ -1217,6 +1131,7 @@ export default function Consultations() {
       {/* ── TAB 3: PRESCRIPTIONS RX ── */}
       {activeTab === 'rx' && (
         <PrescriptionsEditor
+          key={selectedAppointment?.id}
           prescriptions={prescriptions}
           onChangePrescriptions={setPrescriptions}
         />
@@ -1325,6 +1240,7 @@ export default function Consultations() {
         </div>
       )}
 
+      </fieldset>
       {/* ── Modals: Finalize Success & Amendment ── */}
       <FinalizeSuccessModal
         isOpen={isFinalizeModalOpen}
@@ -1335,6 +1251,7 @@ export default function Consultations() {
       />
 
       <AmendmentModal
+        key={selectedAppointment?.id}
         isOpen={isAmendmentModalOpen}
         onClose={() => setIsAmendmentModalOpen(false)}
         onConfirm={handleConfirmAmendment}

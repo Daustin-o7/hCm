@@ -51,6 +51,9 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.Property<int?>("QueueToken")
                         .HasColumnType("integer");
 
+                    b.Property<DateTimeOffset?>("QueueTrackingExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<string>("QueueTrackingToken")
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
@@ -652,6 +655,9 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("character varying(100)");
 
+                    b.PrimitiveCollection<string[]>("DraftLabTests")
+                        .HasColumnType("text[]");
+
                     b.Property<DateOnly?>("FollowUpDate")
                         .HasColumnType("date");
 
@@ -978,11 +984,21 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
 
+                    b.Property<Guid?>("InvoiceId")
+                        .HasColumnType("uuid");
+
                     b.Property<Guid?>("PatientId")
                         .HasColumnType("uuid");
 
                     b.Property<Guid?>("PrescriptionId")
                         .HasColumnType("uuid");
+
+                    b.Property<string>("RequestHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("ResultJson")
+                        .HasColumnType("text");
 
                     b.Property<Guid>("TenantId")
                         .HasColumnType("uuid");
@@ -995,6 +1011,8 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasIndex("DispensedBy");
 
+                    b.HasIndex("InvoiceId");
+
                     b.HasIndex("PatientId");
 
                     b.HasIndex("PrescriptionId");
@@ -1004,6 +1022,10 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.HasIndex("TenantId", "IdempotencyKey")
                         .IsUnique()
                         .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+
+                    b.HasIndex("TenantId", "InvoiceId")
+                        .IsUnique()
+                        .HasFilter("\"InvoiceId\" IS NOT NULL");
 
                     b.ToTable("DispenseRecords");
                 });
@@ -1456,6 +1478,13 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.Property<decimal>("BalanceDue")
                         .HasColumnType("decimal(18,2)");
 
+                    b.Property<string>("CheckoutRequestHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("CheckoutResultJson")
+                        .HasColumnType("text");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
@@ -1550,13 +1579,13 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasIndex("AppointmentId");
 
-                    b.HasIndex("IdempotencyKey")
-                        .IsUnique()
-                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
-
                     b.HasIndex("PatientId");
 
                     b.HasIndex("Status", "CreatedAt");
+
+                    b.HasIndex("TenantId", "IdempotencyKey")
+                        .IsUnique()
+                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
 
                     b.HasIndex("TenantId", "PatientId", "Status");
 
@@ -1770,11 +1799,11 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("TenantId");
-
                     b.HasIndex("EnteredBy");
 
                     b.HasIndex("PreviousVersionId");
+
+                    b.HasIndex("TenantId");
 
                     b.HasIndex("LabOrderId", "Version");
 
@@ -1964,6 +1993,41 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .IsUnique();
 
                     b.ToTable("MessageTemplates");
+                });
+
+            modelBuilder.Entity("Hospital_CRM.Domain.Entities.NotificationIntent", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateOnly>("AppointmentDate")
+                        .HasColumnType("date");
+
+                    b.Property<Guid>("AppointmentId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("HandedOffAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ProtectedPrecheckLink")
+                        .HasColumnType("text");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "AppointmentId")
+                        .IsUnique();
+
+                    b.HasIndex("TenantId", "CreatedAt")
+                        .HasFilter("\"HandedOffAt\" IS NULL");
+
+                    b.ToTable("NotificationIntents", (string)null);
                 });
 
             modelBuilder.Entity("Hospital_CRM.Domain.Entities.NotificationLog", b =>
@@ -2506,13 +2570,13 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasIndex("CreatedBy");
 
-                    b.HasIndex("IdempotencyKey")
-                        .IsUnique()
-                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
-
                     b.HasIndex("Name");
 
                     b.HasIndex("Phone");
+
+                    b.HasIndex("TenantId", "IdempotencyKey")
+                        .IsUnique()
+                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
 
                     b.HasIndex("TenantId", "Phone");
 
@@ -2623,11 +2687,11 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("TenantId");
-
                     b.HasIndex("CapturedBy");
 
                     b.HasIndex("PatientId");
+
+                    b.HasIndex("TenantId");
 
                     b.ToTable("PatientConsents");
                 });
@@ -2696,6 +2760,7 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .HasColumnType("uuid");
 
                     b.Property<DateTimeOffset>("UpdatedAt")
+                        .IsConcurrencyToken()
                         .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
@@ -2703,6 +2768,10 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.HasIndex("ClinicId");
 
                     b.HasIndex("PatientId");
+
+                    b.HasIndex("TenantId", "IdempotencyKey")
+                        .IsUnique()
+                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
 
                     b.HasIndex("TenantId", "ReceiptNumber")
                         .IsUnique();
@@ -2741,6 +2810,9 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.Property<Guid>("PatientDepositId")
                         .HasColumnType("uuid");
 
+                    b.Property<Guid?>("PaymentId")
+                        .HasColumnType("uuid");
+
                     b.Property<Guid>("TenantId")
                         .HasColumnType("uuid");
 
@@ -2749,6 +2821,8 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.HasIndex("InvoiceId");
 
                     b.HasIndex("PatientDepositId");
+
+                    b.HasIndex("PaymentId");
 
                     b.HasIndex("TenantId", "InvoiceId");
 
@@ -2968,6 +3042,9 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.Property<Guid>("InvoiceId")
                         .HasColumnType("uuid");
 
+                    b.Property<bool>("IsPharmacyReturn")
+                        .HasColumnType("boolean");
+
                     b.Property<int>("Method")
                         .HasColumnType("integer");
 
@@ -2993,6 +3070,9 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("character varying(100)");
 
+                    b.Property<Guid?>("RefundSourcePaymentId")
+                        .HasColumnType("uuid");
+
                     b.Property<DateTimeOffset?>("ReportedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -3014,15 +3094,21 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("IdempotencyKey")
-                        .IsUnique()
-                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
-
                     b.HasIndex("InvoiceId");
 
                     b.HasIndex("PayeeAccountId");
 
+                    b.HasIndex("RefundSourcePaymentId");
+
                     b.HasIndex("TenantId", "CreatedAt");
+
+                    b.HasIndex("TenantId", "IdempotencyKey")
+                        .IsUnique()
+                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+
+                    b.HasIndex("TenantId", "Method", "RazorpayPaymentId")
+                        .IsUnique()
+                        .HasFilter("\"RazorpayPaymentId\" IS NOT NULL AND \"Amount\" > 0 AND \"Method\" = 5");
 
                     b.ToTable("Payments");
                 });
@@ -3151,9 +3237,9 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("TenantId");
-
                     b.HasIndex("ConsultationId");
+
+                    b.HasIndex("TenantId");
 
                     b.ToTable("Prescriptions");
                 });
@@ -3388,10 +3474,10 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("Provider", "EventId")
-                        .IsUnique();
-
                     b.HasIndex("TenantId", "Status");
+
+                    b.HasIndex("TenantId", "Provider", "EventId")
+                        .IsUnique();
 
                     b.ToTable("ProcessedWebhookEvents");
                 });
@@ -4252,6 +4338,40 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.ToTable("TenantMemberships");
                 });
 
+            modelBuilder.Entity("Hospital_CRM.Domain.Entities.TenantProvisioningReceipt", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("ActorId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("IdempotencyKey")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("ProtectedResponse")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("RequestHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ActorId", "IdempotencyKey")
+                        .IsUnique();
+
+                    b.ToTable("TenantProvisioningReceipts");
+                });
+
             modelBuilder.Entity("Hospital_CRM.Domain.Entities.TenantTaxProfile", b =>
                 {
                     b.Property<Guid>("Id")
@@ -4865,6 +4985,11 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
+                    b.HasOne("Hospital_CRM.Domain.Entities.Invoice", null)
+                        .WithMany()
+                        .HasForeignKey("InvoiceId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
                     b.HasOne("Hospital_CRM.Domain.Entities.Patient", "Patient")
                         .WithMany()
                         .HasForeignKey("PatientId");
@@ -5071,6 +5196,18 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.Navigation("SearchedByUser");
                 });
 
+            modelBuilder.Entity("Hospital_CRM.Domain.Entities.NotificationIntent", b =>
+                {
+                    b.HasOne("Hospital_CRM.Domain.Entities.Appointment", "Appointment")
+                        .WithMany()
+                        .HasForeignKey("TenantId", "AppointmentId")
+                        .HasPrincipalKey("TenantId", "Id")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Appointment");
+                });
+
             modelBuilder.Entity("Hospital_CRM.Domain.Entities.NotificationLog", b =>
                 {
                     b.HasOne("Hospital_CRM.Domain.Entities.Appointment", "Appointment")
@@ -5253,6 +5390,11 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
 
+                    b.HasOne("Hospital_CRM.Domain.Entities.Payment", null)
+                        .WithMany()
+                        .HasForeignKey("PaymentId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
                     b.Navigation("Invoice");
 
                     b.Navigation("PatientDeposit");
@@ -5322,6 +5464,11 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.HasOne("Hospital_CRM.Domain.Entities.PayeeAccount", "PayeeAccount")
                         .WithMany("Payments")
                         .HasForeignKey("PayeeAccountId");
+
+                    b.HasOne("Hospital_CRM.Domain.Entities.Payment", null)
+                        .WithMany()
+                        .HasForeignKey("RefundSourcePaymentId")
+                        .OnDelete(DeleteBehavior.Restrict);
 
                     b.Navigation("Invoice");
 

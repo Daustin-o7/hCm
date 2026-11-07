@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Hospital_CRM.Api.Authorization;
@@ -10,6 +11,7 @@ using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -24,6 +26,9 @@ public class PlatformAdminController : ControllerBase
     private readonly IPersistentKeyService _keyService;
     private readonly IConfiguration _config;
     private readonly IImpersonationAuditService _auditService;
+    private readonly IEmailSender? _email;
+    private readonly ILogger<PlatformAdminController>? _logger;
+    private readonly IDataProtectionProvider? _dataProtection;
 
     private static readonly SubscriptionTier[] AssignableTiers =
     [
@@ -35,12 +40,18 @@ public class PlatformAdminController : ControllerBase
         HospitalCrmDbContext db,
         IPersistentKeyService keyService,
         IConfiguration config,
-        IImpersonationAuditService auditService)
+        IImpersonationAuditService auditService,
+        IEmailSender? email = null,
+        ILogger<PlatformAdminController>? logger = null,
+        IDataProtectionProvider? dataProtection = null)
     {
         _db = db;
         _keyService = keyService;
         _config = config;
         _auditService = auditService;
+        _email = email;
+        _logger = logger;
+        _dataProtection = dataProtection;
     }
 
     /// <summary>Reject any non-PlatformAdmin user. Defense in depth — the [AuthorizeRoles] attribute
@@ -86,6 +97,7 @@ public class PlatformAdminController : ControllerBase
         if (!IsPlatformAdmin()) return Forbid();
         var t = await _db.Tenants.Include(x => x.Clinic).FirstOrDefaultAsync(x => x.Id == id, ct);
         if (t is null) return NotFound(new { error = "tenant_not_found" });
+
         return Ok(new
         {
             id = t.Id,
@@ -123,6 +135,8 @@ public class PlatformAdminController : ControllerBase
     public async Task<IActionResult> UpdateTenant(Guid id, [FromBody] UpdateTenantRequest request, CancellationToken ct)
     {
         if (!IsPlatformAdmin()) return Forbid();
+        await using var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(ct) : null;
         var t = await _db.Tenants.Include(x => x.Clinic).FirstOrDefaultAsync(x => x.Id == id, ct);
         if (t is null) return NotFound(new { error = "tenant_not_found" });
 
@@ -151,12 +165,18 @@ public class PlatformAdminController : ControllerBase
             if (status == SubscriptionStatus.Suspended)
             {
                 var tenantUserIds = await _db.Users
-                    .Where(u => u.TenantId == id || (u.Clinic != null && u.Clinic.TenantId == id))
+                    .Where(u => u.TenantId == id || (u.Clinic != null && u.Clinic.TenantId == id)
+                        || _db.TenantMemberships.Any(m => m.UserId == u.Id && m.TenantId == id))
+                    .OrderBy(u => u.Id)
                     .Select(u => u.Id)
                     .ToListAsync(ct);
 
+                if (transaction is not null)
+                    foreach (var userId in tenantUserIds)
+                        await SessionMutation.LockAsync(_db, userId, ct);
+
                 var activeRefreshTokens = await _db.RefreshTokens
-                    .Where(r => tenantUserIds.Contains(r.UserId) && r.RevokedAt == null)
+                    .Where(r => EF.Constant(tenantUserIds).Contains(r.UserId) && r.RevokedAt == null)
                     .ToListAsync(ct);
 
                 foreach (var rt in activeRefreshTokens)
@@ -186,6 +206,7 @@ public class PlatformAdminController : ControllerBase
         t.UpdatedAt = DateTimeOffset.UtcNow;
         if (t.Clinic != null) t.Clinic.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(ct);
+        if (transaction is not null) await transaction.CommitAsync(ct);
 
         return Ok(new
         {
@@ -496,9 +517,8 @@ public class PlatformAdminController : ControllerBase
     // ----- B3: Tenant provisioning (V10) -----
 
     /// <summary>
-    /// Transactional, idempotent tenant provisioning. The idempotency key is the
-    /// standard X-Idempotency-Key header handled by <c>IdempotencyMiddleware</c>, so a
-    /// retried request replays the first response instead of creating a second tenant.
+    /// Transactional provisioning with a durable actor/key receipt. Retries replay
+    /// the saved response without creating or sending another invitation.
     /// The first ClinicAdmin is minted as a pending invite — the documented FR-04
     /// exception — because no password is ever generated or sent.
     /// </summary>
@@ -507,45 +527,71 @@ public class PlatformAdminController : ControllerBase
     public async Task<IActionResult> ProvisionTenant([FromBody] ProvisionTenantRequest request, CancellationToken ct)
     {
         if (!IsPlatformAdmin()) return Forbid();
+        var adminUserId = User.GetUserId();
+        if (adminUserId is null || adminUserId == Guid.Empty) return Forbid();
+        Response.Headers.CacheControl = "no-store";
+        var key = Request.Headers["X-Idempotency-Key"].ToString().Trim();
+        if (string.IsNullOrEmpty(key)) key = Request.Headers["Idempotency-Key"].ToString().Trim();
+        if (string.IsNullOrEmpty(key) || key.Length > 128)
+            return BadRequest(new { error = "invalid_idempotency_key" });
 
-        if (string.IsNullOrWhiteSpace(request.Name) ||
-            string.IsNullOrWhiteSpace(request.AdminName) ||
-            string.IsNullOrWhiteSpace(request.AdminEmail))
-            return BadRequest(new { error = "name_admin_name_and_admin_email_required" });
-
-        if (!new EmailAddressAttribute().IsValid(request.AdminEmail))
-            return BadRequest(new { error = "invalid_admin_email" });
-
-        if (!Enum.TryParse<SubscriptionTier>(request.SubscriptionTier ?? nameof(SubscriptionTier.Trial), true, out var tier) ||
-            !AssignableTiers.Contains(tier))
-            return BadRequest(new { error = "invalid_subscription_tier" });
-
-        if (!Enum.TryParse<SubscriptionStatus>(request.SubscriptionStatus ?? nameof(SubscriptionStatus.Trial), true, out var status) ||
-            !Enum.IsDefined(status))
-            return BadRequest(new { error = "invalid_subscription_status" });
-
-        var requestedModules = request.ActivatedModules ?? [ModuleRegistry.Core];
-        var unknown = requestedModules.Where(m => !ModuleRegistry.IsKnown(m)).ToArray();
-        if (unknown.Length > 0)
-            return BadRequest(new { error = "unknown_module_code", modules = unknown });
-
-        var modules = ModuleRegistry.Serialize(requestedModules.Append(ModuleRegistry.Core));
-        var adminUserId = User.GetUserId() ?? Guid.Empty;
-        var now = DateTimeOffset.UtcNow;
-        var tenantId = Guid.NewGuid();
-        var clinicId = Guid.NewGuid();
-        var adminInviteToken = Guid.NewGuid().ToString("N");
-        var adminInviteExpiresAt = now.AddHours(72); // FR-04
-
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
+        var requestHash = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(request)));
+        var protector = (_dataProtection ?? throw new InvalidOperationException("Provisioning requires Data Protection."))
+            .CreateProtector("HospitalCrm.TenantProvisioningReceipt.v1", adminUserId.Value.ToString("N"), key);
+        TenantProvisioningReceipt? receipt = null;
+        ProvisionTenantResponse? response = null;
+        // The existing actor row serializes concurrent requests before checking the unique receipt.
+        var provisionResult = await SessionMutation.RunAsync<IActionResult>(_db, adminUserId.Value, async () =>
         {
-            await using var transaction = await _db.Database.BeginTransactionAsync(ct);
+            if (!await _db.Users.AsNoTracking().AnyAsync(u => u.Id == adminUserId && u.Role == UserRole.PlatformAdmin
+                && u.TenantId == null && u.ClinicId == null, ct)) return Forbid();
+
+            var saved = await _db.TenantProvisioningReceipts.AsNoTracking()
+                .SingleOrDefaultAsync(r => r.ActorId == adminUserId && r.IdempotencyKey == key, ct);
+            if (saved is not null)
+            {
+                if (saved.RequestHash != requestHash) return Conflict(new { error = "idempotency_key_conflict" });
+                try
+                {
+                    var body = JsonSerializer.Deserialize<ProvisionTenantResponse>(protector.Unprotect(saved.ProtectedResponse))
+                        ?? throw new JsonException();
+                    Response.Headers["X-Idempotency-Replay"] = "true";
+                    return StatusCode(StatusCodes.Status201Created, body);
+                }
+                catch (Exception ex) when (ex is CryptographicException or JsonException)
+                {
+                    return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = "provisioning_receipt_unavailable" });
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.AdminName) ||
+                string.IsNullOrWhiteSpace(request.AdminEmail))
+                return BadRequest(new { error = "name_admin_name_and_admin_email_required" });
+
+            var adminEmail = request.AdminEmail.Trim();
+            if (adminEmail.Length > 254 || !new EmailAddressAttribute().IsValid(adminEmail))
+                return BadRequest(new { error = "invalid_admin_email" });
+
+            if (!Enum.TryParse<SubscriptionTier>(request.SubscriptionTier ?? nameof(SubscriptionTier.Trial), true, out var tier) ||
+                !AssignableTiers.Contains(tier)) return BadRequest(new { error = "invalid_subscription_tier" });
+            if (!Enum.TryParse<SubscriptionStatus>(request.SubscriptionStatus ?? nameof(SubscriptionStatus.Trial), true, out var status) ||
+                !Enum.IsDefined(status)) return BadRequest(new { error = "invalid_subscription_status" });
+
+            var requestedModules = request.ActivatedModules ?? [ModuleRegistry.Core];
+            var unknown = requestedModules.Where(m => !ModuleRegistry.IsKnown(m)).ToArray();
+            if (unknown.Length > 0) return BadRequest(new { error = "unknown_module_code", modules = unknown });
 
             // Re-checked inside the transaction: the email may have been claimed since the request started.
-            if (await _db.Users.AnyAsync(u => u.Email == request.AdminEmail, ct))
+            if (await _db.Users.AnyAsync(u => u.Email == adminEmail, ct))
                 return Conflict(new { error = "email_already_registered" });
 
+            var modules = ModuleRegistry.Serialize(requestedModules.Append(ModuleRegistry.Core));
+            var now = DateTimeOffset.UtcNow;
+            var tenantId = Guid.NewGuid();
+            var clinicId = Guid.NewGuid();
+            var inviteId = Guid.NewGuid();
+            var adminInviteToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+            var adminInviteExpiresAt = now.AddHours(72); // FR-04
             _db.Tenants.Add(new Tenant
             {
                 Id = tenantId,
@@ -582,36 +628,53 @@ public class PlatformAdminController : ControllerBase
                     FlagName = module,
                     Enabled = true,
                     UpdatedAt = now,
-                    UpdatedBy = adminUserId
+                    UpdatedBy = adminUserId.Value
                 });
             }
 
             _db.StaffInvites.Add(new StaffInvite
             {
-                Id = Guid.NewGuid(),
+                Id = inviteId,
                 TenantId = tenantId,
                 ClinicId = clinicId,
                 Name = request.AdminName.Trim(),
-                Email = request.AdminEmail.Trim(),
+                Email = adminEmail,
                 Role = UserRole.ClinicAdmin,
-                TokenHash = adminInviteToken.HashPassword(),
+                TokenHash = adminInviteToken.HashToken(),
                 ExpiresAt = adminInviteExpiresAt
             });
 
-            await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
-
-            return StatusCode(201, new
+            // Commit the sole send attempt before calling the provider; a crash leaves an honest unknown outcome.
+            response = new(tenantId, clinicId, inviteId, adminInviteToken, adminInviteExpiresAt,
+                _email is null || IdentityEmail.Link(_config, "accept-invite", adminInviteToken) is null ? "not_configured" : "unknown",
+                tier.ToString().ToLowerInvariant(), status.ToString().ToLowerInvariant(), ModuleRegistry.Parse(modules));
+            receipt = new TenantProvisioningReceipt
             {
-                tenantId,
-                clinicId,
-                inviteToken = adminInviteToken,
-                inviteExpiresAt = adminInviteExpiresAt,
-                subscriptionTier = tier.ToString().ToLowerInvariant(),
-                subscriptionStatus = status.ToString().ToLowerInvariant(),
-                activatedModules = ModuleRegistry.Parse(modules)
-            });
-        });
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                ActorId = adminUserId.Value,
+                IdempotencyKey = key,
+                RequestHash = requestHash,
+                ProtectedResponse = protector.Protect(JsonSerializer.Serialize(response))
+            };
+            _db.TenantProvisioningReceipts.Add(receipt);
+            await _db.SaveChangesAsync(ct);
+            return StatusCode(StatusCodes.Status201Created);
+        }, ct);
+
+        if (provisionResult is not StatusCodeResult { StatusCode: StatusCodes.Status201Created }) return provisionResult;
+        var emailStatus = await IdentityEmail.InviteAsync(_email, _config, request.AdminEmail!.Trim(), response!.inviteToken, response.inviteExpiresAt, ct);
+        _logger?.LogInformation("Provisioned invitation {InviteId} email transport outcome: {Outcome}", response.inviteId, emailStatus);
+        response = response with { emailStatus = emailStatus };
+        receipt!.ProtectedResponse = protector.Protect(JsonSerializer.Serialize(response));
+        await _db.SaveChangesAsync(ct);
+        return StatusCode(StatusCodes.Status201Created, response);
+    }
+
+    private sealed record ProvisionTenantResponse(Guid tenantId, Guid clinicId, Guid inviteId, string inviteToken,
+        DateTimeOffset inviteExpiresAt, string emailStatus, string subscriptionTier, string subscriptionStatus, string[] activatedModules)
+    {
+        public string? emailRetry => emailStatus == "handoff" ? null : "Share the generated link; do not repeat tenant provisioning to resend an invitation.";
     }
 }
 

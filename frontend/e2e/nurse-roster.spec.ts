@@ -1,23 +1,13 @@
 ﻿import { test, expect } from '@playwright/test'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
+import { assertDisposableE2ETarget } from '../../scripts/check-e2e-target.mjs'
 
-// Unique run number (persists across runs) → unique day offset (2..29) per run.
-// Prior runs approve leaves and assign shifts on their own dates; a fresh date
-// per run keeps Select/Apply conflict checks deterministic on repeated runs.
-const counterFile = path.join(os.tmpdir(), 'hospital-crm-nurse-e2e-run.txt')
-const runNum = (() => {
-  const prev = fs.existsSync(counterFile) ? Number(fs.readFileSync(counterFile, 'utf8') || '0') : 0
-  const n = (Number.isFinite(prev) ? prev : 0) + 1
-  fs.writeFileSync(counterFile, String(n))
-  return n
-})()
 const shiftDate = () => {
-  const d = new Date(Date.now() + (2 + (runNum % 28)) * 86400000)
+  const d = new Date(Date.now() + 2 * 86400000)
   return d.toISOString().split('T')[0]
 }
-const marker = `e2e-${runNum}-${Date.now()}`
+const marker = `e2e-${process.env.COMPOSE_PROJECT_NAME}`
+let shiftId: string | undefined
+let leaveId: string | undefined
 
 async function login(page: import('@playwright/test').Page, preset: 'Admin' | 'Nurse') {
   // The dev auth endpoint allows 10 logins/min; a full-suite run can exhaust the
@@ -30,7 +20,7 @@ async function login(page: import('@playwright/test').Page, preset: 'Admin' | 'N
     try {
       await expect(page).toHaveURL(/.*dashboard/, { timeout: 10000 })
       return
-    } catch (err) {
+    } catch {
       if (attempt === 3) {
         throw new Error(`Login as ${preset} failed after ${attempt} attempts — auth rate limit (10/min) still exhausted?`)
       }
@@ -40,50 +30,35 @@ async function login(page: import('@playwright/test').Page, preset: 'Admin' | 'N
 }
 
 test.describe('MOD-26 Nurse roster, leave & nursing care', () => {
+  test.describe.configure({ mode: 'serial' })
 
-  test.beforeAll(async () => {
-    try {
-      const loginRes = await fetch('http://localhost:5000/api/v1/auth/login', {
+  test.afterAll(async () => {
+    if (!shiftId && !leaveId) return
+    assertDisposableE2ETarget()
+    const api = process.env.E2E_API_BASE_URL!
+    const loginRes = await fetch(`${api}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'admin@samstack.ai', password: 'AdminPass123!' })
+    })
+    expect(loginRes.ok).toBeTruthy()
+    const { accessToken } = (await loginRes.json()) as { accessToken?: string }
+    expect(accessToken).toBeTruthy()
+    if (shiftId) {
+      const response = await fetch(`${api}/shifts/${shiftId}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cancel: true })
+      })
+      expect(response.ok).toBeTruthy()
+    }
+    if (leaveId) {
+      const response = await fetch(`${api}/staff/leave-requests/${leaveId}/review`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: 'admin@samstack.ai', password: 'AdminPass123!' })
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'Rejected', note: `Run-owned cleanup: ${marker}` })
       })
-      if (!loginRes.ok) return
-      const { accessToken } = (await loginRes.json()) as { accessToken?: string }
-      if (!accessToken) return
-      const d = shiftDate()
-      const shiftsRes = await fetch(`http://localhost:5000/api/v1/shifts?from=${d}&to=${d}`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      })
-      if (shiftsRes.ok) {
-        const shifts = (await shiftsRes.json()) as Array<{ id: string; status?: string }>
-        for (const s of shifts) {
-          if (s.status !== 'Cancelled') {
-            await fetch(`http://localhost:5000/api/v1/shifts/${s.id}`, {
-              method: 'PUT',
-              headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ cancel: true })
-            })
-          }
-        }
-      }
-      const leavesRes = await fetch('http://localhost:5000/api/v1/staff/leave-requests', {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      })
-      if (leavesRes.ok) {
-        const leaves = (await leavesRes.json()) as Array<{ id: string; startDate: string; endDate: string; status?: string }>
-        for (const l of leaves) {
-          if (l.startDate <= d && l.endDate >= d && l.status !== 'Rejected') {
-            await fetch(`http://localhost:5000/api/v1/staff/leave-requests/${l.id}/review`, {
-              method: 'POST',
-              headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ status: 'Rejected', note: 'cleanup' })
-            })
-          }
-        }
-      }
-    } catch {
-      // Best-effort cleanup
+      expect(response.ok).toBeTruthy()
     }
   })
 
@@ -105,7 +80,12 @@ test.describe('MOD-26 Nurse roster, leave & nursing care', () => {
     await dialog.locator('#shift-date').fill(shiftDate())
     await dialog.locator('#shift-type').selectOption('Evening')
     await dialog.locator('#shift-notes').fill(marker)
+    const created = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/v1/shifts')
     await dialog.getByRole('button', { name: /^Post shift$/i }).click()
+    const response = await created
+    expect(response.ok()).toBeTruthy()
+    shiftId = (await response.json()).shiftId
+    expect(shiftId).toMatch(/^[0-9a-f-]{36}$/i)
     await expect(page.getByText(/Shift created and added to roster|Shift posted/i)).toBeVisible({ timeout: 8000 })
 
     const row = page.locator('tr', { hasText: marker })
@@ -140,7 +120,13 @@ test.describe('MOD-26 Nurse roster, leave & nursing care', () => {
     await expect(dialog).toBeVisible()
     await dialog.locator('#leave-from').fill(shiftDate())
     await dialog.locator('#leave-to').fill(shiftDate())
+    await dialog.locator('#leave-reason').fill(`${marker}-leave`)
+    const created = page.waitForResponse(response => response.request().method() === 'POST' && /\/staff\/nurses\/[^/]+\/leave$/.test(new URL(response.url()).pathname))
     await dialog.getByRole('button', { name: /Submit request/i }).click()
+    const response = await created
+    expect(response.ok()).toBeTruthy()
+    leaveId = (await response.json()).id
+    expect(leaveId).toMatch(/^[0-9a-f-]{36}$/i)
     await expect(page.getByText('Leave request submitted')).toBeVisible({ timeout: 8000 })
   })
 
@@ -176,9 +162,12 @@ test.describe('MOD-26 Nurse roster, leave & nursing care', () => {
     await expect(row.getByText('Assigned', { exact: true })).toBeVisible({ timeout: 10000 })
     await expect(row.getByText('Nurse Joy')).toBeVisible({ timeout: 10000 })
 
-    // Approve the newest pending leave — shift is assigned on the same date,
+    // Approve this run's pending leave — shift is assigned on the same date,
     // so the API returns rosterConflicts and the toast flags the clash.
-    await page.getByRole('button', { name: 'Approve', exact: true }).first().click()
+    const review = page.getByText(`${marker}-leave`, { exact: false }).locator('../..')
+    const reviewed = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/v1/staff/leave-requests/${leaveId}/review`)
+    await review.getByRole('button', { name: 'Approve', exact: true }).click()
+    expect((await reviewed).ok()).toBeTruthy()
     await expect(page.getByText(/roster shift\(s\) clash/i)).toBeVisible({ timeout: 8000 })
   })
 })

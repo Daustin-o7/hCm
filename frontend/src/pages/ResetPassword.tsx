@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { friendlyError } from '../components/ui/Alert'
 import { PublicPage } from '../components/ui/PublicPage'
-import api from '../services/api'
+import { refreshClient as api } from '../services/api'
 
 const ERROR_MESSAGES: Record<string, string> = {
-  invalid_or_expired_token: 'This reset link is invalid or has expired. Request a new one.',
+  invalid_or_expired_token: 'This reset link is invalid, expired or already used. Sign in if you already changed your password, or request a new link.',
+  invalid_token_or_password_length: 'Use the complete reset link and a password between 8 and 72 characters.',
+  password_changed_concurrently: 'Your password changed during this request. Try signing in with your new password, or request a new link.',
   token_and_password_required: 'Please enter the reset token and a new password.',
   user_not_found: 'Account no longer exists. Please contact your clinic admin.',
 }
@@ -37,7 +38,7 @@ export default function ResetPassword() {
       setDone(true)
     } catch (err) {
       const code = (err as { response?: { data?: { error?: string } } })?.response?.data?.error
-      setError(code && ERROR_MESSAGES[code] ? ERROR_MESSAGES[code] : friendlyError(err))
+      setError(code && ERROR_MESSAGES[code] ? ERROR_MESSAGES[code] : 'We could not confirm the password change. Check your connection and try again. If you already submitted this link, try signing in with your new password or request a new link.')
     } finally {
       setSaving(false)
     }
@@ -55,7 +56,7 @@ export default function ResetPassword() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                 </svg>
               </div>
-              <p className="text-sm text-slate-700 font-semibold">Password updated successfully.</p>
+              <p role="status" className="text-sm text-slate-700 font-semibold">Password updated successfully.</p>
               <Link to="/login" className="btn btn-primary w-full justify-center cursor-pointer">
                 Sign in with your new password
               </Link>
@@ -71,7 +72,11 @@ export default function ResetPassword() {
             </div>
           ) : (
             <form onSubmit={submit} className="space-y-4">
-              {error && <div className="alert alert-error">{error}</div>}
+              {error && <div role="alert" className="alert alert-error">{error}</div>}
+              {error && <div className="flex flex-wrap gap-2">
+                <Link to="/forgot-password" className="btn btn-secondary">Request reset link</Link>
+                <Link to="/login" className="btn btn-secondary">Try signing in</Link>
+              </div>}
               <div>
                 <label className="form-label" htmlFor="rp-pass">New password</label>
                 <input
@@ -79,6 +84,8 @@ export default function ResetPassword() {
                   type="password"
                   required
                   minLength={8}
+                  maxLength={72}
+                  autoComplete="new-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="At least 8 characters"
@@ -94,6 +101,8 @@ export default function ResetPassword() {
                   type="password"
                   required
                   minLength={8}
+                  maxLength={72}
+                  autoComplete="new-password"
                   value={confirm}
                   onChange={(e) => setConfirm(e.target.value)}
                   placeholder="Repeat the password"

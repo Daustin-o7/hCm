@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { NavLink, useNavigate, Outlet, useLocation } from 'react-router-dom'
 import { useBranding } from '../context/BrandingContext'
 import { useAuth } from '../context/AuthContext'
@@ -6,8 +6,7 @@ import { BrandLogo } from './ui/BrandLogo'
 import { ThemeToggle } from './ui/ThemeToggle'
 import { formatLocalDate, formatLocalTime, getTimezoneLabel } from '../utils/timezone'
 import { drainPaymentBridge, isPaymentBridgeAvailable } from '../services/paymentBridge'
-import { readOutbox, clearOutbox } from '../services/offlineOutbox'
-import api from '../services/api'
+import { captureOutboxSession, readOutbox, flushOutbox, legacyOutboxStatus, retryOutboxItem, type OutboxEntry } from '../services/offlineOutbox'
 
 // ── Categorized Healthcare Navigation ──────────────────────────────────────────
 export interface NavItem {
@@ -239,6 +238,100 @@ function HeaderClock({ timezone }: { timezone?: string }) {
 }
 
 export default function DashboardLayout() {
+  const { sessionGeneration, loading } = useAuth()
+  if (loading) return <div role="status" className="p-6 text-sm">Changing clinic session…</div>
+  // Remount tenant-sensitive views and shell state at the same identity boundary.
+  return <DashboardSession key={sessionGeneration} />
+}
+
+function OfflineWork() {
+  const [entries, setEntries] = useState<OutboxEntry[]>([])
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(true)
+  const [legacy, setLegacy] = useState(legacyOutboxStatus)
+  const run = useRef<(sync: boolean) => Promise<void>>(async () => {})
+
+  useEffect(() => {
+    let active = true
+    let running = false
+    let rerun: boolean | null = null
+    const refresh = async (sync: boolean) => {
+      if (!active) return
+      if (running) { rerun = sync || rerun === true; return }
+      running = true
+      setBusy(true)
+      setError('')
+      setLegacy(legacyOutboxStatus())
+      try {
+        const session = captureOutboxSession()
+        if (sync) {
+          try { await flushOutbox(session) } catch (failure) {
+            if (active) setError(failure instanceof Error ? failure.message : 'Offline sync failed. Stored work is retained.')
+          }
+        }
+        const items = await readOutbox(session)
+        if (active) setEntries(items)
+      } catch (failure) {
+        if (active) setError(failure instanceof Error ? failure.message : 'Offline storage could not be read.')
+      } finally {
+        running = false
+        if (active) {
+          setBusy(false)
+          if (rerun !== null) {
+            const sync = rerun
+            rerun = null
+            void refresh(sync)
+          }
+        }
+      }
+    }
+    run.current = refresh
+    const reconnect = () => { void refresh(true) }
+    const changed = () => { void refresh(false) }
+    void refresh(true)
+    window.addEventListener('online', reconnect)
+    window.addEventListener('focus', changed)
+    window.addEventListener('samstack:outbox-changed', changed)
+    return () => {
+      active = false
+      run.current = async () => {}
+      window.removeEventListener('online', reconnect)
+      window.removeEventListener('focus', changed)
+      window.removeEventListener('samstack:outbox-changed', changed)
+    }
+  }, [])
+
+  const retry = async (id: string) => {
+    try { await retryOutboxItem(id); await run.current(true) } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'Offline retry failed. Stored work is retained.')
+    }
+  }
+  if (!entries.length && !error && legacy === 'absent') return null
+  return (
+    <section aria-label="Offline work" className="mb-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-4 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h2 className="font-semibold">Offline work {entries.length > 0 ? `(${entries.length} retained)` : ''}</h2>
+        <button type="button" className="btn btn-secondary min-h-11 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-teal-600"
+          disabled={busy} onClick={() => void run.current(true)}>{busy ? 'Checking offline work…' : 'Check and sync'}</button>
+      </div>
+      {error && <p role="alert" className="mt-3 text-[var(--color-danger)]">{error}</p>}
+      {legacy !== 'absent' && <p role="status" className="mt-3 text-[var(--color-text-secondary)]">
+        {legacy === 'present' ? 'Unowned legacy offline work is present on this device. It is untouched and cannot be opened or synced. Ask the clinic administrator for authorized recovery.'
+          : 'Legacy storage could not be checked. Recovery may be needed; no legacy work has been changed.'}
+      </p>}
+      <ul className="divide-y divide-[var(--color-border)]" aria-live="polite">
+        {entries.map(entry => <li key={entry.id} className="flex flex-wrap items-center justify-between gap-4 py-3">
+          <p className="min-w-0 flex-1"><span className="font-mono">{entry.id.slice(0, 8)}</span> — {entry.message}</p>
+          {entry.item && ['rejected', 'unknown'].includes(entry.status) && <button type="button" disabled={busy}
+            className="btn btn-secondary min-h-11 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-teal-600"
+            onClick={() => void retry(entry.id)}>Retry unchanged</button>}
+        </li>)}
+      </ul>
+    </section>
+  )
+}
+
+function DashboardSession() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [showNotifications, setShowNotifications] = useState(false)
@@ -332,24 +425,6 @@ export default function DashboardLayout() {
     const timer = setInterval(() => void drainPaymentBridge(), 60_000)
     return () => clearInterval(timer)
   }, [rawRole])
-
-  // FR-22: Flush durable offline outbox when network is reconnected
-  useEffect(() => {
-    const flushOutbox = async () => {
-      try {
-        const items = readOutbox()
-        if (items.length === 0) return
-        await api.post('/sync/push', { items })
-        clearOutbox()
-      } catch {
-        // Retry next time network is online
-      }
-    }
-
-    void flushOutbox()
-    window.addEventListener('online', flushOutbox)
-    return () => window.removeEventListener('online', flushOutbox)
-  }, [])
 
   const effectiveTimezone = branding.timezone || undefined
 
@@ -671,6 +746,7 @@ export default function DashboardLayout() {
 
         {/* Page Main Content with Mobile Bottom Padding */}
         <main className="flex-1 p-3.5 sm:p-4 lg:p-8 max-w-7xl w-full mx-auto pb-24 lg:pb-8">
+          <OfflineWork />
           <Outlet />
         </main>
 

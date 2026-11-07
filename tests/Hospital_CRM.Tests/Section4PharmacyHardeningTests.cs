@@ -4,6 +4,7 @@ using Hospital_CRM.Api.Controllers;
 using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
+using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -15,32 +16,39 @@ namespace Hospital_CRM.Tests;
 
 public class Section4PharmacyHardeningTests
 {
-    private static HospitalCrmDbContext CreateInMemoryDb()
+    private static HospitalCrmDbContext CreateInMemoryDb(ITenantContext? tenantContext = null)
     {
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(databaseName: $"Sec4Db_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, tenantContext ?? TestMaintenanceTenantContext.Instance);
     }
 
-    private static ClaimsPrincipal CreateUserPrincipal(Guid userId, Guid tenantId, string role)
+    private static ClaimsPrincipal CreateUserPrincipal(Guid userId, Guid tenantId, string role, Guid? clinicId = null)
     {
-        var claims = new[]
+        var claims = new List<Claim>
         {
             new Claim("sub", userId.ToString()),
             new Claim("role", role),
             new Claim("tenant_id", tenantId.ToString())
         };
+        if (clinicId.HasValue) claims.Add(new Claim("clinicId", clinicId.Value.ToString()));
         return new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth"));
     }
 
     [Fact]
     public async Task CDCI_Fallback_Marks_Result_As_Unverified_OpenSource()
     {
-        var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
+        var context = new TenantContext();
+        using var scope = context.PushTenant(tenantId);
+        using var db = CreateInMemoryDb(context);
+        db.Clinics.Add(new() { Id = clinicId, TenantId = tenantId });
+        db.TenantMemberships.Add(new() { UserId = userId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor, Status = "active" });
+        await db.SaveChangesAsync();
 
         var searchService = new MockMedicineSearchService(new List<Hospital_CRM.Api.Services.Typesense.MedicineSearchHit>()); // 0 local hits
         var cdciResults = new List<CdciMedicineSearchResult>
@@ -62,7 +70,7 @@ public class Section4PharmacyHardeningTests
         var controller = new MedicinesController(db, searchService, cdciService, NullLogger<MedicinesController>.Instance);
         controller.ControllerContext = new ControllerContext
         {
-            HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Doctor") }
+            HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Doctor", clinicId) }
         };
 
         var result = await controller.Search("safedox", 10, CancellationToken.None);
@@ -80,9 +88,15 @@ public class Section4PharmacyHardeningTests
     [Fact]
     public async Task Search_Logs_Miss_When_Zero_Hits()
     {
-        var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
+        var context = new TenantContext();
+        using var scope = context.PushTenant(tenantId);
+        using var db = CreateInMemoryDb(context);
+        db.Clinics.Add(new() { Id = clinicId, TenantId = tenantId });
+        db.TenantMemberships.Add(new() { UserId = userId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor, Status = "active" });
+        await db.SaveChangesAsync();
 
         var searchService = new MockMedicineSearchService(new List<Hospital_CRM.Api.Services.Typesense.MedicineSearchHit>());
         var cdciService = new MockCdciMedicineCatalogService(new List<CdciMedicineSearchResult>());
@@ -90,7 +104,7 @@ public class Section4PharmacyHardeningTests
         var controller = new MedicinesController(db, searchService, cdciService, NullLogger<MedicinesController>.Instance);
         controller.ControllerContext = new ControllerContext
         {
-            HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Doctor") }
+            HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Doctor", clinicId) }
         };
 
         var result = await controller.Search("NonExistentMedicineX99", 10, CancellationToken.None);
@@ -100,6 +114,7 @@ public class Section4PharmacyHardeningTests
         Assert.Single(missLogs);
         Assert.Equal("NonExistentMedicineX99", missLogs[0].Query);
         Assert.Equal(userId, missLogs[0].SearchedByUserId);
+        Assert.Equal(tenantId, missLogs[0].TenantId);
     }
 
     [Fact]
@@ -177,7 +192,7 @@ public class Section4PharmacyHardeningTests
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Pharmacist") }
         };
 
-        var req = new DispensePrescriptionRequest(Guid.NewGuid(), null, null, null, null, null, null);
+        var req = new DispensePrescriptionRequest(Guid.NewGuid(), IdempotencyKey: "unlicensed");
         var result = await controller.DispensePrescription(req, CancellationToken.None);
 
         var objResult = Assert.IsType<ObjectResult>(result);
@@ -205,6 +220,7 @@ public class Section4PharmacyHardeningTests
             Id = Guid.NewGuid(),
             TenantId = tenantId,
             Name = "Dr. Test",
+            ClinicId = clinic.Id,
             Role = UserRole.Doctor
         };
         db.Users.Add(doctor);
@@ -212,19 +228,20 @@ public class Section4PharmacyHardeningTests
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Test Patient", Phone = "9876543210" };
         db.Patients.Add(patient);
 
-        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, DoctorId = doctor.Id, PatientId = patient.Id, Date = DateOnly.FromDateTime(DateTime.UtcNow), TimeSlot = "10:00" };
+        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinic.Id, DoctorId = doctor.Id, PatientId = patient.Id, Date = DateOnly.FromDateTime(DateTime.UtcNow), TimeSlot = "10:00" };
         db.Appointments.Add(appt);
 
         var consult = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = appt.Id,
             DoctorId = doctor.Id,
             Status = ConsultationStatus.Finalized
         };
         db.Consultations.Add(consult);
 
-        var rx = new Prescription { Id = Guid.NewGuid(), ConsultationId = consult.Id };
+        var rx = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consult.Id };
         var rxItem = new PrescriptionItem
         {
             Id = Guid.NewGuid(),
@@ -253,7 +270,7 @@ public class Section4PharmacyHardeningTests
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Pharmacist") }
         };
 
-        var req = new DispensePrescriptionRequest(rx.Id, "Test Patient", "Clinic St", "Dr. Test", "MCI-1234", null, null);
+        var req = new DispensePrescriptionRequest(rx.Id, "Test Patient", "Clinic St", "Dr. Test", "MCI-1234", "ndps", null);
         var result = await controller.DispensePrescription(req, CancellationToken.None);
 
         var badRequest = Assert.IsType<BadRequestObjectResult>(result);
@@ -271,25 +288,26 @@ public class Section4PharmacyHardeningTests
         var clinic = new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Licensed Clinic", PharmacyLicenceNumber20 = "DL-20-VALID" };
         db.Clinics.Add(clinic);
 
-        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Dr. Test", Role = UserRole.Doctor };
+        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinic.Id, Name = "Dr. Test", Role = UserRole.Doctor };
         db.Users.Add(doctor);
 
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Test Patient", Phone = "9876543210" };
         db.Patients.Add(patient);
 
-        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, DoctorId = doctor.Id, PatientId = patient.Id, Date = DateOnly.FromDateTime(DateTime.UtcNow), TimeSlot = "10:00" };
+        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinic.Id, DoctorId = doctor.Id, PatientId = patient.Id, Date = DateOnly.FromDateTime(DateTime.UtcNow), TimeSlot = "10:00" };
         db.Appointments.Add(appt);
 
         var consult = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = appt.Id,
             DoctorId = doctor.Id,
             Status = ConsultationStatus.Finalized
         };
         db.Consultations.Add(consult);
 
-        var rx = new Prescription { Id = Guid.NewGuid(), ConsultationId = consult.Id };
+        var rx = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consult.Id };
         var rxItem = new PrescriptionItem
         {
             Id = Guid.NewGuid(),
@@ -312,7 +330,7 @@ public class Section4PharmacyHardeningTests
         };
 
         var selection = new DispenseItemSelection(rxItem.Id, null, 1, ibuprofen.Id, "Out of paracetamol, trying ibuprofen");
-        var req = new DispensePrescriptionRequest(rx.Id, "Patient", "Address", "Dr. Doc", "MCI-1", null, new List<DispenseItemSelection> { selection });
+        var req = new DispensePrescriptionRequest(rx.Id, "Patient", "Address", "Dr. Doc", "MCI-1", "substitution", new List<DispenseItemSelection> { selection });
 
         var result = await controller.DispensePrescription(req, CancellationToken.None);
         var badRequest = Assert.IsType<BadRequestObjectResult>(result);
@@ -349,7 +367,8 @@ public class Section4PharmacyHardeningTests
         await db.SaveChangesAsync();
 
         var timezoneService = new TimezoneService();
-        var controller = new PharmacyPosController(db, NullLogger<PharmacyPosController>.Instance, timezoneService);
+        var controller = new PharmacyPosController(db, NullLogger<PharmacyPosController>.Instance, timezoneService,
+            Part1SaleReadinessTests.Config, new RazorpayOrderClient(new HttpClient(), Part1SaleReadinessTests.Config));
         controller.ControllerContext = new ControllerContext
         {
             HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Pharmacist") }
@@ -363,7 +382,7 @@ public class Section4PharmacyHardeningTests
         {
             new(drug.Id, batch.Id, 1, 112m, 12m, "3004")
         };
-        var req = new PosCheckoutRequest("Walk-in", "9876543210", null, null, null, null, null, "Cash", 112m, null, items);
+        var req = new PosCheckoutRequest("Walk-in", "9876543210", null, null, null, null, null, "Cash", 112m, "IDEMP-INV-reverse-gst", items);
 
         var result = await controller.CheckoutPos(req, CancellationToken.None);
         var objResult = Assert.IsType<ObjectResult>(result);
@@ -395,8 +414,9 @@ public class Section4PharmacyHardeningTests
         var clinic = new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Print Test Clinic" };
         db.Clinics.Add(clinic);
 
-        var doctor = new User { Id = userId, TenantId = tenantId, Name = "Dr. Print", Role = UserRole.Doctor };
+        var doctor = new User { Id = userId, TenantId = tenantId, ClinicId = clinic.Id, Name = "Dr. Print", Role = UserRole.Doctor };
         db.Users.Add(doctor);
+        db.TenantMemberships.Add(new TenantMembership { UserId = userId, TenantId = tenantId, ClinicId = clinic.Id, Role = UserRole.Doctor });
 
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Print Patient", Phone = "9876543210" };
         db.Patients.Add(patient);
@@ -420,19 +440,16 @@ public class Section4PharmacyHardeningTests
             DoctorId = doctor.Id,
             Status = ConsultationStatus.Finalized,
             Version = 1,
-            VerificationQrCode = "QR-PRINT-TEST-123"
+            TenantId = tenantId,
+            VerificationQrCode = "RX-0123456789ABCDEF"
         };
         db.Consultations.Add(consult);
 
-        var rx = new Prescription { Id = Guid.NewGuid(), ConsultationId = consult.Id };
+        var rx = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consult.Id };
         db.Prescriptions.Add(rx);
         await db.SaveChangesAsync();
 
-        var controller = new ConsultationsController(db, NullLogger<ConsultationsController>.Instance);
-        controller.ControllerContext = new ControllerContext
-        {
-            HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Doctor") }
-        };
+        var controller = Part1SaleReadinessTests.Consult(db, userId, tenantId);
 
         // First print -> Original (not duplicate)
         var print1 = await controller.PrintPrescription(rx.Id, CancellationToken.None);
@@ -459,69 +476,21 @@ public class Section4PharmacyHardeningTests
     [Fact]
     public async Task VerifyPrescription_Identifies_Superseded_Amended_Prescription()
     {
-        var db = CreateInMemoryDb();
-        var tenantId = Guid.NewGuid();
-        var apptId = Guid.NewGuid();
-
-        var clinic = new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Verify Clinic" };
-        db.Clinics.Add(clinic);
-
-        var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Verify Patient", Phone = "9876543210" };
-        db.Patients.Add(patient);
-
-        var doctor = new User { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Dr. Verify", Role = UserRole.Doctor };
-        db.Users.Add(doctor);
-
-        var appt = new Appointment
-        {
-            Id = apptId,
-            TenantId = tenantId,
-            ClinicId = clinic.Id,
-            DoctorId = doctor.Id,
-            PatientId = patient.Id,
-            Date = DateOnly.FromDateTime(DateTime.UtcNow),
-            TimeSlot = "10:00"
-        };
-        db.Appointments.Add(appt);
-
-        var consultV1 = new Consultation
-        {
-            Id = Guid.NewGuid(),
-            AppointmentId = apptId,
-            DoctorId = doctor.Id,
-            Version = 1,
-            Status = ConsultationStatus.Amended,
-            VerificationQrCode = "QR-SUPERSEDED-TEST",
-            CreatedAt = DateTimeOffset.UtcNow.AddHours(-2)
-        };
-
-        var consultV2 = new Consultation
-        {
-            Id = Guid.NewGuid(),
-            AppointmentId = apptId,
-            DoctorId = doctor.Id,
-            Version = 2,
-            Status = ConsultationStatus.Finalized,
-            VerificationQrCode = "QR-SUPERSEDED-TEST",
-            CreatedAt = DateTimeOffset.UtcNow
-        };
-
-        db.Consultations.AddRange(consultV1, consultV2);
-        await db.SaveChangesAsync();
-
-        var controller = new ConsultationsController(db, NullLogger<ConsultationsController>.Instance);
-        controller.ControllerContext = new ControllerContext
-        {
-            HttpContext = new DefaultHttpContext()
-        };
+        await using var db = CreateInMemoryDb();
+        var (doctor, _, appt, tenantId) = Part1SaleReadinessTests.Seed(db);
+        var controller = Part1SaleReadinessTests.Consult(db, doctor.Id, tenantId);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(appt.Id, Part1SaleReadinessTests.Finalize([]), CancellationToken.None));
+        var consultV1 = await db.Consultations.SingleAsync();
+        Assert.Equal(201, Assert.IsType<ObjectResult>(await controller.AmendConsultation(consultV1.Id, Part1SaleReadinessTests.Amend(null), CancellationToken.None)).StatusCode);
 
         // When scanned with version 1 parameter
-        var result = await controller.VerifyPrescription("QR-SUPERSEDED-TEST", 1, CancellationToken.None);
+        var result = await Part1SaleReadinessTests.VerifyBound(controller, new(tenantId, consultV1.Id), consultV1.VerificationQrCode!, 1);
         var ok = Assert.IsType<OkObjectResult>(result);
         var json = JsonSerializer.Serialize(ok.Value);
         var doc = JsonSerializer.Deserialize<JsonElement>(json);
 
         Assert.True(doc.GetProperty("isSuperseded").GetBoolean());
+        Assert.True(doc.GetProperty("signatureValid").GetBoolean());
         Assert.Equal("superseded", doc.GetProperty("status").GetString());
         Assert.Equal(2, doc.GetProperty("latestVersion").GetInt32());
         Assert.Contains("superseded", doc.GetProperty("statusDescription").GetString(), StringComparison.OrdinalIgnoreCase);

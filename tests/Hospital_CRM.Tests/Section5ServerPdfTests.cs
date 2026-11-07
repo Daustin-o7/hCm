@@ -22,7 +22,7 @@ public class Section5ServerPdfTests
             .UseInMemoryDatabase(databaseName: dbName ?? Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static ClaimsPrincipal CreatePrincipal(Guid tenantId, Guid userId, string role = "Receptionist")
@@ -30,6 +30,7 @@ public class Section5ServerPdfTests
         var identity = new ClaimsIdentity(new[]
         {
             new Claim("tenant_id", tenantId.ToString()),
+            new Claim("clinicId", tenantId.ToString()),
             new Claim("sub", userId.ToString()),
             new Claim(ClaimTypes.Role, role)
         }, "TestAuth");
@@ -38,6 +39,7 @@ public class Section5ServerPdfTests
 
     private static ConsultationsController CreateConsultationsController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "Doctor")
     {
+        SeedMembership(db, tenantId, userId, role);
         var controller = new ConsultationsController(db, NullLogger<ConsultationsController>.Instance);
         controller.ControllerContext = new ControllerContext
         {
@@ -48,6 +50,7 @@ public class Section5ServerPdfTests
 
     private static InvoicesController CreateInvoicesController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "Receptionist")
     {
+        SeedMembership(db, tenantId, userId, role);
         var config = new ConfigurationBuilder().AddInMemoryCollection().Build();
         var controller = new InvoicesController(db, config, null!);
         controller.ControllerContext = new ControllerContext
@@ -57,8 +60,15 @@ public class Section5ServerPdfTests
         return controller;
     }
 
+    private static void SeedMembership(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role)
+    {
+        db.Clinics.Add(new Clinic { Id = tenantId, TenantId = tenantId, Name = "Synthetic clinic", Address = "Test address", Phone = "9876543210" });
+        db.TenantMemberships.Add(new TenantMembership { TenantId = tenantId, ClinicId = tenantId, UserId = userId, Role = Enum.Parse<UserRole>(role), Status = "active" });
+        db.SaveChanges();
+    }
+
     [Fact]
-    public void PdfService_GeneratesValidPdf14HeaderAndEof()
+    public void PdfService_GeneratesValidPrescriptionPdfHeaderAndEof()
     {
         var service = new PdfService();
         var tenantId = Guid.NewGuid();
@@ -108,7 +118,8 @@ public class Section5ServerPdfTests
         Assert.True(pdfBytes.Length > 200);
 
         var pdfHeader = Encoding.ASCII.GetString(pdfBytes, 0, 8);
-        Assert.StartsWith("%PDF-1.4", pdfHeader);
+        Assert.StartsWith("%PDF-1.", pdfHeader);
+        Assert.Contains("Paracetamol", PdfTestReader.ReadText(pdfBytes));
 
         var pdfTail = Encoding.ASCII.GetString(pdfBytes, pdfBytes.Length - 10, 10);
         Assert.Contains("%%EOF", pdfTail);
@@ -125,9 +136,9 @@ public class Section5ServerPdfTests
 
         var doctor = new User { Id = doctorId, TenantId = tenantId, Name = "Dr. Sharma" };
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "John Doe", Phone = "9876543210" };
-        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, PatientId = patient.Id, Patient = patient, DoctorId = doctorId, Date = DateOnly.FromDateTime(DateTime.Today), TimeSlot = "10:00" };
-        var consultation = new Consultation { Id = Guid.NewGuid(), AppointmentId = appt.Id, Appointment = appt, DoctorId = doctorId, Doctor = doctor, Status = ConsultationStatus.Draft };
-        var rx = new Prescription { Id = Guid.NewGuid(), ConsultationId = consultation.Id, Consultation = consultation };
+        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = tenantId, PatientId = patient.Id, Patient = patient, DoctorId = doctorId, Date = DateOnly.FromDateTime(DateTime.Today), TimeSlot = "10:00" };
+        var consultation = new Consultation { Id = Guid.NewGuid(), TenantId = tenantId, AppointmentId = appt.Id, Appointment = appt, DoctorId = doctorId, Doctor = doctor, Status = ConsultationStatus.Draft };
+        var rx = new Prescription { Id = Guid.NewGuid(), TenantId = tenantId, ConsultationId = consultation.Id, Consultation = consultation };
 
         db.Users.Add(doctor);
         db.Patients.Add(patient);
@@ -152,11 +163,12 @@ public class Section5ServerPdfTests
         var pdfService = new PdfService();
 
         var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Ramesh Kumar", Phone = "9876543210" };
-        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, PatientId = patient.Id, Patient = patient, DoctorId = doctorId, Date = DateOnly.FromDateTime(DateTime.Today), TimeSlot = "10:00" };
+        var appt = new Appointment { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = tenantId, PatientId = patient.Id, Patient = patient, DoctorId = doctorId, Date = DateOnly.FromDateTime(DateTime.Today), TimeSlot = "10:00" };
         var doctor = new User { Id = doctorId, TenantId = tenantId, Name = "Dr. Ananya Roy" };
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = appt.Id,
             Appointment = appt,
             DoctorId = doctorId,
@@ -171,6 +183,7 @@ public class Section5ServerPdfTests
         var rx = new Prescription
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             ConsultationId = consultation.Id,
             Consultation = consultation,
             Items = new List<PrescriptionItem>
@@ -208,8 +221,7 @@ public class Section5ServerPdfTests
         Assert.True(logs[1].IsDuplicateCopy);
         Assert.Equal(2, logs[1].PrintCount);
 
-        // Check duplicate copy text in PDF bytes
-        var pdfText = Encoding.ASCII.GetString(fileResult2.FileContents);
+        var pdfText = PdfTestReader.ReadText(fileResult2.FileContents);
         Assert.Contains("DUPLICATE COPY", pdfText);
     }
 

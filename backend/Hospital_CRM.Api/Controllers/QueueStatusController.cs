@@ -1,4 +1,6 @@
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Enums;
+using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
@@ -12,38 +14,58 @@ namespace Hospital_CRM.Api.Controllers;
 public class QueueStatusController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
+    private readonly ITenantContext? _tenantContext;
 
-    public QueueStatusController(HospitalCrmDbContext db) => _db = db;
+    public QueueStatusController(HospitalCrmDbContext db, ITenantContext? tenantContext = null)
+    {
+        _db = db;
+        _tenantContext = tenantContext;
+    }
 
     /// <summary>
     /// Section 1: Public queue tracker.
-    /// Secured with an opaque, unguessable tracking token (or legacy numeric token fallback).
+    /// Secured with an opaque, unguessable tracking token.
     /// Rate-limited to prevent brute-forcing.
-    /// Exposes STRICTLY ZERO PHI: returns only yourToken, position in queue, estimatedWaitMinutes, and currentlyServing.
+    /// Returns only queue state and time remaining; terminal visits expose status and time remaining only.
     /// </summary>
     [HttpGet("{token}")]
+    [PublicTokenEndpoint(PublicTokenPurpose.Queue)]
+    [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
     public async Task<IActionResult> GetStatus(string token, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(token) || !token.StartsWith("qtrk_", StringComparison.Ordinal))
-            return BadRequest(new { error = "invalid_token" });
+        if (_tenantContext is null || !PublicTokenRouting.IsWellFormed(PublicTokenPurpose.Queue, token))
+            return NotFound(new { error = "token_not_found" });
 
         // Opaque token is the only credential. A numeric queue number is guessable, so it is
         // not accepted here: it would let anyone enumerate other clinics' queues.
-        var appointment = await _db.Appointments
-            .IgnoreQueryFilters()
-            .FirstOrDefaultAsync(a => a.QueueTrackingToken == token, ct);
+        var binding = await PublicTokenRouting.ResolveAsync(_db, PublicTokenPurpose.Queue, token, ct);
+        if (binding is null) return NotFound(new { error = "token_not_found" });
+        using var tenantScope = _tenantContext.PushTenant(binding.TenantId);
+        var appointment = await _db.Appointments.AsNoTracking()
+            .FirstOrDefaultAsync(a => a.Id == binding.ResourceId && a.TenantId == binding.TenantId &&
+                a.QueueTrackingToken == token && a.QueueToken != null, ct);
 
-        if (appointment is null)
+        var now = DateTimeOffset.UtcNow;
+        if (appointment?.QueueTrackingExpiresAt is not { } expiresAt || expiresAt <= now)
             return NotFound(new { error = "token_not_found" });
 
-        var doctorFilter = appointment.DoctorId;
+        var expiresInSeconds = (expiresAt - now).TotalSeconds;
+        var terminalStatus = appointment.Status switch
+        {
+            AppointmentStatus.Completed => "completed",
+            AppointmentStatus.Cancelled => "cancelled",
+            AppointmentStatus.NoShow => "no_show",
+            _ => null
+        };
+        if (terminalStatus is not null)
+            return Ok(new { status = terminalStatus, expiresInSeconds });
+
+        var queue = _db.Appointments.Where(a => a.TenantId == appointment.TenantId &&
+            a.ClinicId == appointment.ClinicId && a.DoctorId == appointment.DoctorId && a.Date == appointment.Date);
 
         // Position: number of patients ahead of this appointment in the doctor's queue today
-        var aheadCount = await _db.Appointments
-            .IgnoreQueryFilters()
-            .Where(a => a.DoctorId == doctorFilter &&
-                        a.Date == appointment.Date &&
-                        a.QueueToken != null &&
+        var aheadCount = await queue
+            .Where(a => a.QueueToken != null &&
                         a.QueueToken < appointment.QueueToken &&
                         (a.Status == AppointmentStatus.CheckedIn || a.Status == AppointmentStatus.InNursing))
             .CountAsync(ct);
@@ -52,11 +74,8 @@ public class QueueStatusController : ControllerBase
         var estimatedWaitMinutes = aheadCount * 15; // standard consultation benchmark: 15 min per patient ahead
 
         // Currently serving = smallest active token (InConsultation, InNursing, or CheckedIn)
-        var currentlyServing = await _db.Appointments
-            .IgnoreQueryFilters()
-            .Where(a => a.DoctorId == doctorFilter &&
-                        a.Date == appointment.Date &&
-                        a.QueueToken != null &&
+        var currentlyServing = await queue
+            .Where(a => a.QueueToken != null &&
                         (a.Status == AppointmentStatus.InConsultation ||
                          a.Status == AppointmentStatus.InNursing ||
                          a.Status == AppointmentStatus.CheckedIn))
@@ -70,12 +89,13 @@ public class QueueStatusController : ControllerBase
             position = position,
             estimatedWaitMinutes = estimatedWaitMinutes,
             currentlyServing = currentlyServing ?? appointment.QueueToken ?? 0,
+            expiresInSeconds,
             status = appointment.Status switch
             {
                 AppointmentStatus.CheckedIn => "waiting",
                 AppointmentStatus.InNursing => "in_nursing",
                 AppointmentStatus.InConsultation => "in_consultation",
-                AppointmentStatus.Completed => "completed",
+                AppointmentStatus.Parked => "parked",
                 _ => "scheduled"
             }
         });

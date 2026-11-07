@@ -1,5 +1,8 @@
 using System.Text;
 using System.Threading.RateLimiting;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Xml.Linq;
 using Hangfire;
 using Hangfire.Dashboard;
 using Hangfire.PostgreSql;
@@ -12,16 +15,20 @@ using Hospital_CRM.Api.Services;
 using Hospital_CRM.Api.Services.Typesense;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
+using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Infrastructure.Data;
 using Hospital_CRM.Infrastructure.Interceptors;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.IdentityModel.Tokens;
+using Npgsql;
 using OpenIddict.Abstractions;
 using OpenIddict.Server.AspNetCore;
 using OpenIddict.Validation.AspNetCore;
@@ -30,7 +37,9 @@ using Serilog;
 var builder = WebApplication.CreateBuilder(args);
 
 // P0-3: fail fast rather than run in a real environment on development defaults.
-StartupConfigurationGuard.Validate(builder.Configuration, builder.Environment);
+ValidateProductionConfiguration(builder.Configuration, builder.Environment);
+var maintenanceCommands = new[] { "--bootstrap-platform-admin", "--reset-mfa", "--maintain-oidc-clients" };
+var maintenanceCommand = maintenanceCommands.SingleOrDefault(args.Contains);
 
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
@@ -55,8 +64,7 @@ if (string.IsNullOrWhiteSpace(defaultConnection))
 
 builder.Services.AddDbContext<HospitalCrmDbContext>((sp, options) =>
     options.UseNpgsql(defaultConnection)
-           .AddInterceptors(sp.GetRequiredService<TenantConnectionInterceptor>())
-           .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning)));
+           .AddInterceptors(sp.GetRequiredService<TenantConnectionInterceptor>()));
 
 builder.Services.AddMemoryCache();
 
@@ -159,18 +167,23 @@ var jwtAudience = builder.Configuration["Jwt:Audience"]
     ?? (builder.Environment.IsDevelopment() ? "Hospital_CRM"
         : throw new InvalidOperationException("Jwt:Audience configuration is missing."));
 
-// Register IPersistentKeyService — PemFileKeyService reads PKCS#8 PEM private key from disk
-// (auto-generated in Development, configured via Jwt:PemFilePath in production).
-builder.Services.AddSingleton<IPersistentKeyService, PemFileKeyService>();
+switch (builder.Configuration["Jwt:KeySource"] ?? "PemFile")
+{
+    case "PemFile":
+        builder.Services.AddSingleton<IPersistentKeyService, PemFileKeyService>();
+        break;
+    case "AzureKeyVault":
+        builder.Services.AddSingleton<IPersistentKeyService, AzureKeyVaultKeyService>();
+        break;
+    default:
+        throw new InvalidOperationException("Jwt:KeySource must be PemFile or AzureKeyVault.");
+}
 
 // Free email-code second factor. No package: System.Net.Mail over the configured SMTP relay.
 builder.Services.AddSingleton<IEmailSender, SmtpEmailSender>();
 
 builder.Services.AddHealthChecks()
-    .AddAsyncCheck("database", async () =>
-    {
-        return Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy("Service is operational.");
-    });
+    .AddCheck<RuntimeReadinessHealthCheck>("runtime", tags: ["ready"], timeout: TimeSpan.FromSeconds(20));
 
 // JWT Bearer auth — IssuerSigningKey is resolved per-request from the
 // already-loaded IPersistentKeyService via OnCreatingTicket. This avoids
@@ -202,6 +215,12 @@ builder.Services.AddSingleton<IPostConfigureOptions<JwtBearerOptions>, Hospital_
 builder.Services.AddAuthorization();
 
 // OpenIddict in-house OIDC server & token engine
+using var oidcSigningCertificate = builder.Environment.IsDevelopment() ? null :
+    LoadProductionCertificate(builder.Configuration, "Oidc:SigningCertificate", X509KeyUsageFlags.DigitalSignature);
+using var oidcEncryptionCertificate = builder.Environment.IsDevelopment() ? null :
+    LoadProductionCertificate(builder.Configuration, "Oidc:EncryptionCertificate", X509KeyUsageFlags.KeyEncipherment);
+if (oidcSigningCertificate != null && oidcSigningCertificate.Thumbprint == oidcEncryptionCertificate!.Thumbprint)
+    throw new InvalidOperationException("OIDC signing and encryption require distinct certificates.");
 builder.Services.AddOpenIddict()
     .AddCore(options =>
     {
@@ -228,17 +247,26 @@ builder.Services.AddOpenIddict()
             "api"
         );
 
-        options.AddDevelopmentEncryptionCertificate()
-               .AddDevelopmentSigningCertificate();
+        if (builder.Environment.IsDevelopment())
+            options.AddDevelopmentEncryptionCertificate().AddDevelopmentSigningCertificate();
+        else
+        {
+            options.SetIssuer(new Uri(builder.Configuration["Oidc:Issuer"]!));
+            options.AddSigningCertificate(oidcSigningCertificate!);
+            options.AddEncryptionCertificate(oidcEncryptionCertificate!);
+            foreach (var retained in builder.Configuration.GetSection("Oidc:RetainedEncryptionCertificates").GetChildren())
+                options.AddEncryptionCertificate(LoadProductionCertificate(retained, "", X509KeyUsageFlags.KeyEncipherment, false));
+        }
 
         options.DisableAccessTokenEncryption();
 
-        options.UseAspNetCore()
+        var oidcAspNet = options.UseAspNetCore()
                .EnableAuthorizationEndpointPassthrough()
                .EnableTokenEndpointPassthrough()
                .EnableUserInfoEndpointPassthrough()
-               .EnableEndSessionEndpointPassthrough()
-               .DisableTransportSecurityRequirement();
+               .EnableEndSessionEndpointPassthrough();
+        if (builder.Environment.IsDevelopment())
+            oidcAspNet.DisableTransportSecurityRequirement();
     })
     .AddValidation(options =>
     {
@@ -251,25 +279,7 @@ var configuredOrigins = builder.Configuration["Cors:AllowedOrigins"]
     ?.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? Array.Empty<string>();
 
-var allowedOrigins = new HashSet<string>(configuredOrigins, StringComparer.OrdinalIgnoreCase)
-{
-    "http://localhost:5173",
-    "https://localhost:5173",
-    "http://localhost:8080",
-    "http://localhost:80",
-    "http://localhost",
-    "https://localhost",
-    "http://127.0.0.1:5173",
-    "https://127.0.0.1:5173",
-    "http://127.0.0.1:8080",
-    "http://127.0.0.1",
-    "https://127.0.0.1",
-    "capacitor://localhost",
-    "ionic://localhost",
-    "http://10.0.2.2:5000",
-    "https://10.0.2.2:7001",
-    "http://10.0.2.2:5173"
-};
+var allowedOrigins = new HashSet<string>(configuredOrigins, StringComparer.OrdinalIgnoreCase);
 
 builder.Services.AddCors(options =>
 {
@@ -306,6 +316,7 @@ builder.Services.AddCors(options =>
 });
 
 // String enums in JSON both ways (e.g. employmentStatus: "Active") — numbers still bind
+builder.Services.AddProblemDetails();
 builder.Services.AddControllers().AddJsonOptions(o =>
     o.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
 builder.Services.AddEndpointsApiExplorer();
@@ -322,9 +333,6 @@ builder.Services.AddScoped<Hospital_CRM.Api.Services.Typesense.IPatientSearchSer
 builder.Services.AddScoped<Hospital_CRM.Api.Services.Typesense.ITypesenseHangfireJobs,
                            Hospital_CRM.Api.Services.Typesense.TypesenseHangfireJobs>();
 
-// Health checks registration for /healthz endpoint
-builder.Services.AddHealthChecks();
-
 // International timezone & midnight boundary service
 builder.Services.AddSingleton<ITimezoneService, TimezoneService>();
 
@@ -335,7 +343,10 @@ builder.Services.AddSingleton<Hospital_CRM.Api.Services.ICdciMedicineCatalogServ
 builder.Services.AddSingleton<IPdfService, PdfService>();
 
 // FR-20/21: Notification services
-builder.Services.AddSingleton<INotificationService, StubNotificationService>();
+builder.Services.AddScoped<StubNotificationService>();
+builder.Services.AddScoped<INotificationService>(sp => sp.GetRequiredService<StubNotificationService>());
+builder.Services.AddHttpClient<INotificationChannel, WhatsAppNotificationChannel>(client =>
+    client.Timeout = TimeSpan.FromSeconds(15));
 builder.Services.AddHostedService<ReminderSchedulerService>();
 
 // MOD-23 (Phase 2): pre-check link generation / submission lookup
@@ -350,11 +361,28 @@ builder.Services.AddScoped<Hospital_CRM.Domain.Services.ITenantContext, TenantCo
 // implementation for a Key Vault-backed one without changing call sites.
 var dataProtectionKeysPath = builder.Configuration["DataProtection:KeysPath"]
     ?? Path.Combine(AppContext.BaseDirectory, "dp-keys");
-Directory.CreateDirectory(dataProtectionKeysPath);
-builder.Services.AddDataProtection()
+if (builder.Environment.IsDevelopment())
+    Directory.CreateDirectory(dataProtectionKeysPath);
+else if (!Directory.Exists(dataProtectionKeysPath) || !Directory.EnumerateFiles(dataProtectionKeysPath, "key-*.xml").Any())
+    throw new InvalidOperationException("Provision or recover the protected Data Protection ring before startup.");
+var dataProtection = builder.Services.AddDataProtection()
     .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath))
     .SetApplicationName("HospitalCrm");
+if (!builder.Environment.IsDevelopment())
+{
+    foreach (var file in Directory.EnumerateFiles(dataProtectionKeysPath, "key-*.xml"))
+        if (!XDocument.Load(file).Descendants().Any(element => element.Name.LocalName == "encryptedSecret"))
+            throw new InvalidOperationException("The production Data Protection ring contains an unprotected key.");
+    var activeCertificate = LoadProductionCertificate(builder.Configuration, "DataProtection:Certificate", X509KeyUsageFlags.KeyEncipherment);
+    if (activeCertificate.Thumbprint == oidcSigningCertificate!.Thumbprint || activeCertificate.Thumbprint == oidcEncryptionCertificate!.Thumbprint)
+        throw new InvalidOperationException("Data Protection requires a certificate distinct from OIDC credentials.");
+    var decryptionCertificates = builder.Configuration.GetSection("DataProtection:RetainedCertificates").GetChildren()
+        .Select(section => LoadProductionCertificate(section, "", X509KeyUsageFlags.KeyEncipherment, false))
+        .Prepend(activeCertificate).ToArray();
+    dataProtection.ProtectKeysWithCertificate(activeCertificate).UnprotectKeysWithAnyCertificate(decryptionCertificates);
+}
 builder.Services.AddSingleton<Hospital_CRM.Domain.Services.ISecretProtector, DataProtectionSecretProtector>();
+builder.Services.AddSingleton<LabFileStorage>();
 
 // Universal module entitlement and kill-switch gate service (D6, A3)
 builder.Services.AddScoped<IModuleGateService, ModuleGateService>();
@@ -384,7 +412,10 @@ if (string.IsNullOrWhiteSpace(hangfireConn))
     throw new InvalidOperationException("Hangfire connection string is missing. Set Hangfire:PostgreSql:Connection or ConnectionStrings:DefaultConnection.");
 }
 builder.Services.AddHangfire(config => config
-    .UsePostgreSqlStorage(c => c.UseNpgsqlConnection(hangfireConn))
+    .UsePostgreSqlStorage(c => c.UseNpgsqlConnection(hangfireConn), new PostgreSqlStorageOptions
+    {
+        PrepareSchemaIfNecessary = builder.Environment.IsDevelopment()
+    })
     .UseSimpleAssemblyNameTypeSerializer()
     .UseRecommendedSerializerSettings());
 builder.Services.AddHangfireServer(options =>
@@ -393,6 +424,24 @@ builder.Services.AddHangfireServer(options =>
 });
 
 var app = builder.Build();
+// Materialize OIDC options now, including retained certificates, rather than on the first request.
+_ = app.Services.GetRequiredService<IOptions<OpenIddict.Server.OpenIddictServerOptions>>().Value;
+
+// Dispatch before resolving storage/jobs, loading remote keys, migrations or starting the host.
+if (maintenanceCommand != null)
+{
+    using var cliScope = app.Services.CreateScope();
+    using var maintenance = cliScope.ServiceProvider.GetRequiredService<ITenantContext>().PushMaintenance();
+    if (maintenanceCommand == "--maintain-oidc-clients")
+    {
+        await SeedOpenIddictClientsAsync(app.Services, app.Configuration, app.Environment);
+        return 0;
+    }
+    var cliDb = cliScope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
+    return maintenanceCommand == "--bootstrap-platform-admin"
+        ? await BootstrapPlatformAdminAsync(cliDb, args)
+        : await ResetPlatformAdminMfaAsync(cliDb, args);
+}
 
 // Load the persistent RS256 key BEFORE serving any traffic.
 // - PemFile: reads from disk (auto-generates in Development on first run).
@@ -406,10 +455,11 @@ using (var scope = app.Services.CreateScope())
 }
 
 // Database migrations and startup seeding
-var autoMigrate = app.Configuration.GetValue<bool?>("Database:AutoMigrate") ?? true;
+var autoMigrate = app.Configuration.GetValue<bool?>("Database:AutoMigrate") ?? app.Environment.IsDevelopment();
 if (autoMigrate)
 {
     using var scope = app.Services.CreateScope();
+    using var maintenance = scope.ServiceProvider.GetRequiredService<ITenantContext>().PushMaintenance();
     var db = scope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
     var eraseOnStartup = app.Configuration.GetValue<bool>("Database:EraseOnStartup");
 
@@ -434,7 +484,6 @@ if (autoMigrate)
     {
         Log.Information("Applying database migrations...");
         await db.Database.MigrateAsync();
-        await SeedOpenIddictClientsAsync(app.Services);
 
         if (app.Environment.IsDevelopment())
         {
@@ -562,15 +611,43 @@ if (autoMigrate)
                     await SeedPharmacyDataAsync(db, defaultClinic?.TenantId);
                     await db.SaveChangesAsync();
                 }
+                var unlicensedClinics = await db.Clinics
+                    .Where(c => string.IsNullOrEmpty(c.PharmacyLicenceNumber20) && string.IsNullOrEmpty(c.PharmacyLicenceNumber21))
+                    .ToListAsync();
+                if (unlicensedClinics.Count > 0)
+                {
+                    foreach (var c in unlicensedClinics)
+                    {
+                        c.PharmacyLicenceNumber20 = "DL-20-2026-KA-8891";
+                        c.PharmacyLicenceNumber21 = "DL-21-2026-KA-8892";
+                        c.PharmacyGstNumber = "29AAAAA0000A1Z5";
+                        c.UpdatedAt = DateTimeOffset.UtcNow;
+                    }
+                    await db.SaveChangesAsync();
+                }
             }
         }
     }
+}
+
+if (autoMigrate)
+    await SeedOpenIddictClientsAsync(app.Services, app.Configuration, app.Environment);
+
+if (app.Environment.IsDevelopment())
+    Directory.CreateDirectory(app.Services.GetRequiredService<LabFileStorage>().RootPath);
+else
+{
+    var readiness = await app.Services.GetRequiredService<HealthCheckService>()
+        .CheckHealthAsync(check => check.Tags.Contains("ready"));
+    if (readiness.Status != HealthStatus.Healthy)
+        throw new InvalidOperationException("Required runtime dependencies or permissions are not ready.");
 }
 
 // Typesense collection init — idempotent. If Typesense is unreachable, log and
 // continue; the API must start even if the search service is down.
 using (var tsScope = app.Services.CreateScope())
 {
+    using var maintenance = tsScope.ServiceProvider.GetRequiredService<ITenantContext>().PushMaintenance();
     var search = tsScope.ServiceProvider.GetRequiredService<Hospital_CRM.Api.Services.Typesense.IPatientSearchService>();
     try
     {
@@ -587,6 +664,7 @@ using (var tsScope = app.Services.CreateScope())
 app.UseForwardedHeaders(ForwardedProxies.Build(builder.Configuration));
 
 app.UseCorrelationId();
+app.UseExceptionHandler();
 
 app.UseHttpsRedirection();
 app.UseResponseCompression();
@@ -596,10 +674,6 @@ app.UseRateLimiter();
 app.UseSecurityHeaders();
 app.UseMiddleware<PlatformAdminIpAllowlistMiddleware>();
 
-
-// MOD-08: serve uploaded lab result files from local disk (S3 swap in TRD-Phase2)
-var labUploadDir = Path.Combine(builder.Environment.ContentRootPath, "lab-uploads");
-Directory.CreateDirectory(labUploadDir);
 
 app.UseAuthentication();
 
@@ -614,32 +688,9 @@ app.UseAuthorization();
 // short-circuits the handler.
 app.UseMiddleware<IdempotencyMiddleware>();
 
-// SEC-002: Lab file static middleware MUST run AFTER UseAuthentication/UseAuthorization
-// so that JWT is parsed before OnPrepareResponse fires. Also short-circuit the response
-// body to prevent the file from being served to unauthenticated users.
-app.UseStaticFiles(new Microsoft.AspNetCore.Builder.StaticFileOptions
-{
-    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(labUploadDir),
-    RequestPath = "/lab-uploads",
-    OnPrepareResponse = ctx =>
-    {
-        if (ctx.Context.User?.Identity?.IsAuthenticated != true)
-        {
-            ctx.Context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            ctx.Context.Response.Headers["WWW-Authenticate"] = "Bearer";
-            ctx.Context.Response.ContentLength = 0;
-            ctx.Context.Response.Body = Stream.Null;
-        }
-        else
-        {
-            ctx.Context.Response.Headers.CacheControl = "private, max-age=86400";
-        }
-    }
-});
-
 app.UseMiddleware<InactivityMiddleware>();
 
-// Hangfire dashboard - gated to ClinicAdmin role.
+// Hangfire dashboard - non-impersonating PlatformAdmin, after the account-setup gate.
 // Mounted at /hangfire. Production should additionally restrict by network/IIS.
 app.UseHangfireDashboard("/hangfire", new DashboardOptions
 {
@@ -658,73 +709,14 @@ RecurringJob.AddOrUpdate<Hospital_CRM.Api.Services.Typesense.ITypesenseHangfireJ
     Cron.Daily(3));
 
 app.MapControllers();
-app.MapHealthChecks("/healthz");
-
-// Production health checks (Kubernetes liveness and readiness probes)
-app.MapGet("/health", async (HospitalCrmDbContext db, CancellationToken ct) =>
-{
-    var canConnect = await db.Database.CanConnectAsync(ct);
-    return canConnect
-        ? Results.Ok(new { status = "healthy", database = "connected", timestamp = DateTimeOffset.UtcNow })
-        : Results.Json(new { status = "unhealthy", database = "disconnected" }, statusCode: StatusCodes.Status503ServiceUnavailable);
-});
+foreach (var route in new[] { "/healthz", "/health", "/health/ready" })
+    app.MapHealthChecks(route, new HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") });
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "alive", timestamp = DateTimeOffset.UtcNow }));
-
-app.MapGet("/health/ready", async (HospitalCrmDbContext db, IConfiguration config, IWebHostEnvironment env, CancellationToken ct) =>
-{
-    var dbConnected = await db.Database.CanConnectAsync(ct);
-
-    var storageProbePath = Path.Combine(env.ContentRootPath, config["Lab:UploadDir"] ?? "lab-uploads");
-    var storageHealthy = false;
-    try
-    {
-        if (!Directory.Exists(storageProbePath))
-        {
-            Directory.CreateDirectory(storageProbePath);
-        }
-        var probeFile = Path.Combine(storageProbePath, $".health-probe-{Guid.NewGuid():N}");
-        await File.WriteAllTextAsync(probeFile, "ready", ct);
-        File.Delete(probeFile);
-        storageHealthy = true;
-    }
-    catch
-    {
-        storageHealthy = false;
-    }
-
-    var isReady = dbConnected && storageHealthy;
-    var payload = new
-    {
-        status = isReady ? "ready" : "unready",
-        probes = new
-        {
-            database = dbConnected ? "connected" : "disconnected",
-            storage = storageHealthy ? "writable" : "unreachable"
-        },
-        timestamp = DateTimeOffset.UtcNow
-    };
-
-    return isReady
-        ? Results.Ok(payload)
-        : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
-});
 
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
-}
-
-// A1: production has no seed. These run instead of the web host and exit.
-//   dotnet run --project backend/Hospital_CRM.Api -- --bootstrap-platform-admin <email>
-//   dotnet run --project backend/Hospital_CRM.Api -- --reset-mfa <email>
-if (args.Contains("--bootstrap-platform-admin") || args.Contains("--reset-mfa"))
-{
-    using var cliScope = app.Services.CreateScope();
-    var cliDb = cliScope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
-    return args.Contains("--bootstrap-platform-admin")
-        ? await BootstrapPlatformAdminAsync(cliDb, args)
-        : await ResetPlatformAdminMfaAsync(cliDb, args);
 }
 
 app.Run();
@@ -734,6 +726,87 @@ static string? ArgumentValue(string[] args, string name)
 {
     var index = Array.IndexOf(args, name);
     return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+}
+
+static void ValidateProductionConfiguration(IConfiguration config, IHostEnvironment environment)
+{
+    if (environment.IsDevelopment()) return;
+    foreach (var name in new[] { "Database:AutoMigrate", "Database:EraseOnStartup" })
+        if (config.GetValue<bool?>(name) != false)
+            throw new InvalidOperationException($"{name} must be explicitly false outside Development.");
+    if (!string.IsNullOrWhiteSpace(config.GetConnectionString("MigrationsConnection")))
+        throw new InvalidOperationException("Owner migration credentials must not be available to the runtime process.");
+    foreach (var name in new[] { "ConnectionStrings:DefaultConnection", "Hangfire:PostgreSql:Connection" })
+    {
+        var value = config[name] ?? (name.StartsWith("Hangfire:", StringComparison.Ordinal) ? config.GetConnectionString("DefaultConnection") : null);
+        NpgsqlConnectionStringBuilder connection;
+        try { connection = new NpgsqlConnectionStringBuilder(value); }
+        catch { throw new InvalidOperationException($"{name} is not a valid PostgreSQL connection string."); }
+        if (string.IsNullOrWhiteSpace(connection.Host) || string.IsNullOrWhiteSpace(connection.Database) ||
+            string.IsNullOrWhiteSpace(connection.Username) || connection.Username.Equals("postgres", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"{name} requires an explicit non-owner runtime login and database.");
+    }
+    foreach (var name in new[] { "Jwt:Issuer", "Jwt:Audience", "Jwt:KeyId", "DataProtection:KeysPath", "Lab:UploadDir", "Smtp:Host", "Smtp:From" })
+        if (string.IsNullOrWhiteSpace(config[name]) || config[name] == "Hospital_CRM")
+            throw new InvalidOperationException($"{name} requires an explicit production value.");
+    if (config["Jwt:KeySource"] is not ("PemFile" or "AzureKeyVault"))
+        throw new InvalidOperationException("Jwt:KeySource must be PemFile or AzureKeyVault.");
+    foreach (var name in config["Jwt:KeySource"] == "PemFile" ? new[] { "Jwt:PemFilePath" } :
+        new[] { "Jwt:AzureKeyVault:Url", "Jwt:AzureKeyVault:KeyName", "Jwt:AzureKeyVault:KeyVersion" })
+        if (string.IsNullOrWhiteSpace(config[name])) throw new InvalidOperationException($"{name} is required.");
+    if (!Path.IsPathFullyQualified(config["DataProtection:KeysPath"]!) || !Path.IsPathFullyQualified(config["Lab:UploadDir"]!))
+        throw new InvalidOperationException("Production key and private upload mounts require absolute paths.");
+    if (!config.GetValue("Mfa:RequireEnrolment", true))
+        throw new InvalidOperationException("Mandatory MFA enrolment cannot be disabled outside Development.");
+    if (config.GetValue("Razorpay:ReconciliationEnabled", false))
+        throw new InvalidOperationException("Razorpay reconciliation must remain disabled pending acceptance.");
+    if (!config.GetValue("Smtp:EnableSsl", true) || config.GetValue("Smtp:Port", 587) is < 1 or > 65535 ||
+        !System.Net.Mail.MailAddress.TryCreate(config["Smtp:From"], out _) ||
+        (!string.IsNullOrWhiteSpace(config["Smtp:Username"]) && string.IsNullOrWhiteSpace(config["Smtp:Password"])))
+        throw new InvalidOperationException("Production SMTP requires TLS, a valid port/sender and credentials for an authenticated relay.");
+    var origins = ProductionUrls(config, "Cors:AllowedOrigins", true);
+    var publicUrl = ProductionUrls(config, "App:PublicBaseUrl", true).Single();
+    _ = ProductionUrls(config, "Oidc:Issuer", true).Single();
+    if (!origins.Contains(publicUrl))
+        throw new InvalidOperationException("App:PublicBaseUrl must be an approved CORS origin.");
+    foreach (var name in new[] { "Oidc:RedirectUris", "Oidc:PostLogoutRedirectUris" })
+        foreach (var callback in ProductionUrls(config, name, false))
+            if (!origins.Any(origin => origin.GetLeftPart(UriPartial.Authority) == callback.GetLeftPart(UriPartial.Authority)))
+                throw new InvalidOperationException($"{name} must use approved frontend origins.");
+}
+
+static Uri[] ProductionUrls(IConfiguration config, string name, bool originOnly)
+{
+    var values = config[name]?.Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) ?? [];
+    if (values.Length == 0) throw new InvalidOperationException($"{name} is required.");
+    return values.Select(value =>
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
+            uri.IsLoopback || uri.Host == "10.0.2.2" || uri.Host.Contains('*') ||
+            !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment) ||
+            (originOnly && (uri.AbsolutePath != "/" || value != uri.GetLeftPart(UriPartial.Authority))))
+            throw new InvalidOperationException($"{name} requires literal production HTTPS {(originOnly ? "origins" : "URLs")} without credentials, wildcards, queries or fragments.");
+        return uri;
+    }).ToArray();
+}
+
+static X509Certificate2 LoadProductionCertificate(IConfiguration config, string prefix, X509KeyUsageFlags purpose, bool current = true)
+{
+    var path = config[prefix + "Path"];
+    if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+        throw new InvalidOperationException($"{prefix}Path requires an absolute protected certificate path.");
+    X509Certificate2 certificate;
+    try { certificate = X509CertificateLoader.LoadPkcs12FromFile(path, config[prefix + "Password"], X509KeyStorageFlags.EphemeralKeySet); }
+    catch { throw new InvalidOperationException($"{prefix} certificate could not be loaded."); }
+    using var rsa = certificate.GetRSAPrivateKey();
+    var usage = certificate.Extensions.OfType<X509KeyUsageExtension>().SingleOrDefault();
+    if (rsa == null || rsa.KeySize < 2048 || usage == null || (usage.KeyUsages & purpose) != purpose ||
+        certificate.NotBefore.ToUniversalTime() > DateTime.UtcNow || (current && certificate.NotAfter.ToUniversalTime() <= DateTime.UtcNow))
+    {
+        certificate.Dispose();
+        throw new InvalidOperationException($"{prefix} requires a valid private RSA certificate (2048+ bits) with the expected key usage.");
+    }
+    return certificate;
 }
 
 static async Task<int> BootstrapPlatformAdminAsync(HospitalCrmDbContext db, string[] args)
@@ -773,7 +846,7 @@ static async Task<int> BootstrapPlatformAdminAsync(HospitalCrmDbContext db, stri
     Console.WriteLine($"PlatformAdmin created: {email}");
     if (generated)
         Console.WriteLine($"One-time password (shown once): {password}");
-    Console.WriteLine("First sign-in forces a password change; two-factor authentication can be enabled in Settings if desired.");
+    Console.WriteLine("First sign-in requires a password change and MFA enrolment before operational access.");
     return 0;
 }
 
@@ -793,13 +866,19 @@ static async Task<int> ResetPlatformAdminMfaAsync(HospitalCrmDbContext db, strin
         return 3;
     }
 
-    user.MfaEnabled = false;
-    user.MfaSecret = null;
-    user.MfaMethod = null;
-    user.UpdatedAt = DateTimeOffset.UtcNow;
-    await db.SaveChangesAsync();
+    await SessionMutation.RunAsync(db, user.Id, async () =>
+    {
+        user.MfaEnabled = false;
+        user.MfaSecret = null;
+        user.MfaMethod = null;
+        user.UpdatedAt = DateTimeOffset.UtcNow;
+        var sessions = await db.RefreshTokens.Where(t => t.UserId == user.Id && t.RevokedAt == null).ToListAsync();
+        foreach (var session in sessions) session.RevokedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        return true;
+    }, CancellationToken.None);
 
-    Console.WriteLine($"MFA reset for {email}; second-factor authentication is now disabled.");
+    Console.WriteLine($"MFA reset for {email}; next sign-in requires enrolment. Existing session families are revoked.");
     return 0;
 }
 
@@ -1288,36 +1367,35 @@ static async Task SeedPharmacyDataAsync(HospitalCrmDbContext db, Guid? tenantId 
     }
 }
 
-static async Task SeedOpenIddictClientsAsync(IServiceProvider serviceProvider)
+static async Task SeedOpenIddictClientsAsync(IServiceProvider serviceProvider, IConfiguration config, IHostEnvironment environment)
 {
     using var scope = serviceProvider.CreateScope();
+    using var maintenance = scope.ServiceProvider.GetRequiredService<ITenantContext>().PushMaintenance();
     var appManager = scope.ServiceProvider.GetRequiredService<IOpenIddictApplicationManager>();
     var scopeManager = scope.ServiceProvider.GetRequiredService<IOpenIddictScopeManager>();
 
-    if (await scopeManager.FindByNameAsync("api") is null)
+    var scopeDescriptor = new OpenIddictScopeDescriptor
     {
-        await scopeManager.CreateAsync(new OpenIddictScopeDescriptor
-        {
-            Name = "api",
-            DisplayName = "Hospital CRM API",
-            Resources = { "api" }
-        });
-    }
+        Name = "api",
+        DisplayName = "Hospital CRM API",
+        Resources = { "api" }
+    };
+    var apiScope = await scopeManager.FindByNameAsync("api");
+    if (apiScope is null) await scopeManager.CreateAsync(scopeDescriptor);
+    else await scopeManager.UpdateAsync(apiScope, scopeDescriptor);
 
     var pwaClient = await appManager.FindByClientIdAsync("hospital-crm-pwa");
-    if (pwaClient is null)
+    var descriptor = new OpenIddictApplicationDescriptor
     {
-        var descriptor = new OpenIddictApplicationDescriptor
-        {
-            ClientId = "hospital-crm-pwa",
-            DisplayName = "Hospital CRM PWA",
-            ClientType = OpenIddictConstants.ClientTypes.Public,
-            ConsentType = OpenIddictConstants.ConsentTypes.Implicit,
-            Requirements =
+        ClientId = "hospital-crm-pwa",
+        DisplayName = "Hospital CRM PWA",
+        ClientType = OpenIddictConstants.ClientTypes.Public,
+        ConsentType = OpenIddictConstants.ConsentTypes.Implicit,
+        Requirements =
             {
                 OpenIddictConstants.Requirements.Features.ProofKeyForCodeExchange
             },
-            Permissions =
+        Permissions =
             {
                 OpenIddictConstants.Permissions.Endpoints.Authorization,
                 OpenIddictConstants.Permissions.Endpoints.Token,
@@ -1330,10 +1408,10 @@ static async Task SeedOpenIddictClientsAsync(IServiceProvider serviceProvider)
                 OpenIddictConstants.Permissions.Scopes.Roles,
                 OpenIddictConstants.Permissions.Prefixes.Scope + "api"
             }
-        };
+    };
 
-        var redirectUris = new[]
-        {
+    var redirectUris = environment.IsDevelopment() ? new[]
+    {
             "http://localhost:5173/auth/callback",
             "https://localhost:5173/auth/callback",
             "http://localhost:8080/auth/callback",
@@ -1343,14 +1421,14 @@ static async Task SeedOpenIddictClientsAsync(IServiceProvider serviceProvider)
             "capacitor://localhost/auth/callback",
             "http://10.0.2.2:5000/auth/callback",
             "https://10.0.2.2:7001/auth/callback"
-        };
-        foreach (var uri in redirectUris)
-        {
-            descriptor.RedirectUris.Add(new Uri(uri));
-        }
+        } : ProductionUrls(config, "Oidc:RedirectUris", false).Select(uri => uri.AbsoluteUri).ToArray();
+    foreach (var uri in redirectUris)
+    {
+        descriptor.RedirectUris.Add(new Uri(uri));
+    }
 
-        var postLogoutRedirectUris = new[]
-        {
+    var postLogoutRedirectUris = environment.IsDevelopment() ? new[]
+    {
             "http://localhost:5173/login",
             "https://localhost:5173/login",
             "http://localhost:8080/login",
@@ -1359,13 +1437,13 @@ static async Task SeedOpenIddictClientsAsync(IServiceProvider serviceProvider)
             "capacitor://localhost/login",
             "http://10.0.2.2:5000/login",
             "https://10.0.2.2:7001/login"
-        };
-        foreach (var uri in postLogoutRedirectUris)
-        {
-            descriptor.PostLogoutRedirectUris.Add(new Uri(uri));
-        }
-
-        await appManager.CreateAsync(descriptor);
-        Log.Information("OpenIddict client 'hospital-crm-pwa' registered successfully.");
+        } : ProductionUrls(config, "Oidc:PostLogoutRedirectUris", false).Select(uri => uri.AbsoluteUri).ToArray();
+    foreach (var uri in postLogoutRedirectUris)
+    {
+        descriptor.PostLogoutRedirectUris.Add(new Uri(uri));
     }
+
+    if (pwaClient is null) await appManager.CreateAsync(descriptor);
+    else await appManager.UpdateAsync(pwaClient, descriptor);
+    Log.Information("OpenIddict client 'hospital-crm-pwa' and scope 'api' maintained successfully.");
 }

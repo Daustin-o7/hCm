@@ -1,74 +1,45 @@
-# ==============================================================================
-# restore-db.ps1 — PostgreSQL Database Restore & Verification (PowerShell / Windows)
-# Hospital_CRM Production Disaster Recovery Infrastructure
-# ==============================================================================
-
+#requires -Version 7.0
 [CmdletBinding()]
 param(
-    [string]$BackupFile = "",
-    [string]$PgHost = "localhost",
+    [Parameter(Mandatory)][string]$BackupDirectory,
+    [switch]$VerifyOnly,
+    [string]$PgHost,
     [int]$PgPort = 5432,
-    [string]$Database = "hospital_crm",
-    [string]$User = "postgres"
+    [string]$Database,
+    [string]$User,
+    [string]$RestoreFilesDirectory,
+    [switch]$ApprovedIsolatedTarget,
+    [switch]$ProtectedStorageConfirmed,
+    [switch]$RolesReviewed
 )
-
-$ErrorActionPreference = "Stop"
-
-$RootDir = Split-Path -Parent $PSScriptRoot
-
-if (-not $BackupFile) {
-    $BackupsDir = Join-Path $RootDir "backups"
-    if (Test-Path $BackupsDir) {
-        $latest = Get-ChildItem -Path $BackupsDir -Filter "*.dump" -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($latest) {
-            $BackupFile = $latest.FullName
-            Write-Host "==> Auto-selected latest backup: $BackupFile" -ForegroundColor Cyan
-        }
-    }
+. "$PSScriptRoot/recovery-common.ps1"
+$source = Assert-ProtectedRecoveryPath $BackupDirectory
+$manifest = Get-RecoveryManifest $source
+if ($VerifyOnly) { Write-Output "Recovery set integrity passed ($(@($manifest.files).Count) files); no database or file restore performed."; return }
+Assert-IsolatedRestoreTarget $PgHost $PgPort $Database $ApprovedIsolatedTarget.IsPresent
+if (!$ProtectedStorageConfirmed -or !$RolesReviewed -or [string]::IsNullOrWhiteSpace($User) -or [string]::IsNullOrWhiteSpace($RestoreFilesDirectory)) {
+    throw 'Reviewed pre-provisioned owners/roles, protected destination and an explicit restore user/files directory are required.'
 }
-
-if (-not $BackupFile -or -not (Test-Path $BackupFile)) {
-    Write-Error "ERROR: Backup dump file not specified or file does not exist: '$BackupFile'."
-    exit 1
+$destination = Assert-ProtectedRecoveryPath $RestoreFilesDirectory
+if (Test-Path -LiteralPath $destination) { throw 'The restored-files directory must not exist.' }
+if ($destination.StartsWith($source.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Restore output must not alter the original recovery set.'
 }
-
-$ChecksumFile = "$BackupFile.sha256"
-if (Test-Path $ChecksumFile) {
-    Write-Host "==> Verifying SHA256 integrity checksum..." -ForegroundColor Cyan
-    $expectedHash = (Get-Content $ChecksumFile).Split(" ")[0].Trim()
-    $actualHash = (Get-FileHash -Path $BackupFile -Algorithm SHA256).Hash
-    if ($expectedHash -ieq $actualHash) {
-        Write-Host "    Checksum OK ($actualHash)" -ForegroundColor Green
-    } else {
-        Write-Error "CHECKSUM MISMATCH! Expected: $expectedHash, Actual: $actualHash"
-        exit 1
-    }
+$parent = Split-Path $destination -Parent
+Assert-NoRecoveryLinks $parent
+$env:PGCONNECT_TIMEOUT = '5'
+$pg = @('--no-password', "--host=$PgHost", "--port=$PgPort", "--username=$User", "--dbname=$Database")
+# No CREATE/DROP database, --clean, --no-owner or --no-privileges: fail if anything conflicts.
+$query = "SELECT current_database() = '$Database' AND NOT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%') AND NOT EXISTS (SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema'));"
+$empty = Invoke-RecoveryPg psql ($pg + @('-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-c', $query))
+if (($empty -join '').Trim() -ne 't') { throw 'Restore target is not an empty isolated database.' }
+Invoke-RecoveryPg pg_restore ($pg + @('--exit-on-error', '--single-transaction', (Join-Path $source 'database.dump'))) | Out-Null
+New-Item -ItemType Directory -Path $destination | Out-Null
+if (!$IsWindows) { [IO.File]::SetUnixFileMode($destination, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute) }
+foreach ($name in @('uploads', 'keys', 'configuration')) {
+    Copy-Item -LiteralPath (Join-Path $source $name) -Destination $destination -Recurse
 }
-
-Write-Host "==> Restoring database '$Database' from '$BackupFile'..." -ForegroundColor Cyan
-$env:PGCONNECT_TIMEOUT = "3"
-$pgRestore = Get-Command pg_restore -ErrorAction SilentlyContinue
-if (-not $pgRestore) {
-    Write-Error "pg_restore was not found on PATH. Install the PostgreSQL client tools and retry."
-    exit 1
+foreach ($entry in $manifest.files | Where-Object path -match '^(uploads|keys|configuration)/') {
+    if ((Get-FileHash -LiteralPath (Join-Path $destination $entry.path) -Algorithm SHA256).Hash -ne $entry.sha256) { throw 'Restored file checksum mismatch; keep the isolated target offline.' }
 }
-
-& $pgRestore.Source --no-password --host=$PgHost --port=$PgPort --username=$User --dbname=$Database --clean --if-exists --no-owner --no-privileges $BackupFile
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Restore failed: pg_restore exited with code $LASTEXITCODE."
-    exit 1
-}
-
-$psql = Get-Command psql -ErrorAction SilentlyContinue
-if (-not $psql) {
-    Write-Error "psql was not found on PATH; cannot verify the restored database."
-    exit 1
-}
-
-$userCount = & $psql.Source --no-password --host=$PgHost --port=$PgPort --username=$User --dbname=$Database -v ON_ERROR_STOP=1 -t -c 'SELECT count(*) FROM "Users";'
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Restore verification failed: the restored database did not answer the Users query."
-    exit 1
-}
-
-Write-Host "==> Restoration verified successfully! Users restored: $($userCount.Trim())" -ForegroundColor Green
+Write-Output 'Database and files restored into the isolated target. Keep jobs/egress stopped; role, RLS, business, key-decryption and credential-cutover acceptance is still required.'

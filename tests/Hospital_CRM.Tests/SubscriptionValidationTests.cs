@@ -35,7 +35,7 @@ public class SubscriptionValidationTests
     private static HospitalCrmDbContext CreateInMemoryDb() =>
         new(new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase($"TenantPatchDb_{Guid.NewGuid()}")
-            .Options);
+            .Options, TestMaintenanceTenantContext.Instance);
 
     private static PlatformAdminController CreateController(HospitalCrmDbContext db)
     {

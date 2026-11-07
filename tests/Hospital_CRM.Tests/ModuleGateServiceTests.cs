@@ -15,7 +15,7 @@ public class ModuleGateServiceTests
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(databaseName: $"GateDb_{Guid.NewGuid()}")
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     [Fact]

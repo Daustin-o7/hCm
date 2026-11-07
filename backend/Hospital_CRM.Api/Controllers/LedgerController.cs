@@ -1,6 +1,8 @@
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
@@ -16,8 +18,14 @@ namespace Hospital_CRM.Api.Controllers;
 public class LedgerController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
+    private readonly ITimezoneService _timezone;
+    private const string AccountingTimezone = "Asia/Kolkata";
 
-    public LedgerController(HospitalCrmDbContext db) => _db = db;
+    public LedgerController(HospitalCrmDbContext db, ITimezoneService? timezone = null)
+    {
+        _db = db;
+        _timezone = timezone ?? new TimezoneService();
+    }
 
     private Guid TenantId => User.GetTenantId() ?? Guid.Empty;
 
@@ -27,18 +35,14 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Receptionist", "Doctor")]
     public async Task<IActionResult> Income([FromQuery] string? month, CancellationToken ct)
     {
-        var (year, monthNum) = ParseMonth(month);
+        if (await ValidateScope(ct) is { } denied) return denied;
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
+        var start = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var end = _timezone.GetStartOfDayUtc(startDate.AddMonths(1), AccountingTimezone);
 
-        var tenantId = TenantId;
-        var startDate = new DateOnly(year, monthNum, 1);
-        var endDate = startDate.AddMonths(1);
-
-        var payments = await _db.Payments
-            .Include(p => p.Invoice)
-            .Where(p => p.TenantId == tenantId
-                     && p.Status == PaymentStatus.Completed
-                     && p.PaidAt >= startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)
-                     && p.PaidAt < endDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc))
+        var payments = await QueryPayments()
+            .Where(p => p.Status == PaymentStatus.Completed && p.PaidAt >= start && p.PaidAt < end)
             .ToListAsync(ct);
 
         var totalIncome = payments.Sum(p => p.Amount);
@@ -51,7 +55,7 @@ public class LedgerController : ControllerBase
 
         return Ok(new
         {
-            month = $"{year:D4}-{monthNum:D2}",
+            month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             totalIncome,
             gstCollected,
             invoiceCount,
@@ -65,17 +69,13 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
     public async Task<IActionResult> DailyCollection([FromQuery] string? date, CancellationToken ct)
     {
-        var targetDate = DateOnly.TryParse(date, out var parsed) ? parsed : DateOnly.FromDateTime(DateTime.UtcNow);
-        var start = targetDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var end = start.AddDays(1);
-        var tenantId = TenantId;
+        if (await ValidateScope(ct) is { } denied) return denied;
+        if (!TryParseDay(date, out var targetDate))
+            return BadRequest(new { error = "invalid_date", message = "Use YYYY-MM-DD." });
+        var start = _timezone.GetStartOfDayUtc(targetDate, AccountingTimezone);
+        var end = _timezone.GetStartOfDayUtc(targetDate.AddDays(1), AccountingTimezone);
 
-        var payments = await _db.Payments
-            .Include(p => p.Invoice)
-            .Where(p => p.TenantId == tenantId
-                     && ((p.PaidAt >= start && p.PaidAt < end)
-                         || (p.ReportedAt >= start && p.ReportedAt < end)))
-            .ToListAsync(ct);
+        var payments = await QueryCollections(start, end).ToListAsync(ct);
 
         var confirmedPayments = payments.Where(p => p.Status == PaymentStatus.Completed).ToList();
         var reportedPayments = payments.Where(p => p.VerificationStatus == PaymentVerificationStatus.Reported && p.Status != PaymentStatus.Completed).ToList();
@@ -107,12 +107,13 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
     public async Task<IActionResult> OutstandingDues(CancellationToken ct)
     {
+        if (await ValidateScope(ct) is { } denied) return denied;
         var tenantId = TenantId;
         var now = DateTimeOffset.UtcNow;
 
-        var unpaidInvoices = await _db.Invoices
+        var unpaidInvoices = await QueryInvoices()
             .Include(i => i.Appointment).ThenInclude(a => a!.Patient)
-            .Where(i => i.TenantId == tenantId
+            .Where(i => (i.AppointmentId == null || i.Appointment!.Patient == null || i.Appointment.Patient.TenantId == tenantId)
                      && i.Status != InvoiceStatus.Paid
                      && i.Status != InvoiceStatus.Cancelled
                      && i.Status != InvoiceStatus.Refunded
@@ -162,11 +163,12 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> Journal([FromQuery] int limit = 50, CancellationToken ct = default)
     {
+        if (await ValidateScope(ct) is { } denied) return denied;
         var tenantId = TenantId;
         var entries = await _db.FinanceLedgerEntries
             .Where(e => e.TenantId == tenantId)
             .OrderByDescending(e => e.CreatedAt)
-            .Take(Math.Min(limit, 200))
+            .Take(Math.Clamp(limit, 1, 200))
             .Select(e => new
             {
                 id = e.Id,
@@ -193,6 +195,7 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> CreateExpense([FromBody] CreateExpenseRequest request, CancellationToken ct)
     {
+        if (await ValidateScope(ct) is { } denied) return denied;
         if (!Enum.TryParse<ExpenseCategory>(request.Category, true, out var category))
             return BadRequest(new { error = "invalid_category" });
 
@@ -237,6 +240,7 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> UpdateExpense(Guid id, [FromBody] UpdateExpenseRequest request, CancellationToken ct)
     {
+        if (await ValidateScope(ct) is { } denied) return denied;
         var tenantId = TenantId;
         var expense = await _db.LedgerExpenses.FirstOrDefaultAsync(e => e.Id == id && e.TenantId == tenantId, ct);
         if (expense is null)
@@ -277,9 +281,10 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> ListExpenses([FromQuery] string? month, CancellationToken ct)
     {
-        var (year, monthNum) = ParseMonth(month);
+        if (await ValidateScope(ct) is { } denied) return denied;
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
         var tenantId = TenantId;
-        var startDate = new DateOnly(year, monthNum, 1);
         var endDate = startDate.AddMonths(1);
 
         var expenses = await _db.LedgerExpenses
@@ -305,27 +310,27 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> Summary([FromQuery] string? month, CancellationToken ct)
     {
-        var (year, monthNum) = ParseMonth(month);
-        var monthLabel = $"{year:D4}-{monthNum:D2}";
+        if (await ValidateScope(ct) is { } denied) return denied;
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
+        var monthLabel = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture);
         var tenantId = TenantId;
-        var startDate = new DateOnly(year, monthNum, 1);
         var endDate = startDate.AddMonths(1);
+        var start = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var end = _timezone.GetStartOfDayUtc(endDate, AccountingTimezone);
 
-        var payments = await _db.Payments
-            .Include(p => p.Invoice)
-            .Where(p => p.TenantId == tenantId
-                     && p.PaidAt >= startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)
-                     && p.PaidAt < endDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc))
-            .ToListAsync(ct);
+        var payments = await QueryCollections(start, end).ToListAsync(ct);
 
         var confirmedIncome = payments.Where(p => p.Status == PaymentStatus.Completed).Sum(p => p.Amount);
         var reportedPending = payments.Where(p => p.VerificationStatus == PaymentVerificationStatus.Reported && p.Status != PaymentStatus.Completed).Sum(p => p.Amount);
 
-        // Credit notes in month
+        var ownedInvoiceIds = QueryInvoices().Select(i => i.Id);
+        // Pending/rejected notes have no realized effect; use the approved note's issue period.
         var creditNotes = await _db.CreditNotes
             .Where(c => c.TenantId == tenantId
-                     && c.IssuedAt >= startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)
-                     && c.IssuedAt < endDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc))
+                     && ownedInvoiceIds.Contains(c.InvoiceId)
+                     && c.Status == CreditNoteStatus.Approved
+                     && c.IssuedAt >= start && c.IssuedAt < end)
             .SumAsync(c => c.Amount, ct);
 
         // Expenses (if any)
@@ -363,15 +368,15 @@ public class LedgerController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
     public async Task<IActionResult> Daily([FromQuery] string? date, CancellationToken ct)
     {
-        var targetDate = DateOnly.TryParse(date, out var parsed) ? parsed : DateOnly.FromDateTime(DateTime.UtcNow);
-        var start = targetDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var end = start.AddDays(1);
+        if (await ValidateScope(ct) is { } denied) return denied;
+        if (!TryParseDay(date, out var targetDate))
+            return BadRequest(new { error = "invalid_date", message = "Use YYYY-MM-DD." });
+        var start = _timezone.GetStartOfDayUtc(targetDate, AccountingTimezone);
+        var end = _timezone.GetStartOfDayUtc(targetDate.AddDays(1), AccountingTimezone);
         var tenantId = TenantId;
 
-        var payments = await _db.Payments
-            .Include(p => p.Invoice)
-            .Where(p => p.TenantId == tenantId
-                     && p.Status == PaymentStatus.Completed
+        var payments = await QueryPayments()
+            .Where(p => p.Status == PaymentStatus.Completed
                      && p.PaidAt >= start
                      && p.PaidAt < end)
             .ToListAsync(ct);
@@ -411,15 +416,64 @@ public class LedgerController : ControllerBase
         });
     }
 
-    private static (int year, int month) ParseMonth(string? month)
+    private async Task<IActionResult?> ValidateScope(CancellationToken ct)
     {
-        if (!string.IsNullOrWhiteSpace(month) &&
-            DateOnly.TryParse($"{month}-01", out var parsed))
+        var userId = User.GetUserId();
+        if (userId is null || userId == Guid.Empty) return Unauthorized(new { error = "invalid_token" });
+        var tenantId = TenantId;
+        var clinicId = User.GetClinicId();
+        if (tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty
+            || !await _db.Clinics.AnyAsync(c => c.Id == clinicId && c.TenantId == tenantId, ct)
+            || !await _db.TenantMemberships.AnyAsync(m => m.UserId == userId && m.TenantId == tenantId
+                && m.ClinicId == clinicId && m.Status == "active", ct))
+            return StatusCode(403, new { error = "invalid_selected_clinic" });
+        return null;
+    }
+
+    private IQueryable<Invoice> QueryInvoices()
+    {
+        var tenantId = TenantId;
+        var clinicId = User.GetClinicId();
+        // Walk-ins, expenses and journal rows have tenant ownership; appointments also bind a clinic.
+        return _db.Invoices.AsNoTracking().Where(i => i.TenantId == tenantId
+            && (i.AppointmentId == null || i.Appointment != null
+                && i.Appointment.TenantId == tenantId && i.Appointment.ClinicId == clinicId));
+    }
+
+    private IQueryable<Payment> QueryPayments()
+    {
+        var tenantId = TenantId;
+        var ownedInvoiceIds = QueryInvoices().Select(i => i.Id);
+        return _db.Payments.AsNoTrackingWithIdentityResolution().Include(p => p.Invoice)
+            .Where(p => p.TenantId == tenantId && ownedInvoiceIds.Contains(p.InvoiceId));
+    }
+
+    private IQueryable<Payment> QueryCollections(DateTime start, DateTime end) => QueryPayments()
+        .Where(p => p.Status == PaymentStatus.Completed && p.PaidAt >= start && p.PaidAt < end
+            || p.Status != PaymentStatus.Completed && p.VerificationStatus == PaymentVerificationStatus.Reported
+                && p.ReportedAt >= start && p.ReportedAt < end);
+
+    private bool TryParseMonth(string? month, out DateOnly startDate)
+    {
+        if (month is null)
         {
-            return (parsed.Year, parsed.Month);
+            var today = _timezone.GetLocalDate(null, AccountingTimezone);
+            startDate = new DateOnly(today.Year, today.Month, 1);
+            return true;
         }
-        var now = DateTime.UtcNow;
-        return (now.Year, now.Month);
+        return DateOnly.TryParseExact($"{month}-01", "yyyy-MM-dd", CultureInfo.InvariantCulture,
+            DateTimeStyles.None, out startDate) && startDate.Year is > 1 and < 9999;
+    }
+
+    private bool TryParseDay(string? date, out DateOnly targetDate)
+    {
+        if (date is null)
+        {
+            targetDate = _timezone.GetLocalDate(null, AccountingTimezone);
+            return true;
+        }
+        return DateOnly.TryParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+            DateTimeStyles.None, out targetDate) && targetDate.Year is > 1 and < 9999;
     }
 }
 

@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using System.Text.Json;
 using Hospital_CRM.Api.Controllers;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
@@ -25,16 +26,17 @@ public class Section3ClinicalHardeningTests
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
-    private static void SetCaller(ControllerBase controller, Guid userId, string role, Guid tenantId)
+    private static void SetCaller(ControllerBase controller, Guid userId, string role, Guid tenantId, Guid clinicId)
     {
         var claims = new[]
         {
             new Claim("sub", userId.ToString()),
             new Claim("role", role),
-            new Claim("tenant_id", tenantId.ToString())
+            new Claim("tenant_id", tenantId.ToString()),
+            new Claim("clinicId", clinicId.ToString())
         };
         controller.ControllerContext = new ControllerContext
         {
@@ -47,6 +49,16 @@ public class Section3ClinicalHardeningTests
 
     private static JsonElement ToJson(object? value) =>
         JsonSerializer.SerializeToElement(value, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+    private static User SeedNurse(HospitalCrmDbContext db, Guid tenantId, Guid clinicId)
+    {
+        var nurse = new User { Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Nurse,
+            Name = "Synthetic nurse", Email = "nurse@test.invalid", PasswordHash = "not-a-login" };
+        db.Users.Add(nurse);
+        db.TenantMemberships.Add(new TenantMembership { UserId = nurse.Id, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Nurse });
+        db.SaveChanges();
+        return nurse;
+    }
 
     private (User Doctor, Patient Patient, Appointment Appointment, Guid TenantId, Guid ClinicId) SetupClinic(
         HospitalCrmDbContext db, AppointmentStatus status = AppointmentStatus.CheckedIn)
@@ -168,9 +180,9 @@ public class Section3ClinicalHardeningTests
     public async Task Finalize_SecondTime_IsRejectedAsAlreadyFinalized()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db);
+        var (doctor, _, appointment, tenantId, clinicId) = SetupClinic(db);
         var controller = new ConsultationsController(db);
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
         var first = await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(), CancellationToken.None);
         Assert.IsType<OkObjectResult>(first);
@@ -186,9 +198,9 @@ public class Section3ClinicalHardeningTests
     public async Task Finalize_RejectsAndDraftDoesNotReopenAClosedVisit()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db, AppointmentStatus.Completed);
+        var (doctor, _, appointment, tenantId, clinicId) = SetupClinic(db, AppointmentStatus.Completed);
         var controller = new ConsultationsController(db);
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
         var finalize = await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(), CancellationToken.None) as ConflictObjectResult;
         Assert.NotNull(finalize);
@@ -207,11 +219,11 @@ public class Section3ClinicalHardeningTests
     public async Task SaveDraft_AfterFinalize_IsRejected()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db);
+        var (doctor, _, appointment, tenantId, clinicId) = SetupClinic(db);
         var controller = new ConsultationsController(db);
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
-        await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(), CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(), CancellationToken.None));
 
         var draft = await controller.SaveDraft(
             appointment.Id,
@@ -226,15 +238,15 @@ public class Section3ClinicalHardeningTests
     public async Task Amend_WithoutItems_KeepsThePrescription()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db);
+        var (doctor, _, appointment, tenantId, clinicId) = SetupClinic(db);
         var controller = new ConsultationsController(db);
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
         var items = new List<StructuredPrescriptionItemRequest>
         {
             new(null, "Paracetamol", "Dolo 650", "Tablet", "650mg", "Oral", "1-1-1", 3, "Days", "After food", 9, null, "General", false)
         };
-        await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(items), CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(items), CancellationToken.None));
         var v1 = await db.Consultations.FirstAsync(c => c.AppointmentId == appointment.Id);
 
         var amended = await controller.AmendConsultation(
@@ -247,7 +259,7 @@ public class Section3ClinicalHardeningTests
                 StructuredObservationsJson: null, PrescriptionItems: null),
             CancellationToken.None);
 
-        Assert.IsType<ObjectResult>(amended);
+        Assert.Equal(201, Assert.IsType<ObjectResult>(amended).StatusCode);
 
         var v2 = await db.Consultations
             .Include(c => c.Prescriptions).ThenInclude(p => p.Items)
@@ -256,6 +268,12 @@ public class Section3ClinicalHardeningTests
         Assert.Equal(2, v2.Version);
         var item = Assert.Single(v2.Prescriptions.SelectMany(p => p.Items));
         Assert.Equal("Paracetamol", item.GenericName);
+        Assert.Equal("650mg", item.Strength);
+        Assert.Equal("1-1-1", item.Frequency);
+        Assert.Equal(9, item.TotalQuantity);
+        Assert.Equal("Viral fever", v1.Diagnosis);
+        Assert.Equal("Dengue fever", v2.Diagnosis);
+        Assert.NotEqual(Assert.Single(v1.Prescriptions.SelectMany(p => p.Items)).Id, item.Id);
     }
 
     [Fact]
@@ -276,10 +294,11 @@ public class Section3ClinicalHardeningTests
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.Users.Add(otherDoctor);
+        db.TenantMemberships.Add(new TenantMembership { UserId = otherDoctor.Id, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor });
         await db.SaveChangesAsync();
 
         var controller = new ConsultationsController(db);
-        SetCaller(controller, otherDoctor.Id, "Doctor", tenantId);
+        SetCaller(controller, otherDoctor.Id, "Doctor", tenantId, clinicId);
 
         var result = await controller.ClaimAppointment(appointment.Id, CancellationToken.None) as ConflictObjectResult;
 
@@ -295,7 +314,7 @@ public class Section3ClinicalHardeningTests
     public async Task Finalize_BlocksNdpsSourcedFromTheDrugCatalogue()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db);
+        var (doctor, _, appointment, tenantId, clinicId) = SetupClinic(db);
 
         var drug = new Drug
         {
@@ -310,7 +329,7 @@ public class Section3ClinicalHardeningTests
         await db.SaveChangesAsync();
 
         var controller = new ConsultationsController(db);
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
         // No scheduleClass in the request: the catalogue alone must block it.
         var items = new List<StructuredPrescriptionItemRequest>
@@ -325,24 +344,26 @@ public class Section3ClinicalHardeningTests
     }
 
     [Fact]
-    public async Task Verify_RecomputesTheSignatureAndReturnsTheLatestVersion()
+    public async Task VerifyBound_RecomputesTheSignatureAndReturnsTheLatestVersion()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db);
-        var controller = new ConsultationsController(db);
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        var (doctor, _, appointment, tenantId, clinicId) = SetupClinic(db);
+        var controller = new ConsultationsController(db, NullLogger<ConsultationsController>.Instance, tenantContext: new TenantContext());
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
-        await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(), CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(appointment.Id, FinalizeRequest(), CancellationToken.None));
         var v1 = await db.Consultations.FirstAsync(c => c.AppointmentId == appointment.Id);
+        Assert.True(PublicTokenRouting.IsWellFormed(PublicTokenPurpose.Prescription, v1.VerificationQrCode));
 
-        var verified = await controller.VerifyPrescription(v1.VerificationQrCode!, CancellationToken.None) as OkObjectResult;
+        // SQL token routing is covered by Part2TenantBoundaryPostgresTests; exercise the bound clinical stage here.
+        var verified = await Part1SaleReadinessTests.VerifyBound(controller, new(tenantId, v1.Id), v1.VerificationQrCode!) as OkObjectResult;
         Assert.NotNull(verified);
         var body = ToJson(verified.Value);
         Assert.True(body.GetProperty("signatureValid").GetBoolean());
         Assert.Equal(1, body.GetProperty("version").GetInt32());
 
         // The same code must resolve to the newest version after an amendment.
-        await controller.AmendConsultation(
+        var amendment = await controller.AmendConsultation(
             v1.Id,
             new AmendConsultationRequest(
                 AmendmentReason: "Added diagnosis detail",
@@ -351,24 +372,40 @@ public class Section3ClinicalHardeningTests
                 FollowUpNotes: null, TemplateId: null, TemplateVersion: null,
                 StructuredObservationsJson: null, PrescriptionItems: null),
             CancellationToken.None);
+        Assert.Equal(201, Assert.IsType<ObjectResult>(amendment).StatusCode);
+        var v2 = await db.Consultations.SingleAsync(c => c.PreviousVersionId == v1.Id);
 
-        var afterAmend = await controller.VerifyPrescription(v1.VerificationQrCode!, CancellationToken.None) as OkObjectResult;
+        var afterAmend = await Part1SaleReadinessTests.VerifyBound(controller, new(tenantId, v2.Id), v1.VerificationQrCode!) as OkObjectResult;
         Assert.NotNull(afterAmend);
         var amendedBody = ToJson(afterAmend.Value);
         Assert.Equal(2, amendedBody.GetProperty("version").GetInt32());
         Assert.True(amendedBody.GetProperty("amended").GetBoolean());
         Assert.True(amendedBody.GetProperty("signatureValid").GetBoolean());
+        Assert.Equal("valid", amendedBody.GetProperty("status").GetString());
+
+        var original = ToJson(Assert.IsType<OkObjectResult>(await Part1SaleReadinessTests.VerifyBound(controller, new(tenantId, v2.Id), v1.VerificationQrCode!, 1)).Value);
+        Assert.Equal(1, original.GetProperty("version").GetInt32());
+        Assert.True(original.GetProperty("signatureValid").GetBoolean());
+        Assert.Equal("superseded", original.GetProperty("status").GetString());
+
+        v2.Diagnosis = "Tampered diagnosis";
+        await db.SaveChangesAsync();
+        var tampered = ToJson(Assert.IsType<OkObjectResult>(await Part1SaleReadinessTests.VerifyBound(controller, new(tenantId, v2.Id), v1.VerificationQrCode!)).Value);
+        Assert.False(tampered.GetProperty("signatureValid").GetBoolean());
+        Assert.False(tampered.GetProperty("verified").GetBoolean());
+        Assert.Equal("invalid", tampered.GetProperty("status").GetString());
     }
 
     [Fact]
     public async Task LabReview_RequiresAResult()
     {
         var db = CreateInMemoryDb();
-        var (doctor, patient, appointment, tenantId, _) = SetupClinic(db);
+        var (doctor, patient, appointment, tenantId, clinicId) = SetupClinic(db);
 
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = appointment.Id,
             DoctorId = doctor.Id,
             Status = ConsultationStatus.Finalized,
@@ -391,7 +428,7 @@ public class Section3ClinicalHardeningTests
         await db.SaveChangesAsync();
 
         var controller = new LabOrdersController(db, new ConfigurationBuilder().Build());
-        SetCaller(controller, doctor.Id, "Doctor", tenantId);
+        SetCaller(controller, doctor.Id, "Doctor", tenantId, clinicId);
 
         var result = await controller.DoctorReview(order.Id, new DoctorReviewLabOrderRequest("Looks fine", null), CancellationToken.None)
             as ConflictObjectResult;
@@ -404,17 +441,19 @@ public class Section3ClinicalHardeningTests
     public async Task Vitals_Overwrite_IsAuditedWithThePriorValues()
     {
         var db = CreateInMemoryDb();
-        var (doctor, patient, appointment, tenantId, _) = SetupClinic(db);
+        var (_, patient, appointment, tenantId, clinicId) = SetupClinic(db);
+        var nurse = SeedNurse(db, tenantId, clinicId);
         var controller = new VitalsController(db, NullLogger<VitalsController>.Instance);
-        SetCaller(controller, doctor.Id, "Nurse", tenantId);
+        SetCaller(controller, nurse.Id, "Nurse", tenantId, clinicId);
 
-        await controller.RecordVitals(appointment.Id,
-            new RecordVitalsRequest(120, 80, 72, 98.6m, 16, 98, 70m, 170m, 95m, null, null), CancellationToken.None);
-        await controller.RecordVitals(appointment.Id,
-            new RecordVitalsRequest(150, 95, 88, 100.4m, 20, 96, 70m, 170m, 95m, null, null), CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.RecordVitals(appointment.Id,
+            new RecordVitalsRequest(120, 80, 72, 98.6m, 16, 98, 70m, 170m, 95m, null, null), CancellationToken.None));
+        Assert.IsType<OkObjectResult>(await controller.RecordVitals(appointment.Id,
+            new RecordVitalsRequest(150, 95, 88, 100.4m, 20, 96, 70m, 170m, 95m, null, null), CancellationToken.None));
 
         var audit = await db.PatientAuditLogs.SingleAsync(a => a.FieldName == "VITALS_AMENDED");
         Assert.Equal(patient.Id, audit.PatientId);
+        Assert.Equal(nurse.Id, audit.ChangedBy);
         Assert.Contains("BP 120/80", audit.OldValue);
         Assert.Contains("BP 150/95", audit.NewValue);
     }
@@ -423,13 +462,14 @@ public class Section3ClinicalHardeningTests
     public async Task Vitals_UnchangedResubmit_DoesNotWriteAnAmendment()
     {
         var db = CreateInMemoryDb();
-        var (doctor, _, appointment, tenantId, _) = SetupClinic(db);
+        var (_, _, appointment, tenantId, clinicId) = SetupClinic(db);
+        var nurse = SeedNurse(db, tenantId, clinicId);
         var controller = new VitalsController(db, NullLogger<VitalsController>.Instance);
-        SetCaller(controller, doctor.Id, "Nurse", tenantId);
+        SetCaller(controller, nurse.Id, "Nurse", tenantId, clinicId);
 
         var request = new RecordVitalsRequest(120, 80, 72, 98.6m, 16, 98, 70m, 170m, 95m, null, null);
-        await controller.RecordVitals(appointment.Id, request, CancellationToken.None);
-        await controller.RecordVitals(appointment.Id, request, CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.RecordVitals(appointment.Id, request, CancellationToken.None));
+        Assert.IsType<OkObjectResult>(await controller.RecordVitals(appointment.Id, request, CancellationToken.None));
 
         Assert.Equal(0, await db.PatientAuditLogs.CountAsync(a => a.FieldName == "VITALS_AMENDED"));
     }

@@ -24,7 +24,7 @@ public class Section5BillingAuditFixesTests
             .UseInMemoryDatabase(databaseName: $"Sec5FixDb_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static ClaimsPrincipal CreateUserPrincipal(Guid userId, Guid tenantId, string role)
@@ -198,8 +198,8 @@ public class Section5BillingAuditFixesTests
 
         var second = await controller.ConfirmPayment(invoice.Id,
             new ConfirmPaymentRequest("cash", 400m, PaymentId: reported.Id), CancellationToken.None);
-        var bad = Assert.IsType<BadRequestObjectResult>(second);
-        Assert.Contains("payment_already_confirmed", bad.Value?.ToString() ?? "");
+        var replay = Assert.IsType<OkObjectResult>(second);
+        Assert.Contains("alreadyConfirmed = True", replay.Value?.ToString() ?? "");
         Assert.Equal(400m, invoice.PaidAmount);
         Assert.Single(db.FinanceLedgerEntries.Where(e => e.ReferenceType == "Payment" && e.ReferenceId == reported.Id));
     }
@@ -285,11 +285,14 @@ public class Section5BillingAuditFixesTests
     {
         var db = CreateInMemoryDb();
         var (tenantId, doctorId, appointmentId) = await SeedClinicAndAppointment(db);
+        var clinicId = (await db.Appointments.FindAsync(appointmentId))!.ClinicId;
+        db.TenantMemberships.Add(new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Receptionist });
         var invoice = MakeInvoice(tenantId, appointmentId, 500m, InvoiceStatus.Draft);
         db.Invoices.Add(invoice);
         await db.SaveChangesAsync();
 
         var controller = CreateInvoicesController(db, doctorId, tenantId, "Receptionist");
+        ((ClaimsIdentity)controller.User.Identity!).AddClaim(new Claim("clinicId", clinicId.ToString()));
         var res = await controller.PrintInvoice(invoice.Id, CancellationToken.None);
 
         var bad = Assert.IsType<BadRequestObjectResult>(res);
@@ -361,6 +364,8 @@ public class Section5BillingAuditFixesTests
     {
         var db = CreateInMemoryDb();
         var (tenantId, doctorId, appointmentId) = await SeedClinicAndAppointment(db);
+        var clinicId = (await db.Appointments.FindAsync(appointmentId))!.ClinicId;
+        db.TenantMemberships.Add(new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Receptionist });
         var invoice = MakeInvoice(tenantId, appointmentId, 800m, InvoiceStatus.Finalized);
 
         db.Invoices.Add(invoice);
@@ -385,6 +390,7 @@ public class Section5BillingAuditFixesTests
                 HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(doctorId, tenantId, "Receptionist") }
             }
         };
+        ((ClaimsIdentity)controller.User.Identity!).AddClaim(new Claim("clinicId", clinicId.ToString()));
 
         var res = await controller.DailyCollection(null, CancellationToken.None);
         var ok = Assert.IsType<OkObjectResult>(res);

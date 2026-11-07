@@ -1,13 +1,12 @@
 using System.ComponentModel.DataAnnotations;
-using System.Security.Claims;
 using System.Security.Cryptography;
-using System.Text;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
+using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -25,19 +24,22 @@ public class AppointmentsController : ControllerBase
     private readonly PrecheckService _precheckService;
     private readonly ITimezoneService _timezoneService;
     private readonly IModuleGateService _moduleGate;
+    private readonly ITenantContext? _tenantContext;
 
     public AppointmentsController(
         HospitalCrmDbContext db,
         INotificationService notificationService,
         PrecheckService precheckService,
         ITimezoneService timezoneService,
-        IModuleGateService moduleGate)
+        IModuleGateService moduleGate,
+        ITenantContext? tenantContext = null)
     {
         _db = db;
         _notificationService = notificationService;
         _precheckService = precheckService;
         _timezoneService = timezoneService;
         _moduleGate = moduleGate;
+        _tenantContext = tenantContext;
     }
 
     [HttpPost]
@@ -47,109 +49,19 @@ public class AppointmentsController : ControllerBase
         if (!DateOnly.TryParse(request.Date, out var appointmentDate))
             return BadRequest(new { error = "invalid_date_format" });
 
-        var patient = await _db.Patients.FindAsync([request.PatientId], ct);
-        if (patient is null)
-            return NotFound(new { error = "patient_not_found" });
-
-        var doctor = await _db.Users.FirstOrDefaultAsync(u => u.Id == request.DoctorId && u.Role == UserRole.Doctor, ct);
-        if (doctor is null)
-            return NotFound(new { error = "doctor_not_found" });
-
-        var clinic = await _db.Clinics
-            .Include(c => c.WorkingHours)
-            .Include(c => c.Holidays)
-            .Include(c => c.SpecialHours)
-            .FirstOrDefaultAsync(c => c.Id == doctor.ClinicId, ct);
-
-        if (clinic is null)
-        {
-            clinic = await _db.Clinics
-                .Include(c => c.WorkingHours)
-                .Include(c => c.Holidays)
-                .Include(c => c.SpecialHours)
-                .FirstOrDefaultAsync(ct);
-        }
-
-        if (clinic is null)
-            return BadRequest(new { error = "no_clinic_configured" });
-
-        // Check if the requested date falls within a holiday range (exact date or recurring annually MM-dd)
-        var requestDate = appointmentDate.ToString("yyyy-MM-dd");
-        var requestMonthDay = appointmentDate.ToString("MM-dd");
-        var isHoliday = clinic.Holidays.Any(h =>
-        {
-            if (h.RecurringAnnually && h.StartDate.Length >= 10 && h.EndDate.Length >= 10)
-            {
-                var startMd = h.StartDate.Substring(5, 5);
-                var endMd = h.EndDate.Substring(5, 5);
-                return string.Compare(requestMonthDay, startMd, StringComparison.Ordinal) >= 0 &&
-                       string.Compare(requestMonthDay, endMd, StringComparison.Ordinal) <= 0;
-            }
-
-            return string.Compare(requestDate, h.StartDate, StringComparison.Ordinal) >= 0 &&
-                   string.Compare(requestDate, h.EndDate, StringComparison.Ordinal) <= 0;
-        });
-
-        if (isHoliday)
-            return BadRequest(new { error = "clinic_closed_on_selected_date" });
-
-        var dayOfWeek = (int)appointmentDate.DayOfWeek;
-
-        // Check if there's a special opening hour override for this date
-        var specialHour = clinic.SpecialHours.FirstOrDefault(s => s.Date == requestDate);
-        if (specialHour is not null)
-        {
-            // Special hours override normal schedule
-            if (string.CompareOrdinal(request.TimeSlot, specialHour.OpenTime) < 0 ||
-                string.CompareOrdinal(request.TimeSlot, specialHour.CloseTime) >= 0)
-            {
-                return BadRequest(new { error = "time_slot_outside_special_working_hours" });
-            }
-        }
-        else
-        {
-            // Use the normal weekly schedule if configured
-            if (clinic.WorkingHours.Any())
-            {
-                var workingShifts = clinic.WorkingHours
-                    .Where(h => h.DayOfWeek == dayOfWeek)
-                    .OrderBy(h => h.ShiftIndex)
-                    .ToList();
-
-                if (workingShifts.Count == 0)
-                    return BadRequest(new { error = "clinic_closed_on_selected_day" });
-
-                // Verify the time slot falls within at least one of the shifts
-                var isInAnyShift = workingShifts.Any(s =>
-                    string.CompareOrdinal(request.TimeSlot, s.OpenTime) >= 0 &&
-                    string.CompareOrdinal(request.TimeSlot, s.CloseTime) < 0);
-
-                if (!isInAnyShift)
-                    return BadRequest(new { error = "time_slot_outside_working_hours" });
-            }
-            else
-            {
-                // Fallback default working hours (08:00 to 20:00) when not explicitly configured
-                if (string.CompareOrdinal(request.TimeSlot, "08:00") < 0 ||
-                    string.CompareOrdinal(request.TimeSlot, "20:00") >= 0)
-                {
-                    return BadRequest(new { error = "time_slot_outside_working_hours" });
-                }
-            }
-        }
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership?.Clinic is not { } clinic || membership.Role == UserRole.Nurse)
+            return Forbid();
 
         var executionStrategy = _db.Database.CreateExecutionStrategy();
-        return await executionStrategy.ExecuteAsync<IActionResult>(async () =>
+        Guid? intentId = null;
+        var result = await executionStrategy.ExecuteAsync<IActionResult>(async () =>
         {
-            await using var transaction = await _db.Database.BeginTransactionAsync(ct);
-            var slotTaken = await _db.Appointments.AnyAsync(a =>
-                a.DoctorId == request.DoctorId &&
-                a.Date == appointmentDate &&
-                a.TimeSlot == request.TimeSlot &&
-                a.Status != AppointmentStatus.Cancelled, ct);
-
-            if (slotTaken)
-                return Conflict(new { error = "slot_already_booked" });
+            await using var transaction = _db.Database.IsRelational() ? await _db.Database.BeginTransactionAsync(ct) : null;
+            var validationError = await ValidateBookingAsync(_db, clinic.TenantId, clinic.Id,
+                request.PatientId, request.DoctorId, appointmentDate, request.TimeSlot, null, ct);
+            if (validationError != null)
+                return BookingError(validationError);
 
             var typeEnum = string.Equals(request.Type, "walkin", StringComparison.OrdinalIgnoreCase)
                 ? AppointmentType.WalkIn
@@ -193,35 +105,20 @@ public class AppointmentsController : ControllerBase
                 if (precheckSubmission is not null)
                 {
                     _db.PrecheckSubmissions.Add(precheckSubmission);
-                    await _db.SaveChangesAsync(ct);
                 }
             }
-            await transaction.CommitAsync(ct);
-
-            // FR-20: notification fire-and-forget after commit. precheckPlaintext is captured
-            // by value in the closure so the scoped DbContext can safely be disposed.
-            // FR-20: WhatsApp confirmation (only with opt-in per DPDP Section 1)
-            var bookedAppointment = appointment;
-            var patient = await _db.Patients.Include(p => p.Consents).FirstOrDefaultAsync(p => p.Id == bookedAppointment.PatientId, ct);
-            var clinicName = clinic.Name;
-            var slotDateTime = bookedAppointment.Date.ToDateTime(TimeOnly.Parse(bookedAppointment.TimeSlot));
-            var hasWhatsAppOptIn = patient?.Consents.Any(c => c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null) ?? false;
+            var hasWhatsAppOptIn = await _db.PatientConsents.AnyAsync(c => c.TenantId == clinic.TenantId &&
+                c.PatientId == appointment.PatientId && c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null, ct);
+            NotificationIntent? intent = null;
             if (hasWhatsAppOptIn)
             {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        var link = precheckPlaintext is null ? null : _precheckService.BuildLink(precheckPlaintext);
-                        if (patient != null)
-                        {
-                            await _notificationService.SendAppointmentConfirmationAsync(
-                                bookedAppointment.Id, patient.Phone, clinicName, slotDateTime, link);
-                        }
-                    }
-                    catch { /* logged inside the service */ }
-                });
+                intent = _notificationService.CreateConfirmationIntent(appointment,
+                    precheckPlaintext is null ? null : _precheckService.BuildLink(precheckPlaintext));
+                _db.Set<NotificationIntent>().Add(intent);
             }
+            await _db.SaveChangesAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
+            intentId = intent?.Id;
 
             return StatusCode(201, new
             {
@@ -230,18 +127,28 @@ public class AppointmentsController : ControllerBase
                 queueToken = (int?)null
             });
         });
+        // Handoff errors must never replay a committed booking through the execution strategy.
+        if (intentId.HasValue)
+        {
+            using var handoff = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            handoff.CancelAfter(TimeSpan.FromSeconds(5));
+            await _notificationService.HandoffConfirmationAsync(intentId.Value, handoff.Token);
+        }
+        return result;
     }
 
     [HttpPost("{id:guid}/check-in")]
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin")]
     public async Task<IActionResult> CheckIn(Guid id, CancellationToken ct)
     {
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null || membership.Role == UserRole.Nurse) return Forbid();
         var executionStrategy = _db.Database.CreateExecutionStrategy();
         return await executionStrategy.ExecuteAsync<IActionResult>(async () =>
         {
             await using var transaction = _db.Database.IsRelational() ? await _db.Database.BeginTransactionAsync(ct) : null;
 
-            var appointment = await _db.Appointments.FindAsync([id], ct);
+            var appointment = await SelectedAppointments(membership).FirstOrDefaultAsync(a => a.Id == id, ct);
             if (appointment is null)
                 return NotFound(new { error = "appointment_not_found" });
 
@@ -270,16 +177,14 @@ public class AppointmentsController : ControllerBase
             if (_db.Database.IsRelational())
             {
                 // Atomic counter per (tenant, doctor, date) via UPDATE RETURNING
-                var counter = await _db.DoctorDailyQueueCounters
-                    .FromSqlInterpolated($@"
+                var tokens = await _db.Database.SqlQuery<int>($@"
                         INSERT INTO ""DoctorDailyQueueCounters"" (""Id"", ""TenantId"", ""DoctorId"", ""Date"", ""LastToken"", ""UpdatedAt"")
                         VALUES ({Guid.NewGuid()}, {appointment.TenantId}, {appointment.DoctorId}, {today}, 1, now())
                         ON CONFLICT (""TenantId"", ""DoctorId"", ""Date"")
                         DO UPDATE SET ""LastToken"" = ""DoctorDailyQueueCounters"".""LastToken"" + 1, ""UpdatedAt"" = now()
-                        RETURNING *")
-                    .AsNoTracking()
-                    .FirstOrDefaultAsync(ct);
-                nextToken = counter?.LastToken ?? 1;
+                        RETURNING ""LastToken"" AS ""Value""")
+                    .ToListAsync(ct);
+                nextToken = tokens.Single();
             }
             else
             {
@@ -313,6 +218,7 @@ public class AppointmentsController : ControllerBase
             appointment.QueueToken = nextToken;
             appointment.QueueTrackingToken = trackingToken;
             appointment.UpdatedAt = DateTimeOffset.UtcNow;
+            appointment.QueueTrackingExpiresAt = appointment.UpdatedAt.AddHours(24);
 
             await _db.SaveChangesAsync(ct);
             if (transaction != null) await transaction.CommitAsync(ct);
@@ -343,11 +249,13 @@ public class AppointmentsController : ControllerBase
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Nurse")]
     public async Task<IActionResult> Update(Guid id, [FromBody] UpdateAppointmentRequest request, CancellationToken ct)
     {
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null) return Forbid();
         var userId = User.GetUserId();
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var appointment = await _db.Appointments.FindAsync([id], ct);
+        var appointment = await SelectedAppointments(membership).FirstOrDefaultAsync(a => a.Id == id, ct);
         if (appointment is null)
             return NotFound(new { error = "appointment_not_found" });
 
@@ -389,6 +297,8 @@ public class AppointmentsController : ControllerBase
             _db.AppointmentHistories.Add(history);
             appointment.Status = newStatus.Value;
             appointment.UpdatedAt = DateTimeOffset.UtcNow;
+            if (appointment.Status is AppointmentStatus.Completed or AppointmentStatus.Cancelled or AppointmentStatus.NoShow)
+                appointment.EndQueueTracking(history.ChangedAt);
 
             await _db.SaveChangesAsync(ct);
         }
@@ -400,10 +310,12 @@ public class AppointmentsController : ControllerBase
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin")]
     public async Task<IActionResult> Reschedule(Guid id, [FromBody] RescheduleAppointmentRequest request, CancellationToken ct)
     {
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null || membership.Role == UserRole.Nurse) return Forbid();
         var userId = User.GetUserId();
         if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var appointment = await _db.Appointments.FindAsync([id], ct);
+        var appointment = await SelectedAppointments(membership).FirstOrDefaultAsync(a => a.Id == id, ct);
         if (appointment is null) return NotFound(new { error = "appointment_not_found" });
 
         if (appointment.Status == AppointmentStatus.Completed ||
@@ -415,15 +327,10 @@ public class AppointmentsController : ControllerBase
         if (!DateOnly.TryParse(request.NewDate, out var newDate))
             return BadRequest(new { error = "invalid_date_format" });
 
-        var slotTaken = await _db.Appointments.AnyAsync(a =>
-            a.DoctorId == appointment.DoctorId &&
-            a.Date == newDate &&
-            a.TimeSlot == request.NewTimeSlot &&
-            a.Id != appointment.Id &&
-            a.Status != AppointmentStatus.Cancelled, ct);
-
-        if (slotTaken)
-            return Conflict(new { error = "slot_already_booked" });
+        var validationError = await ValidateBookingAsync(_db, appointment.TenantId, appointment.ClinicId,
+            appointment.PatientId, appointment.DoctorId, newDate, request.NewTimeSlot, appointment.Id, ct);
+        if (validationError != null)
+            return BookingError(validationError);
 
         _db.AppointmentHistories.Add(new AppointmentHistory
         {
@@ -440,6 +347,7 @@ public class AppointmentsController : ControllerBase
         appointment.TimeSlot = request.NewTimeSlot;
         appointment.QueueToken = null;
         appointment.QueueTrackingToken = null;
+        appointment.QueueTrackingExpiresAt = null;
         appointment.Status = AppointmentStatus.Booked;
         appointment.UpdatedAt = DateTimeOffset.UtcNow;
 
@@ -466,7 +374,9 @@ public class AppointmentsController : ControllerBase
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Nurse")]
     public async Task<IActionResult> List([FromQuery] string? date, [FromQuery] Guid? doctorId, [FromQuery] Guid? patientId, CancellationToken ct)
     {
-        var query = _db.Appointments
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null) return Forbid();
+        var query = SelectedAppointments(membership)
             .Include(a => a.Patient)
             .Include(a => a.Doctor)
             .AsQueryable();
@@ -557,7 +467,9 @@ public class AppointmentsController : ControllerBase
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Nurse")]
     public async Task<IActionResult> UpdatePriority(Guid id, [FromBody] UpdatePriorityRequest request, CancellationToken ct)
     {
-        var appointment = await _db.Appointments.FindAsync([id], ct);
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null) return Forbid();
+        var appointment = await SelectedAppointments(membership).FirstOrDefaultAsync(a => a.Id == id, ct);
         if (appointment is null)
             return NotFound(new { error = "appointment_not_found" });
 
@@ -639,8 +551,14 @@ public class AppointmentsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetPrecheckSubmission(Guid id, CancellationToken ct)
     {
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null || membership.Role is not (UserRole.Doctor or UserRole.ClinicAdmin))
+            return Forbid();
+        if (!await SelectedAppointments(membership).AnyAsync(a => a.Id == id &&
+            (membership.Role == UserRole.ClinicAdmin || a.DoctorId == membership.UserId), ct))
+            return NotFound(new { error = "appointment_not_found" });
         var submission = await _db.PrecheckSubmissions
-            .FirstOrDefaultAsync(s => s.AppointmentId == id, ct);
+            .FirstOrDefaultAsync(s => s.AppointmentId == id && s.TenantId == membership.TenantId, ct);
 
         if (submission is null || submission.SubmittedAt is null)
             return Ok(new { submitted = false });
@@ -658,6 +576,7 @@ public class AppointmentsController : ControllerBase
 
     /// <summary>FR-23-02 — Patient submits pre-check form (unauthenticated, tokenized with DOB verification).</summary>
     [HttpPost("/api/v1/precheck/{token}")]
+    [PublicTokenEndpoint(PublicTokenPurpose.Precheck)]
     [AllowAnonymous]
     [EnableRateLimiting("precheck")]
     [ProducesResponseType(StatusCodes.Status200OK)]
@@ -665,17 +584,22 @@ public class AppointmentsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
     public async Task<IActionResult> SubmitPrecheck(string token, [FromBody] PrecheckSubmissionRequest request, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(token))
+        if (_tenantContext is null || !PublicTokenRouting.IsWellFormed(PublicTokenPurpose.Precheck, token))
             return BadRequest(new { error = "invalid_token" });
 
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+        var binding = await PublicTokenRouting.ResolveAsync(_db, PublicTokenPurpose.Precheck, token, ct);
+        if (binding is null) return BadRequest(new { error = "invalid_token" });
+        using var tenantScope = _tenantContext.PushTenant(binding.TenantId);
+        var hash = token.HashToken();
         var submission = await _db.PrecheckSubmissions
-            .IgnoreQueryFilters()
+            .AsNoTracking()
             .Include(s => s.Appointment)
                 .ThenInclude(a => a.Patient)
-            .FirstOrDefaultAsync(s => s.TokenHash == hash, ct);
+            .FirstOrDefaultAsync(s => s.Id == binding.ResourceId && s.TenantId == binding.TenantId &&
+                s.TokenHash == hash && s.Appointment.TenantId == binding.TenantId &&
+                s.Appointment.Patient.TenantId == binding.TenantId, ct);
 
-        if (submission is null)
+        if (submission?.Appointment?.Patient is null)
             return BadRequest(new { error = "invalid_token" });
 
         if (!await _moduleGate.IsModuleEnabledAsync(submission.TenantId, ModuleRegistry.Precheck, ct))
@@ -685,7 +609,7 @@ public class AppointmentsController : ControllerBase
         if (submission.SubmittedAt is not null)
             return Ok(new { message = "already_submitted" });
 
-        if (DateTimeOffset.UtcNow > submission.ExpiresAt)
+        if (DateTimeOffset.UtcNow >= submission.ExpiresAt)
             return BadRequest(new { error = "token_expired" });
 
         // P2-C1 Identity binding: Verify submitted DOB matches patient record
@@ -700,18 +624,29 @@ public class AppointmentsController : ControllerBase
             }
         }
 
-        submission.SubmittedAt = DateTimeOffset.UtcNow;
-        submission.ChiefComplaint = request.ChiefComplaint;
-        submission.SymptomDuration = request.SymptomDuration;
-        submission.Medications = request.Medications;
-        submission.Allergies = request.Allergies;
-        await _db.SaveChangesAsync(ct);
+        // Conditional update is the single-use boundary, including concurrent submissions.
+        var now = DateTimeOffset.UtcNow;
+        var updated = await _db.PrecheckSubmissions.Where(s => s.Id == binding.ResourceId &&
+                s.TenantId == binding.TenantId && s.TokenHash == hash && s.SubmittedAt == null && s.ExpiresAt > now)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(s => s.SubmittedAt, now)
+                .SetProperty(s => s.ChiefComplaint, request.ChiefComplaint)
+                .SetProperty(s => s.SymptomDuration, request.SymptomDuration)
+                .SetProperty(s => s.Medications, request.Medications)
+                .SetProperty(s => s.Allergies, request.Allergies), ct);
+        if (updated == 0)
+        {
+            var alreadySubmitted = await _db.PrecheckSubmissions.AnyAsync(s => s.Id == binding.ResourceId &&
+                s.TenantId == binding.TenantId && s.TokenHash == hash && s.SubmittedAt != null, ct);
+            return alreadySubmitted ? Ok(new { message = "already_submitted" }) : BadRequest(new { error = "token_expired" });
+        }
 
         return Ok(new { message = "submitted" });
     }
 
     /// <summary>FR-23-02 - Validate a pre-check link without submitting (unauthenticated, same tokenisation).</summary>
     [HttpGet("/api/v1/precheck/{token}")]
+    [PublicTokenEndpoint(PublicTokenPurpose.Precheck)]
     [AllowAnonymous]
     [EnableRateLimiting("precheck")]
     [ProducesResponseType(StatusCodes.Status200OK)]
@@ -719,13 +654,18 @@ public class AppointmentsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
     public async Task<IActionResult> GetPrecheckStatus(string token, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(token))
+        if (_tenantContext is null || !PublicTokenRouting.IsWellFormed(PublicTokenPurpose.Precheck, token))
             return BadRequest(new { error = "invalid_token" });
 
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+        var binding = await PublicTokenRouting.ResolveAsync(_db, PublicTokenPurpose.Precheck, token, ct);
+        if (binding is null) return BadRequest(new { error = "invalid_token" });
+        using var tenantScope = _tenantContext.PushTenant(binding.TenantId);
+        var hash = token.HashToken();
         var submission = await _db.PrecheckSubmissions
-            .IgnoreQueryFilters()
-            .FirstOrDefaultAsync(s => s.TokenHash == hash, ct);
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Id == binding.ResourceId && s.TenantId == binding.TenantId &&
+                s.TokenHash == hash && s.Appointment.TenantId == binding.TenantId &&
+                s.Appointment.Patient.TenantId == binding.TenantId, ct);
 
         if (submission is null)
             return BadRequest(new { error = "invalid_token" });
@@ -737,10 +677,90 @@ public class AppointmentsController : ControllerBase
         if (submission.SubmittedAt is not null)
             return Ok(new { message = "already_submitted" });
 
-        if (DateTimeOffset.UtcNow > submission.ExpiresAt)
+        if (DateTimeOffset.UtcNow >= submission.ExpiresAt)
             return BadRequest(new { error = "token_expired" });
 
         return Ok(new { message = "valid" });
+    }
+
+    private Task<TenantMembership?> SelectedMembershipAsync(CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        if (userId is null || tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty ||
+            !Enum.TryParse<UserRole>(User.GetUserRole(), out var role) ||
+            role is not (UserRole.Receptionist or UserRole.Doctor or UserRole.ClinicAdmin or UserRole.Nurse))
+            return Task.FromResult<TenantMembership?>(null);
+        return _db.TenantMemberships.AsNoTracking().Include(m => m.Clinic).SingleOrDefaultAsync(m =>
+            m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active" &&
+            m.Role == role && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
+    }
+
+    private IQueryable<Appointment> SelectedAppointments(TenantMembership membership) =>
+        _db.Appointments.Where(a => a.TenantId == membership.TenantId && a.ClinicId == membership.ClinicId);
+
+    private IActionResult BookingError(string error) => error switch
+    {
+        "slot_already_booked" => Conflict(new { error }),
+        "patient_not_found" or "doctor_not_found" => NotFound(new { error }),
+        _ => BadRequest(new { error })
+    };
+
+    /// <summary>Shared booking/follow-up safeguards; the caller owns the transaction and unique-slot conflict handling.</summary>
+    public static async Task<string?> ValidateBookingAsync(HospitalCrmDbContext db, Guid tenantId, Guid clinicId,
+        Guid patientId, Guid doctorId, DateOnly date, string timeSlot, Guid? excludingAppointmentId = null,
+        CancellationToken ct = default)
+    {
+        if (tenantId == Guid.Empty || clinicId == Guid.Empty)
+            return "no_clinic_configured";
+        if (!TimeOnly.TryParseExact(timeSlot, "HH:mm", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out _))
+            return "invalid_time_slot";
+        if (!await db.Patients.AnyAsync(p => p.Id == patientId && p.TenantId == tenantId, ct))
+            return "patient_not_found";
+        if (!await db.TenantMemberships.AnyAsync(m => m.UserId == doctorId && m.TenantId == tenantId &&
+            m.ClinicId == clinicId && m.Status == "active" && m.Role == UserRole.Doctor, ct))
+            return "doctor_not_found";
+        var clinic = await db.Clinics.AsNoTracking().Include(c => c.WorkingHours).Include(c => c.Holidays)
+            .Include(c => c.SpecialHours).SingleOrDefaultAsync(c => c.Id == clinicId && c.TenantId == tenantId, ct);
+        if (clinic is null) return "no_clinic_configured";
+
+        var requestDate = date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        var monthDay = date.ToString("MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        var holiday = clinic.Holidays.Any(h =>
+        {
+            if (h.RecurringAnnually && h.StartDate.Length >= 10 && h.EndDate.Length >= 10)
+            {
+                var start = h.StartDate.Substring(5, 5);
+                var end = h.EndDate.Substring(5, 5);
+                return string.CompareOrdinal(start, end) <= 0
+                    ? string.CompareOrdinal(monthDay, start) >= 0 && string.CompareOrdinal(monthDay, end) <= 0
+                    : string.CompareOrdinal(monthDay, start) >= 0 || string.CompareOrdinal(monthDay, end) <= 0;
+            }
+            return string.CompareOrdinal(requestDate, h.StartDate) >= 0 && string.CompareOrdinal(requestDate, h.EndDate) <= 0;
+        });
+        if (holiday) return "clinic_closed_on_selected_date";
+
+        var special = clinic.SpecialHours.FirstOrDefault(s => s.Date == requestDate);
+        if (special != null)
+        {
+            if (string.CompareOrdinal(timeSlot, special.OpenTime) < 0 || string.CompareOrdinal(timeSlot, special.CloseTime) >= 0)
+                return "time_slot_outside_special_working_hours";
+        }
+        else if (clinic.WorkingHours.Count > 0)
+        {
+            var shifts = clinic.WorkingHours.Where(h => h.DayOfWeek == (int)date.DayOfWeek).ToList();
+            if (shifts.Count == 0) return "clinic_closed_on_selected_day";
+            if (!shifts.Any(s => string.CompareOrdinal(timeSlot, s.OpenTime) >= 0 && string.CompareOrdinal(timeSlot, s.CloseTime) < 0))
+                return "time_slot_outside_working_hours";
+        }
+        else if (string.CompareOrdinal(timeSlot, "08:00") < 0 || string.CompareOrdinal(timeSlot, "20:00") >= 0)
+            return "time_slot_outside_working_hours";
+
+        return await db.Appointments.AnyAsync(a => a.TenantId == tenantId && a.ClinicId == clinicId &&
+            a.DoctorId == doctorId && a.Date == date && a.TimeSlot == timeSlot && a.Id != excludingAppointmentId &&
+            a.Status != AppointmentStatus.Cancelled, ct) ? "slot_already_booked" : null;
     }
 }
 

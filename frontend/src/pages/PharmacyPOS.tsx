@@ -1,6 +1,8 @@
-﻿import { useState, useEffect, useRef, useMemo } from 'react'
-import api from '../services/api'
-import { Alert } from '../components/ui/Alert'
+﻿import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
+import { z } from 'zod'
+import api, { getSessionGeneration } from '../services/api'
+import { downloadPdf } from '../services/downloadPdf'
+import { Alert, friendlyError } from '../components/ui/Alert'
 import { Modal } from '../components/ui/Modal'
 
 interface PendingPrescription {
@@ -25,6 +27,8 @@ interface PrescriptionItemDetail {
   duration: number
   durationUnit: string
   totalQuantity: number
+  dispensedQuantity: number
+  remainingQuantity: number
   scheduleClass: string
   isDispensed: boolean
 }
@@ -62,6 +66,7 @@ interface DrugItem {
   totalStock: number
   commonBrands?: string
   earliestBatch?: BatchInfo
+  nextExpiringBatch?: BatchInfo
 }
 
 interface CartItem {
@@ -79,30 +84,98 @@ interface CartItem {
   hsnCode: string
 }
 
-interface CompletedInvoice {
-  invoiceId: string
-  invoiceNumber: string
-  subtotal: number
-  gstAmount: number
-  total: number
+const money = z.number().finite().nonnegative().multipleOf(0.01)
+const savedTime = z.string().datetime({ offset: true })
+const savedInvoice = z.object({
+  idempotencyKey: z.string().min(1), invoiceId: z.string().uuid(), invoiceNumber: z.string().min(1),
+  subtotal: money, gstAmount: money, paidAmount: money, balanceDue: money, createdAt: savedTime,
+  itemCount: z.number().int().positive(),
+})
+const saleSchema = savedInvoice.extend({
+  total: money.positive(), status: z.literal('Paid'), tenderedAmount: money, changeDue: money,
+  paymentMethod: z.enum(['Cash', 'UPI', 'Card', 'NetBanking']), paymentId: z.string().uuid(),
+  paymentReference: z.string().nullable(), paymentStatus: z.literal('Completed'),
+  verificationStatus: z.literal('Confirmed'), confirmedAt: savedTime,
+  items: z.array(z.object({
+    lineItemId: z.string().uuid(), drugBatchId: z.string().uuid(), description: z.string().min(1),
+    quantity: z.number().int().positive(), unitPrice: money.positive(), amount: money, taxAmount: money,
+    grossAmount: money.positive(), gstRate: z.number().min(0).max(28), hsnCode: z.string().nullable(),
+  })).min(1),
+})
+const supplySchema = savedInvoice.extend({
+  dispenseId: z.string().uuid(), prescriptionId: z.string().uuid(), patientName: z.string().min(1),
+  totalAmount: money.positive(), status: z.literal('dispensed'), invoiceStatus: z.literal('Finalized'),
+  items: z.array(z.object({
+    prescriptionItemId: z.string().uuid(), drugId: z.string().uuid(), drugBatchId: z.string().uuid(),
+    batchNumber: z.string().min(1), description: z.string().min(1), quantity: z.number().int().positive(),
+    unitPrice: money.positive(), dispensedQuantity: z.number().int().positive(), remainingQuantity: z.number().int().nonnegative(),
+    substitutedDrugId: z.string().uuid().nullable(), substitutionReason: z.string().nullable(),
+  })).min(1),
+})
+type CompletedInvoice = z.infer<typeof saleSchema>
+type SavedSupply = z.infer<typeof supplySchema>
+interface CheckoutRequest {
+  idempotencyKey: string
+  walkInCustomerName?: string
+  walkInCustomerPhone?: string
+  prescriberName?: string
+  prescriberRegNo?: string
+  paymentMethod: CompletedInvoice['paymentMethod']
+  paymentReference?: string
   tenderedAmount: number
-  changeDue: number
-  paymentMethod: string
-  createdAt: string
-  items: Array<{
-    description: string
-    quantity: number
-    unitPrice: number
-    amount: number
-    gstRate: number
-    hsnCode: string
-  }>
+  items: { drugId: string; drugBatchId: string; quantity: number; unitPrice: number; gstRate: number; hsnCode?: string }[]
+}
+interface SupplyRequest {
+  idempotencyKey: string
+  prescriptionId: string
+  itemSelections: { prescriptionItemId: string; quantity: number }[]
+}
+const cents = (value: number) => Math.round(value * 100)
+
+function validatesSale(result: CompletedInvoice, request: CheckoutRequest): boolean {
+  return result.idempotencyKey === request.idempotencyKey && result.itemCount === request.items.length
+    && result.items.length === request.items.length && new Set(result.items.map(i => i.drugBatchId)).size === result.items.length
+    && result.paymentMethod === request.paymentMethod && (result.paymentReference ?? '') === (request.paymentReference ?? '')
+    && cents(result.total) === cents(result.paidAmount) && result.balanceDue === 0
+    && cents(result.tenderedAmount) === cents(request.tenderedAmount)
+    && cents(result.changeDue) === cents(request.tenderedAmount - result.total)
+    && (request.paymentMethod === 'Cash' || result.changeDue === 0)
+    && cents(result.subtotal + result.gstAmount) === cents(result.total)
+    && cents(result.subtotal) === result.items.reduce((sum, i) => sum + cents(i.amount), 0)
+    && cents(result.gstAmount) === result.items.reduce((sum, i) => sum + cents(i.taxAmount), 0)
+    && result.items.every(item => {
+      const sent = request.items.find(i => i.drugBatchId === item.drugBatchId)
+      return sent && sent.quantity === item.quantity && sent.unitPrice === item.unitPrice && sent.gstRate === item.gstRate
+        && (sent.hsnCode ?? '') === (item.hsnCode ?? '')
+        && cents(item.grossAmount) === cents(item.unitPrice * item.quantity)
+        && cents(item.amount + item.taxAmount) === cents(item.grossAmount)
+        && cents(item.amount) === cents(item.grossAmount / (1 + item.gstRate / 100))
+    })
+}
+
+function validatesSupply(result: SavedSupply, request: SupplyRequest, prescription: LoadedPrescription): boolean {
+  return result.idempotencyKey === request.idempotencyKey && result.prescriptionId === request.prescriptionId
+    && result.itemCount === request.itemSelections.length && result.items.length === request.itemSelections.length
+    && new Set(result.items.map(i => i.prescriptionItemId)).size === result.items.length
+    && result.paidAmount === 0 && cents(result.balanceDue) === cents(result.totalAmount)
+    && cents(result.subtotal + result.gstAmount) === cents(result.totalAmount)
+    && cents(result.totalAmount) === result.items.reduce((sum, i) => sum + cents(i.unitPrice * i.quantity), 0)
+    && result.items.every(item => {
+      const sent = request.itemSelections.find(i => i.prescriptionItemId === item.prescriptionItemId)
+      const original = prescription.items.find(i => i.id === item.prescriptionItemId)
+      return sent && original && sent.quantity === item.quantity && !item.substitutedDrugId && !item.substitutionReason
+        && (!original.drugId || original.drugId === item.drugId)
+        && item.dispensedQuantity === original.dispensedQuantity + sent.quantity
+        && item.remainingQuantity === original.remainingQuantity - sent.quantity
+    })
 }
 
 export default function PharmacyPOS() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<DrugItem[]>([])
   const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [searchAttempt, setSearchAttempt] = useState(0)
   const [cart, setCart] = useState<CartItem[]>([])
 
   // Customer & Prescriber details
@@ -110,8 +183,14 @@ export default function PharmacyPOS() {
   const [customerPhone, setCustomerPhone] = useState('')
   const [prescriberName, setPrescriberName] = useState('')
   const [prescriberRegNo, setPrescriberRegNo] = useState('')
-  const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'Card' | 'UPI'>('Cash')
+  const [paymentMethod, setPaymentMethod] = useState<CompletedInvoice['paymentMethod']>('Cash')
+  const [paymentReference, setPaymentReference] = useState('')
   const [tenderedAmount, setTenderedAmount] = useState<number | ''>('')
+  const saleRequest = useRef<CheckoutRequest | null>(null)
+  const saleBusy = useRef(false)
+  const [saleFrozen, setSaleFrozen] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [documentError, setDocumentError] = useState('')
 
   // Modals & State
   const [submitting, setSubmitting] = useState(false)
@@ -120,6 +199,9 @@ export default function PharmacyPOS() {
   const [activeSubstituteDrug, setActiveSubstituteDrug] = useState<DrugItem | null>(null)
   const [substitutesList, setSubstitutesList] = useState<any[]>([])
   const [loadingSubstitutes, setLoadingSubstitutes] = useState(false)
+  const [substitutesError, setSubstitutesError] = useState('')
+  const [substituteAttempt, setSubstituteAttempt] = useState(0)
+  const closeSubstitutes = useCallback(() => setActiveSubstituteDrug(null), [])
 
   // Dispense Prescription state
   const [dispenseModalOpen, setDispenseModalOpen] = useState(false)
@@ -129,33 +211,59 @@ export default function PharmacyPOS() {
   const [loadedPrescription, setLoadedPrescription] = useState<LoadedPrescription | null>(null)
   const [loadingRxDetail, setLoadingRxDetail] = useState(false)
   const [dispensingRx, setDispensingRx] = useState(false)
-  const [dispenseResult, setDispenseResult] = useState<any | null>(null)
+  const [dispenseResult, setDispenseResult] = useState<SavedSupply | null>(null)
   const [dispenseError, setDispenseError] = useState('')
+  const [supplyQuantities, setSupplyQuantities] = useState<Record<string, number | ''>>({})
+  const supplyRequest = useRef<{ request: SupplyRequest; prescription: LoadedPrescription } | null>(null)
+  const supplyBusy = useRef(false)
+  const [supplyFrozen, setSupplyFrozen] = useState(false)
+  const [suppliedConsultationId, setSuppliedConsultationId] = useState<string | null>(null)
+
+  const closeReceipt = useCallback(() => { setCompletedInvoice(null); setDocumentError('') }, [])
+  const closeDispense = useCallback(() => {
+    if (supplyRequest.current || supplyBusy.current) return
+    setDispenseModalOpen(false)
+    setDispenseResult(null)
+    setLoadedPrescription(null)
+    setDocumentError('')
+  }, [])
+
+  useEffect(() => {
+    if (!saleFrozen && !supplyFrozen) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [saleFrozen, supplyFrozen])
 
   const openDispenseModal = async () => {
+    if (saleRequest.current) return
     setDispenseModalOpen(true)
     setDispenseError('')
     setDispenseResult(null)
     setLoadedPrescription(null)
     setCustomRxId('')
+    setSupplyQuantities({})
+    setDocumentError('')
     setLoadingPendingRx(true)
     try {
       const res = await api.get('/pharmacy/prescriptions/pending')
       setPendingPrescriptions(Array.isArray(res.data) ? res.data : [])
-    } catch {
+    } catch (err) {
       setPendingPrescriptions([])
+      setDispenseError(friendlyError(err))
     } finally {
       setLoadingPendingRx(false)
     }
   }
 
   const loadPrescription = async (rxId: string) => {
-    if (!rxId.trim()) return
+    if (!rxId.trim() || supplyRequest.current || loadingRxDetail) return
     setLoadingRxDetail(true)
     setDispenseError('')
     try {
       const res = await api.get(`/pharmacy/prescriptions/${rxId.trim()}`)
       setLoadedPrescription(res.data)
+      setSupplyQuantities({})
     } catch (err: any) {
       setDispenseError(err.response?.data?.message || err.response?.data?.error || 'Failed to load prescription.')
     } finally {
@@ -164,47 +272,48 @@ export default function PharmacyPOS() {
   }
 
   const handleDispenseSubmit = async () => {
-    if (!loadedPrescription) return
+    if (!loadedPrescription || supplyBusy.current) return
+    if (!supplyRequest.current) {
+      const itemSelections = loadedPrescription.items
+        .filter(item => Number(supplyQuantities[item.id] ?? 0) !== 0)
+        .map(item => ({ prescriptionItemId: item.id, quantity: Number(supplyQuantities[item.id]) }))
+      if (!itemSelections.length) { setDispenseError('Select at least one medicine quantity to supply.'); return }
+      if (itemSelections.some(selection => {
+        const item = loadedPrescription.items.find(i => i.id === selection.prescriptionItemId)!
+        return !Number.isInteger(selection.quantity) || selection.quantity < 1 || selection.quantity > item.remainingQuantity
+          || item.scheduleClass === 'NDPS' || item.isDispensed
+      })) { setDispenseError('Enter whole supply quantities within each medicine’s remaining allowance.'); return }
+      supplyRequest.current = {
+        request: { idempotencyKey: `IDEMP-DISP-${crypto.randomUUID()}`, prescriptionId: loadedPrescription.prescriptionId, itemSelections },
+        prescription: loadedPrescription,
+      }
+      setSupplyFrozen(true)
+    }
+    const { request, prescription } = supplyRequest.current
+    supplyBusy.current = true
     setDispensingRx(true)
     setDispenseError('')
     try {
-      const res = await api.post('/pharmacy/dispense', {
-        prescriptionId: loadedPrescription.prescriptionId,
-        patientName: loadedPrescription.patientName,
-        prescriberName: loadedPrescription.doctorName,
-        prescriberRegNo: loadedPrescription.doctorRegNo
-      })
-      setDispenseResult(res.data)
+      const res = await api.post('/pharmacy/dispense', request)
+      const parsed = supplySchema.safeParse(res.data)
+      if (!parsed.success || !validatesSupply(parsed.data, request, prescription)) {
+        throw new Error('The response does not prove the saved supply. Retry the unchanged request to recover its outcome.')
+      }
+      setDispenseResult(parsed.data)
+      setSuppliedConsultationId(prescription.consultationId)
+      supplyRequest.current = null
+      setSupplyFrozen(false)
       setLoadedPrescription(null)
-      api.get('/pharmacy/prescriptions/pending').then(r => setPendingPrescriptions(r.data || [])).catch(() => {})
-    } catch (err: any) {
-      setDispenseError(err.response?.data?.message || err.response?.data?.error || 'Prescription dispensing failed.')
+    } catch (err) {
+      setDispenseError(friendlyError(err))
     } finally {
+      supplyBusy.current = false
       setDispensingRx(false)
     }
   }
 
   const [defaultCatalog, setDefaultCatalog] = useState<DrugItem[]>([])
   const searchInputRef = useRef<HTMLInputElement>(null)
-
-  const performSearch = async (queryText: string) => {
-    const q = queryText.trim()
-    if (!q) {
-      setSearchResults([])
-      return
-    }
-    setSearching(true)
-    try {
-      const res = await api.get('/pharmacy/drugs', {
-        params: { query: q, inStockOnly: false, pageSize: 20 }
-      })
-      setSearchResults(res.data.drugs || [])
-    } catch (err: any) {
-      console.error('Failed to search drugs', err)
-    } finally {
-      setSearching(false)
-    }
-  }
 
   // Load initial essential catalog on mount & focus input
   useEffect(() => {
@@ -215,8 +324,9 @@ export default function PharmacyPOS() {
           params: { inStockOnly: false, pageSize: 20 }
         })
         setDefaultCatalog(res.data.drugs || [])
-      } catch (err) {
+      } catch (err: any) {
         console.error('Failed to load initial catalog', err)
+        setError(err.response?.data?.message || err.response?.data?.error || 'Failed to load pharmacy catalog. Verify module entitlement and backend connection.')
       }
     }
     loadInitialCatalog()
@@ -224,17 +334,30 @@ export default function PharmacyPOS() {
 
   // Auto search on query debounce
   useEffect(() => {
-    if (!searchQuery.trim()) {
-      setSearchResults([])
-      return
-    }
-
-    const timer = setTimeout(() => {
-      performSearch(searchQuery)
+    const q = searchQuery.trim()
+    setSearchResults([])
+    setSearchError('')
+    setSearching(Boolean(q))
+    if (!q) return
+    const controller = new AbortController()
+    const generation = getSessionGeneration()
+    const isCurrent = () => !controller.signal.aborted && generation === getSessionGeneration()
+    const timer = setTimeout(async () => {
+      if (!isCurrent()) return
+      try {
+        const res = await api.get('/pharmacy/drugs', {
+          params: { query: q, inStockOnly: false, pageSize: 20 }, signal: controller.signal,
+        })
+        if (isCurrent()) setSearchResults(res.data.drugs || [])
+      } catch {
+        if (isCurrent()) setSearchError('Medicine search failed. Try again.')
+      } finally {
+        if (isCurrent()) setSearching(false)
+      }
     }, 150)
 
-    return () => clearTimeout(timer)
-  }, [searchQuery])
+    return () => { clearTimeout(timer); controller.abort() }
+  }, [searchQuery, searchAttempt])
 
   // Cart calculations
   const { subtotal, totalGst, grandTotal, hasScheduleH1 } = useMemo(() => {
@@ -264,6 +387,7 @@ export default function PharmacyPOS() {
 
   // Add drug to cart using FEFO (earliest available batch)
   const addToCart = async (drug: DrugItem) => {
+    if (saleRequest.current) return
     setError('')
     try {
       // Fetch fresh FEFO batches
@@ -276,45 +400,18 @@ export default function PharmacyPOS() {
         mrp: number
       }>
 
-      if (!batches || batches.length === 0) {
-        const fallbackBatch = drug.earliestBatch ? {
-          id: drug.earliestBatch.batchId,
-          batchNumber: drug.earliestBatch.batchNumber,
-          expiryDate: drug.earliestBatch.expiryDate,
-          quantityRemaining: drug.earliestBatch.quantityRemaining || drug.totalStock || 50,
-          mrp: drug.earliestBatch.mrp || drug.indicativeMrp || 45.00
-        } : {
-          id: `batch-${drug.id}-1`,
-          batchNumber: 'BAT-2026-01',
-          expiryDate: '2027-12-31',
-          quantityRemaining: drug.totalStock || 100,
-          mrp: drug.indicativeMrp || 50.00
-        }
-
-        setCart(prev => [
-          ...prev,
-          {
-            drugId: drug.id,
-            drugName: drug.name,
-            genericName: drug.genericName,
-            scheduleClass: drug.scheduleClass,
-            batchId: fallbackBatch.id,
-            batchNumber: fallbackBatch.batchNumber,
-            expiryDate: fallbackBatch.expiryDate,
-            quantity: 1,
-            maxStock: fallbackBatch.quantityRemaining,
-            unitPrice: fallbackBatch.mrp,
-            gstRate: drug.gstRate || 12,
-            hsnCode: drug.hsnCode || '30049099'
-          }
-        ])
-        setSearchQuery('')
-        setSearchResults([])
-        searchInputRef.current?.focus()
+      if (saleRequest.current) return
+      const resolvedBatch = Array.isArray(batches) ? batches[0] : null
+      if (!resolvedBatch || !Number.isInteger(resolvedBatch.quantityRemaining) || resolvedBatch.quantityRemaining <= 0) {
+        setError(`No current sellable batch for "${drug.name}". Refresh stock before selling.`)
+        return
+      }
+      if (!money.positive().safeParse(resolvedBatch.mrp).success || !z.number().min(0).max(28).safeParse(drug.gstRate).success) {
+        setError('The current batch price or catalogue GST rate is invalid. Correct the catalogue before selling.')
         return
       }
 
-      const fefoBatch = batches[0] // Earliest non-expired batch
+      const fefoBatch = resolvedBatch
 
       // Check if already in cart
       const existingIndex = cart.findIndex(c => c.batchId === fefoBatch.id)
@@ -339,8 +436,8 @@ export default function PharmacyPOS() {
             quantity: 1,
             maxStock: fefoBatch.quantityRemaining,
             unitPrice: fefoBatch.mrp,
-            gstRate: drug.gstRate || 12,
-            hsnCode: drug.hsnCode || '30049099'
+            gstRate: drug.gstRate,
+            hsnCode: drug.hsnCode ?? ''
           }
         ])
       }
@@ -354,6 +451,7 @@ export default function PharmacyPOS() {
   }
 
   const updateQuantity = (index: number, newQty: number) => {
+    if (saleRequest.current || !Number.isInteger(newQty)) return
     if (newQty <= 0) {
       removeFromCart(index)
       return
@@ -371,36 +469,48 @@ export default function PharmacyPOS() {
   }
 
   const removeFromCart = (index: number) => {
+    if (saleRequest.current) return
     setCart(prev => prev.filter((_, idx) => idx !== index))
   }
 
   const clearCart = () => {
+    if (saleRequest.current) return
     setCart([])
     setCustomerName('')
     setCustomerPhone('')
     setPrescriberName('')
     setPrescriberRegNo('')
     setTenderedAmount('')
+    setPaymentReference('')
     setError('')
   }
 
   // Find Generic Molecule Substitutes
-  const openSubstitutes = async (drug: DrugItem) => {
-    setActiveSubstituteDrug(drug)
+  useEffect(() => {
+    if (!activeSubstituteDrug) return
+    const controller = new AbortController()
+    const generation = getSessionGeneration()
+    const isCurrent = () => !controller.signal.aborted && generation === getSessionGeneration()
     setLoadingSubstitutes(true)
     setSubstitutesList([])
-    try {
-      const res = await api.get(`/pharmacy/substitutes/${drug.id}`)
-      setSubstitutesList(res.data.substitutes || [])
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setLoadingSubstitutes(false)
+    setSubstitutesError('')
+    const loadSubstitutes = async () => {
+      try {
+        const res = await api.get(`/pharmacy/substitutes/${activeSubstituteDrug.id}`, { signal: controller.signal })
+        if (isCurrent()) setSubstitutesList(res.data.substitutes || [])
+      } catch {
+        if (isCurrent()) setSubstitutesError('Unable to load substitutes. Try again.')
+      } finally {
+        if (isCurrent()) setLoadingSubstitutes(false)
+      }
     }
-  }
+    loadSubstitutes()
+    return () => controller.abort()
+  }, [activeSubstituteDrug, substituteAttempt])
 
   // Handle POS Checkout
   const handleCheckout = async () => {
+    if (saleBusy.current) return
     if (cart.length === 0) {
       setError('Cart is empty.')
       return
@@ -417,40 +527,69 @@ export default function PharmacyPOS() {
       }
     }
 
+    if (!saleRequest.current && paymentMethod !== 'Cash' && !paymentReference.trim()) {
+      setError('Enter the actual bank / card receipt reference before recording an electronic payment.')
+      return
+    }
+    const tender = paymentMethod === 'Cash' && typeof tenderedAmount === 'number' ? tenderedAmount : grandTotal
+    if (!saleRequest.current && (!money.safeParse(tender).success || tender < grandTotal)) {
+      setError('Cash tendered must cover the total and use at most two decimal places.')
+      return
+    }
+
     setError('')
     setSubmitting(true)
+    saleBusy.current = true
 
-    const payload = {
+    const payload: CheckoutRequest = saleRequest.current ?? {
+      idempotencyKey: `IDEMP-INV-${crypto.randomUUID()}`,
       walkInCustomerName: customerName.trim() || 'Walk-in Customer',
       walkInCustomerPhone: (customerPhone.replace(/\D/g, '').slice(-10)) || undefined,
       prescriberName: prescriberName.trim() || undefined,
       prescriberRegNo: prescriberRegNo.trim() || undefined,
       paymentMethod,
-      tenderedAmount: typeof tenderedAmount === 'number' ? tenderedAmount : grandTotal,
+      paymentReference: paymentMethod === 'Cash' ? undefined : paymentReference.trim(),
+      tenderedAmount: tender,
       items: cart.map(c => ({
         drugId: c.drugId,
         drugBatchId: c.batchId,
         quantity: c.quantity,
         unitPrice: c.unitPrice,
         gstRate: c.gstRate,
-        hsnCode: c.hsnCode
+        hsnCode: c.hsnCode || undefined
       }))
     }
+    // shortcut: retry evidence lives for this page lifetime; reconcile unresolved requests before leaving.
+    saleRequest.current = payload
+    setSaleFrozen(true)
 
     try {
       const res = await api.post('/pharmacy/checkout', payload)
-      setCompletedInvoice(res.data)
+      const parsed = saleSchema.safeParse(res.data)
+      if (!parsed.success || !validatesSale(parsed.data, payload)) {
+        throw new Error('The response does not prove the saved sale. Retry the unchanged request to recover its receipt.')
+      }
+      setCompletedInvoice(parsed.data)
+      setDocumentError('')
+      saleRequest.current = null
+      setSaleFrozen(false)
       clearCart()
-    } catch (err: any) {
+    } catch (err) {
       // No receipt without a persisted invoice: a failed checkout must never print a document.
-      setError(err.response?.data?.message || err.response?.data?.error || 'Checkout transaction failed.')
+      setError(friendlyError(err))
     } finally {
+      saleBusy.current = false
       setSubmitting(false)
     }
   }
 
-  const printReceipt = () => {
-    window.print()
+  const downloadDocument = async (path: string, filename: string) => {
+    if (downloading) return
+    setDownloading(true)
+    setDocumentError('')
+    try { await downloadPdf(path, filename) }
+    catch (err) { setDocumentError(friendlyError(err)) }
+    finally { setDownloading(false) }
   }
 
   return (
@@ -477,6 +616,7 @@ export default function PharmacyPOS() {
           <button
             type="button"
             onClick={openDispenseModal}
+            disabled={saleFrozen}
             className="btn btn-primary btn-sm flex items-center gap-1.5 cursor-pointer"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -486,6 +626,7 @@ export default function PharmacyPOS() {
           </button>
           <button
             onClick={() => clearCart()}
+            disabled={saleFrozen}
             className="btn btn-secondary btn-sm"
           >
             Clear Cart
@@ -494,15 +635,16 @@ export default function PharmacyPOS() {
       </div>
 
       {error && <Alert variant="error" onDismiss={() => setError('')}>{error}</Alert>}
+      {saleFrozen && <p role="status" className="alert alert-warning">This sale’s outcome is unresolved. Keep this page open and retry the unchanged sale before starting another transaction.</p>}
 
       {/* ── Main Layout: POS Cart on Right, Drug Search on Left ── */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         
         {/* Left Column: Drug Search & Catalog Selector (7 Cols) */}
         <div className="lg:col-span-7 space-y-4">
-          <div className="card p-4 space-y-3">
+          <fieldset disabled={saleFrozen} className="card p-4 space-y-3 min-w-0">
             <div className="flex items-center justify-between">
-              <label className="form-label">
+              <label htmlFor="medicine-search" className="form-label">
                 Search Medicine / Salt / Barcode
               </label>
               <span className="text-[11px] text-slate-400 font-mono font-medium">
@@ -513,6 +655,7 @@ export default function PharmacyPOS() {
             <div className="search-wrap">
               <input
                 ref={searchInputRef}
+                id="medicine-search"
                 type="text"
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
@@ -525,7 +668,7 @@ export default function PharmacyPOS() {
                 </svg>
               </div>
               {searching && (
-                <div className="absolute right-3.5 top-3">
+                <div role="status" aria-label="Searching medicines" className="absolute right-3.5 top-3">
                   <span className="spinner spinner-sm" />
                 </div>
               )}
@@ -544,7 +687,7 @@ export default function PharmacyPOS() {
                 <button
                   key={chip.label}
                   type="button"
-                  onClick={() => { setSearchQuery(chip.query); performSearch(chip.query) }}
+                  onClick={() => { setSearchQuery(chip.query); setSearchAttempt(attempt => attempt + 1) }}
                   className={`btn btn-sm ${searchQuery === chip.query ? 'btn-primary' : 'btn-secondary'}`}
                 >
                   {chip.label}
@@ -556,6 +699,15 @@ export default function PharmacyPOS() {
             {(() => {
               const displayList = searchQuery.trim() ? searchResults : defaultCatalog
               const isSearchMode = Boolean(searchQuery.trim())
+
+              if (isSearchMode && searchError) {
+                return <div className="space-y-3">
+                  <Alert variant="error">{searchError}</Alert>
+                  <button type="button" className="btn btn-secondary" onClick={() => setSearchAttempt(attempt => attempt + 1)}>
+                    Retry search
+                  </button>
+                </div>
+              }
 
               if (isSearchMode && searchResults.length === 0 && !searching) {
                 return (
@@ -624,7 +776,7 @@ export default function PharmacyPOS() {
 
                             <div className="flex items-center gap-1.5">
                               <button
-                                onClick={() => openSubstitutes(drug)}
+                                onClick={() => setActiveSubstituteDrug(drug)}
                                 className="btn btn-secondary btn-sm"
                                 title="Find Bio-Equivalent Generic Substitutes"
                               >
@@ -649,7 +801,7 @@ export default function PharmacyPOS() {
                 </div>
               )
             })()}
-          </div>
+          </fieldset>
 
           {/* Quick Category / Prescription Helper info */}
           <div className="card p-4">
@@ -667,6 +819,7 @@ export default function PharmacyPOS() {
         {/* Right Column: Billing POS Cart & Tender (5 Cols) */}
         <div className="lg:col-span-5 space-y-4">
           <div className="card p-5 space-y-4">
+            <fieldset disabled={saleFrozen} className="space-y-4 min-w-0">
             <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
               <h2 className="text-sm font-bold flex items-center gap-2 tracking-tight text-[var(--color-text)]">
                 <span>Current Order Cart</span>
@@ -710,6 +863,7 @@ export default function PharmacyPOS() {
                       <div className="flex items-center border rounded-lg overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
                         <button
                           onClick={() => updateQuantity(idx, item.quantity - 1)}
+                          aria-label={`Decrease quantity for ${item.drugName}`}
                           className="btn btn-ghost btn-sm"
                         >
                           -
@@ -719,6 +873,7 @@ export default function PharmacyPOS() {
                         </span>
                         <button
                           onClick={() => updateQuantity(idx, item.quantity + 1)}
+                          aria-label={`Increase quantity for ${item.drugName}`}
                           className="btn btn-ghost btn-sm"
                         >
                           +
@@ -744,8 +899,9 @@ export default function PharmacyPOS() {
             <div className="border-t pt-3 space-y-2.5" style={{ borderColor: 'var(--color-border)' }}>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="form-label">Patient / Customer</label>
+                  <label htmlFor="sale-customer" className="form-label">Patient / Customer</label>
                   <input
+                    id="sale-customer"
                     type="text"
                     value={customerName}
                     onChange={e => setCustomerName(e.target.value)}
@@ -754,8 +910,9 @@ export default function PharmacyPOS() {
                   />
                 </div>
                 <div>
-                  <label className="form-label">Mobile Number</label>
+                  <label htmlFor="sale-phone" className="form-label">Mobile Number</label>
                   <input
+                    id="sale-phone"
                     type="tel"
                     value={customerPhone}
                     onChange={e => setCustomerPhone(e.target.value)}
@@ -776,8 +933,9 @@ export default function PharmacyPOS() {
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     <div>
-                      <label className="form-label">Prescribing Doctor *</label>
+                      <label htmlFor="sale-prescriber" className="form-label">Prescribing Doctor *</label>
                       <input
+                        id="sale-prescriber"
                         type="text"
                         value={prescriberName}
                         onChange={e => setPrescriberName(e.target.value)}
@@ -786,8 +944,9 @@ export default function PharmacyPOS() {
                       />
                     </div>
                     <div>
-                      <label className="form-label">Doctor Reg # *</label>
+                      <label htmlFor="sale-registration" className="form-label">Doctor Reg # *</label>
                       <input
+                        id="sale-registration"
                         type="text"
                         value={prescriberRegNo}
                         onChange={e => setPrescriberRegNo(e.target.value)}
@@ -817,16 +976,17 @@ export default function PharmacyPOS() {
 
               {/* Payment Method Selector */}
               <div className="pt-2">
-                <label className="form-label">Payment Rail</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {(['Cash', 'UPI', 'Card'] as const).map(method => (
+                <p className="form-label">Payment method</p>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" role="group" aria-label="Payment method">
+                  {(['Cash', 'UPI', 'Card', 'NetBanking'] as const).map(method => (
                     <button
                       key={method}
                       type="button"
-                      onClick={() => setPaymentMethod(method)}
+                      onClick={() => { setPaymentMethod(method); setPaymentReference('') }}
+                      aria-pressed={paymentMethod === method}
                       className={`btn btn-sm cursor-pointer ${paymentMethod === method ? 'btn-primary' : 'btn-secondary'}`}
                     >
-                      {method === 'Cash' ? '💵 Cash' : method === 'UPI' ? '⚡ UPI QR' : '💳 Card'}
+                      {method}
                     </button>
                   ))}
                 </div>
@@ -835,9 +995,12 @@ export default function PharmacyPOS() {
               {paymentMethod === 'Cash' && (
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   <div>
-                    <label className="form-label">Cash Tendered</label>
+                    <label htmlFor="sale-tender" className="form-label">Cash tendered</label>
                     <input
+                      id="sale-tender"
                       type="number"
+                      min={grandTotal}
+                      step="0.01"
                       value={tenderedAmount}
                       onChange={e => setTenderedAmount(e.target.value ? parseFloat(e.target.value) : '')}
                       placeholder={grandTotal.toFixed(2)}
@@ -845,7 +1008,7 @@ export default function PharmacyPOS() {
                     />
                   </div>
                   <div>
-                    <label className="form-label">Change Return</label>
+                    <p className="form-label">Change return</p>
                     <div className="form-input mono mt-1 font-semibold text-[var(--color-success-text)]">
                       ₹{typeof tenderedAmount === 'number' && tenderedAmount > grandTotal
                         ? (tenderedAmount - grandTotal).toFixed(2)
@@ -854,7 +1017,16 @@ export default function PharmacyPOS() {
                   </div>
                 </div>
               )}
+              {paymentMethod !== 'Cash' && (
+                <div>
+                  <label htmlFor="sale-reference" className="form-label">Bank / card receipt reference</label>
+                  <input id="sale-reference" className="form-input" value={paymentReference} maxLength={256}
+                    onChange={e => setPaymentReference(e.target.value)} autoComplete="off" />
+                  <p className="text-xs text-[var(--color-text-muted)]">Record the reference from the clinic’s confirmed receipt.</p>
+                </div>
+              )}
             </div>
+            </fieldset>
 
             {/* Checkout Action Button */}
             <button
@@ -868,7 +1040,7 @@ export default function PharmacyPOS() {
                   Generating Invoice & Receipt…
                 </>
               ) : (
-                `Complete Sale · ₹${grandTotal.toFixed(2)}`
+                `${saleFrozen ? 'Retry unchanged sale' : 'Complete Sale'} · ₹${grandTotal.toFixed(2)}`
               )}
             </button>
           </div>
@@ -877,26 +1049,19 @@ export default function PharmacyPOS() {
 
       {/* ── Generic Substitutes Modal ── */}
       {activeSubstituteDrug && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
-          <div className="card max-w-xl w-full p-6 space-y-4">
-            <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
-              <div>
-                <h3 className="text-base font-bold text-[var(--color-text)]">Generic Molecule Substitutes</h3>
-                <p className="text-xs text-[var(--color-text-muted)]">
-                  Showing alternative brands for <strong className="text-[var(--color-text)]">{activeSubstituteDrug.name}</strong> ({activeSubstituteDrug.genericName})
-                </p>
-              </div>
-              <button
-                onClick={() => setActiveSubstituteDrug(null)}
-                className="btn btn-ghost btn-sm"
-              >
-                ✕
-              </button>
-            </div>
-
+        <Modal open onClose={closeSubstitutes} title="Generic Molecule Substitutes"
+          description={`Showing alternative brands for ${activeSubstituteDrug.name} (${activeSubstituteDrug.genericName})`} size="md">
             {loadingSubstitutes ? (
-              <div className="py-8 text-center text-sm text-[var(--color-text-muted)]">
+              <div role="status" className="py-8 text-center text-sm text-[var(--color-text-muted)]">
                 <span className="spinner spinner-md" /> Searching generic salt equivalents…
+              </div>
+            ) : substitutesError ? (
+              <div className="space-y-3">
+                <Alert variant="error">{substitutesError}</Alert>
+                <button type="button" disabled={saleFrozen} className="btn btn-secondary"
+                  onClick={() => setSubstituteAttempt(attempt => attempt + 1)}>
+                  Retry substitutes
+                </button>
               </div>
             ) : substitutesList.length === 0 ? (
               <div className="empty-state">
@@ -915,10 +1080,10 @@ export default function PharmacyPOS() {
                     </div>
 
                     <button
-                      disabled={!sub.inStock}
+                      disabled={saleFrozen || !sub.inStock}
                       onClick={() => {
                         addToCart(sub)
-                        setActiveSubstituteDrug(null)
+                        closeSubstitutes()
                       }}
                       className="btn btn-primary btn-sm"
                     >
@@ -928,47 +1093,16 @@ export default function PharmacyPOS() {
                 ))}
               </div>
             )}
-          </div>
-        </div>
+        </Modal>
       )}
 
       {/* ── Thermal Receipt & Invoice Print Preview Modal ── */}
       {completedInvoice && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm print:p-0 print:bg-white">
-          <div className="card max-w-md w-full p-6 space-y-4 print:border-none print:shadow-none print:w-full">
-            
-            {/* Header / Actions (Hidden in Print) */}
-            <div className="flex items-center justify-between border-b pb-3 print:hidden" style={{ borderColor: 'var(--color-border)' }}>
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-                <h3 className="font-bold text-sm text-[var(--color-text)]">Sale Completed</h3>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={printReceipt}
-                  className="btn btn-primary btn-sm"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H7a2 2 0 00-2 2v4h10z" />
-                  </svg>
-                  Print Receipt
-                </button>
-                <button
-                  onClick={() => setCompletedInvoice(null)}
-                  className="btn btn-ghost btn-sm"
-                >
-                  ✕
-                </button>
-              </div>
-            </div>
-
-            {/* 80mm Printable Thermal Slip Format */}
+        <Modal open onClose={closeReceipt} title="Saved sale receipt"
+          description="Original confirmed collection. Later refunds are recorded separately in billing." size="lg">
+          <div className="space-y-4">
+            {documentError && <Alert variant="error">{documentError}</Alert>}
             <div className="mono text-xs space-y-2 border p-4 rounded bg-[var(--color-surface-raised)] text-[var(--color-text)] print:bg-white print:border-none print:p-0" style={{ borderColor: 'var(--color-border)' }}>
-              <div className="text-center space-y-0.5 border-b border-dashed pb-2" style={{ borderColor: 'var(--color-border)' }}>
-                <p className="font-bold text-sm tracking-wide">SAMSTACK HEALTHCARE PHARMACY</p>
-                <p className="text-[10px] text-[var(--color-text-muted)]">DL No: — • GSTIN: —</p>
-                <p className="text-[10px] text-[var(--color-text-muted)]">Tax Invoice / Cash Receipt</p>
-              </div>
 
               <div className="flex justify-between text-[11px] pt-1">
                 <span>Invoice: <strong>{completedInvoice.invoiceNumber}</strong></span>
@@ -976,6 +1110,9 @@ export default function PharmacyPOS() {
               </div>
               <div className="text-[11px]">
                 <span>Tender: {completedInvoice.paymentMethod}</span>
+                {completedInvoice.paymentReference && <p>Reference: {completedInvoice.paymentReference}</p>}
+                <p>Payment: {completedInvoice.paymentId}</p>
+                <p>Confirmed: {new Date(completedInvoice.confirmedAt).toLocaleString('en-IN')}</p>
               </div>
 
               <div className="border-t border-b border-dashed py-1.5 space-y-1" style={{ borderColor: 'var(--color-border)' }}>
@@ -983,14 +1120,14 @@ export default function PharmacyPOS() {
                   <span className="col-span-6">Item (Batch)</span>
                   <span className="col-span-2 text-center">Qty</span>
                   <span className="col-span-2 text-right">Price</span>
-                  <span className="col-span-2 text-right">Amt</span>
+                  <span className="col-span-2 text-right">Gross amount</span>
                 </div>
                 {completedInvoice.items.map((it, idx) => (
                   <div key={idx} className="grid grid-cols-12 text-[10px]">
                     <span className="col-span-6 truncate">{it.description}</span>
                     <span className="col-span-2 text-center">{it.quantity}</span>
                     <span className="col-span-2 text-right">₹{it.unitPrice.toFixed(2)}</span>
-                    <span className="col-span-2 text-right">₹{it.amount.toFixed(2)}</span>
+                    <span className="col-span-2 text-right">₹{it.grossAmount.toFixed(2)}</span>
                   </div>
                 ))}
               </div>
@@ -1016,36 +1153,38 @@ export default function PharmacyPOS() {
                 )}
               </div>
 
-              <div className="text-center text-[9px] text-[var(--color-text-muted)] border-t border-dashed pt-2" style={{ borderColor: 'var(--color-border)' }}>
-                <p>Thank you for choosing us! Get well soon.</p>
-                <p>Prescription drugs sold under licensed pharmacist supervision.</p>
-              </div>
             </div>
 
-            {/* Modal Bottom Close */}
-            <div className="pt-2 flex justify-end print:hidden">
+            <div className="pt-2 flex flex-wrap justify-end gap-2">
+              <button disabled={downloading} className="btn btn-primary"
+                onClick={() => downloadDocument(`/invoices/${completedInvoice.invoiceId}/pdf`, `${completedInvoice.invoiceNumber}.pdf`)}>
+                {downloading ? 'Downloading invoice…' : 'Download invoice PDF'}
+              </button>
               <button
-                onClick={() => setCompletedInvoice(null)}
-                className="btn btn-secondary w-full"
+                onClick={closeReceipt}
+                className="btn btn-secondary"
               >
                 New Transaction
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {/* ── Prescription Dispense Modal ── */}
       {dispenseModalOpen && (
         <Modal
           open={dispenseModalOpen}
-          onClose={() => { setDispenseModalOpen(false); setDispenseResult(null); setLoadedPrescription(null); }}
-          title={dispenseResult ? "Prescription Dispensed Successfully" : loadedPrescription ? `Dispense Rx for ${loadedPrescription.patientName}` : "Clinical Prescription Dispense"}
-          description={dispenseResult ? "Finalized pharmacy sales invoice generated and linked to clinic ledger." : "Review doctor prescription, verify medicine schedules, and dispense with automatic billing."}
+          onClose={closeDispense}
+          persistent={supplyFrozen || dispensingRx}
+          title={dispenseResult ? 'Supply recorded' : loadedPrescription ? `Dispense Rx for ${loadedPrescription.patientName}` : 'Clinical Prescription Dispense'}
+          description={dispenseResult ? 'Finalized invoice saved. No payment receipt was recorded.' : 'Review remaining medicines and enter the quantities being supplied.'}
           size="lg"
         >
           <div className="space-y-4 text-xs">
             {dispenseError && <Alert variant="error" onDismiss={() => setDispenseError('')}>{dispenseError}</Alert>}
+            {documentError && <Alert variant="error">{documentError}</Alert>}
+            {supplyFrozen && <p role="status" className="alert alert-warning">Keep this page open. Retry the unchanged supply to recover its saved outcome.</p>}
 
             {dispenseResult ? (
               <div className="space-y-4">
@@ -1056,29 +1195,34 @@ export default function PharmacyPOS() {
                   </div>
                   <div className="grid grid-cols-2 gap-2 text-xs pt-1">
                     <div><span className="text-emerald-700 font-medium">Patient:</span> {dispenseResult.patientName}</div>
-                    <div><span className="text-emerald-700 font-medium">Total Amount:</span> ₹{Number(dispenseResult.totalAmount || 0).toFixed(2)}</div>
-                    <div><span className="text-emerald-700 font-medium">Items Dispensed:</span> {dispenseResult.itemCount || 0}</div>
-                    <div><span className="text-emerald-700 font-medium">Balance Due:</span> ₹{Number(dispenseResult.balanceDue || 0).toFixed(2)}</div>
+                    <div><span className="text-emerald-700 font-medium">Total Amount:</span> ₹{dispenseResult.totalAmount.toFixed(2)}</div>
+                    <div><span className="text-emerald-700 font-medium">Items Dispensed:</span> {dispenseResult.itemCount}</div>
+                    <div><span className="text-emerald-700 font-medium">Balance Due:</span> ₹{dispenseResult.balanceDue.toFixed(2)}</div>
                   </div>
                 </div>
+                <ul className="space-y-2">
+                  {dispenseResult.items.map(item => <li key={item.prescriptionItemId}>
+                    <strong>{item.description}</strong> · Batch: {item.batchNumber} · Supplied now: {item.quantity}
+                    <p>Supplied total: {item.dispensedQuantity} · Remaining: {item.remainingQuantity}</p>
+                  </li>)}
+                </ul>
 
                 <div className="pt-3 border-t border-[var(--color-border)] flex justify-end gap-2">
-                  {dispenseResult.prescriptionId && (
-                    <a
-                      href={`/api/v1/prescriptions/${dispenseResult.prescriptionId}/pdf`}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                  {suppliedConsultationId && (
+                    <button
+                      disabled={downloading}
+                      onClick={() => downloadDocument(`/consultations/${suppliedConsultationId}/prescription/pdf`, 'prescription.pdf')}
                       className="btn btn-secondary btn-sm flex items-center gap-1.5"
                     >
                       <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                       </svg>
-                      Print Prescription PDF
-                    </a>
+                      {downloading ? 'Downloading prescription…' : 'Download prescription PDF'}
+                    </button>
                   )}
                   <button
                     type="button"
-                    onClick={() => { setDispenseModalOpen(false); setDispenseResult(null); }}
+                    onClick={closeDispense}
                     className="btn btn-primary btn-sm cursor-pointer"
                   >
                     Done
@@ -1110,7 +1254,7 @@ export default function PharmacyPOS() {
                   <h4 className="font-semibold text-slate-900 text-xs">Prescribed Medicines ({loadedPrescription.items.length})</h4>
                   <div className="card divide-y border-slate-200 overflow-hidden">
                     {loadedPrescription.items.map((it) => (
-                      <div key={it.id} className="p-3 flex items-center justify-between hover:bg-[var(--color-surface-hover)]">
+                      <div key={it.id} className="p-3 flex flex-wrap gap-4 items-center justify-between hover:bg-[var(--color-surface-hover)]">
                         <div>
                           <div className="flex items-center gap-2">
                             <span className="font-semibold text-slate-900">{it.brandName ? `${it.brandName} (${it.genericName})` : it.genericName}</span>
@@ -1124,12 +1268,18 @@ export default function PharmacyPOS() {
                           <p className="text-slate-500 text-[11px] mt-0.5 font-mono">
                             Dose: {it.frequency} for {it.duration} {it.durationUnit} • Total Units: {it.totalQuantity}
                           </p>
+                          <p>Supplied: {it.dispensedQuantity} of {it.totalQuantity} · Remaining: {it.remainingQuantity}</p>
                         </div>
                         <div>
                           {it.isDispensed ? (
                             <span className="badge badge-success">ALREADY DISPENSED</span>
                           ) : (
-                            <span className="badge badge-neutral">PENDING</span>
+                            <div>
+                              <label htmlFor={`supply-${it.id}`} className="form-label">Supply quantity for {it.brandName || it.genericName}</label>
+                              <input id={`supply-${it.id}`} className="form-input w-28" type="number" min="0" max={it.remainingQuantity} step="1"
+                                disabled={supplyFrozen || it.scheduleClass === 'NDPS'} value={supplyQuantities[it.id] ?? ''}
+                                onChange={e => setSupplyQuantities(previous => ({ ...previous, [it.id]: e.target.value === '' ? '' : Number(e.target.value) }))} />
+                            </div>
                           )}
                         </div>
                       </div>
@@ -1141,6 +1291,7 @@ export default function PharmacyPOS() {
                   <button
                     type="button"
                     onClick={() => setLoadedPrescription(null)}
+                    disabled={supplyFrozen}
                     className="btn btn-secondary btn-sm cursor-pointer"
                   >
                     ← Back to List
@@ -1148,18 +1299,19 @@ export default function PharmacyPOS() {
                   <div className="flex gap-2">
                     <button
                       type="button"
-                      onClick={() => setDispenseModalOpen(false)}
+                      onClick={closeDispense}
+                      disabled={supplyFrozen}
                       className="btn btn-secondary btn-sm cursor-pointer"
                     >
                       Cancel
                     </button>
                     <button
                       type="button"
-                      disabled={dispensingRx || loadedPrescription.items.some(i => i.scheduleClass === 'NDPS')}
+                      disabled={dispensingRx}
                       onClick={handleDispenseSubmit}
                       className="btn btn-primary btn-sm cursor-pointer"
                     >
-                      {dispensingRx ? 'Dispensing & Billing…' : 'Confirm Dispense & Invoice'}
+                      {dispensingRx ? 'Dispensing & Billing…' : supplyFrozen ? 'Retry unchanged supply' : 'Confirm Dispense & Invoice'}
                     </button>
                   </div>
                 </div>
@@ -1167,10 +1319,11 @@ export default function PharmacyPOS() {
             ) : (
               <div className="space-y-4">
                 <div className="space-y-2">
-                  <label className="form-label">Lookup Prescription by ID</label>
+                  <label htmlFor="prescription-lookup" className="form-label">Lookup Prescription by ID</label>
                   <div className="flex gap-2">
                     <input
                       type="text"
+                      id="prescription-lookup"
                       placeholder="Paste prescription UUID (e.g. 3fa85f64-5717-4562-b3fc-2c963f66afa6)..."
                       value={customRxId}
                       onChange={e => setCustomRxId(e.target.value)}
@@ -1209,6 +1362,7 @@ export default function PharmacyPOS() {
                           </div>
                           <button
                             type="button"
+                            disabled={loadingRxDetail}
                             onClick={() => loadPrescription(rx.prescriptionId)}
                             className="btn btn-secondary btn-xs cursor-pointer"
                           >

@@ -7,160 +7,99 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Hospital_CRM.Api.Services;
 
-/// <summary>
-/// MOD-13 (FR-13-03): evaluates active notification rules on a schedule and fires
-/// notifications. Idempotent: checks NotificationLog for a matching RuleId + AppointmentId
-/// pair before sending, so a job restart doesn't double-send.
-/// </summary>
-public class NotificationRulesWorker : BackgroundService
+public sealed class NotificationRulesWorker(IServiceScopeFactory scopes, ILogger<NotificationRulesWorker> logger) : BackgroundService
 {
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly ILogger<NotificationRulesWorker> _logger;
-    private readonly PeriodicTimer _timer;
-
-    public NotificationRulesWorker(
-        IServiceScopeFactory scopeFactory,
-        ILogger<NotificationRulesWorker> logger)
-    {
-        _scopeFactory = scopeFactory;
-        _logger = logger;
-        // Phase 1 single-tenant: default 5 min. Configurable later.
-        _timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
-    }
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Notification rules worker started");
-
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
         try
         {
-            while (await _timer.WaitForNextTickAsync(stoppingToken))
+            while (await timer.WaitForNextTickAsync(stoppingToken))
             {
                 try { await EvaluateAsync(stoppingToken); }
-                catch (Exception ex) { _logger.LogError(ex, "Error evaluating notification rules"); }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { throw; }
+                catch (Exception ex) { logger.LogError("Notification rule cycle failed: {FailureType}", ex.GetType().Name); }
             }
         }
-        catch (OperationCanceledException)
-        {
-            // Normal shutdown: PeriodicTimer.WaitForNextTickAsync throws on cancellation.
-        }
-        finally
-        {
-            _timer.Dispose();
-        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
     }
 
-    private async Task EvaluateAsync(CancellationToken ct)
+    public async Task EvaluateAsync(CancellationToken ct)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
-        var notifier = scope.ServiceProvider.GetRequiredService<INotificationService>();
-        var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
-
-        // B2/F4: this previously hardcoded Guid.Empty, so no tenant's rules ever fired.
-        // Evaluate each tenant under its own pushed context so RLS and the EF query
-        // filter see exactly one tenant's rows.
-        var tenantIds = await db.Tenants.Select(t => t.Id).ToListAsync(ct);
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-
+        List<Guid> tenantIds;
+        using (var inventory = scopes.CreateScope())
+        {
+            var context = inventory.ServiceProvider.GetRequiredService<ITenantContext>();
+            using var maintenance = context.PushMaintenance();
+            var db = inventory.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
+            tenantIds = await db.Tenants.AsNoTracking().Select(t => t.Id).ToListAsync(ct);
+        }
         foreach (var tenantId in tenantIds)
         {
-            using var tenantScope = tenantContext.PushTenant(tenantId);
-
-            var activeRules = await db.NotificationRules
-                .Include(r => r.Template)
-                .Where(r => r.Active)
-                .ToListAsync(ct);
-
-            foreach (var rule in activeRules)
+            ct.ThrowIfCancellationRequested();
+            using var scope = scopes.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+            using var tenantScope = context.PushTenant(tenantId);
+            var db = scope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
+            var notifier = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            // Confirmation intent is committed with booking, even if the request dies before enqueue.
+            var pending = await db.Set<NotificationIntent>().AsNoTracking().Where(i =>
+                i.TenantId == tenantId && i.HandedOffAt == null).OrderBy(i => i.CreatedAt)
+                .Select(i => i.Id).ToListAsync(ct);
+            foreach (var intentId in pending)
             {
+                ct.ThrowIfCancellationRequested();
+                await notifier.HandoffConfirmationAsync(intentId, ct);
+            }
+            var timezones = scope.ServiceProvider.GetRequiredService<ITimezoneService>();
+            var rules = await db.NotificationRules.AsNoTracking().Where(r => r.TenantId == tenantId && r.Active).ToListAsync(ct);
+            foreach (var rule in rules)
+            {
+                if (rule.RuleType == NotificationRuleType.RemindIfNoVisitNMonths)
+                {
+                    logger.LogWarning("Notification rule {RuleId} disabled: no_visit_policy_pending", rule.Id);
+                    continue;
+                }
+                // Booking owns confirmations, ReminderSchedulerService owns the default reminder.
+                if (rule.RuleType != NotificationRuleType.RemindNDaysBefore) continue;
                 try
                 {
-                    await EvaluateRuleAsync(db, notifier, rule, today, ct);
+                    var daysBefore = GetDaysBefore(rule.TimingConfigJson);
+                    if (!daysBefore.HasValue)
+                    {
+                        logger.LogWarning("Notification rule {RuleId} disabled: invalid_days_before", rule.Id);
+                        continue;
+                    }
+                    var clinics = await db.Clinics.AsNoTracking().Where(c => c.TenantId == tenantId).ToListAsync(ct);
+                    foreach (var clinic in clinics)
+                    {
+                        var today = timezones.GetClinicToday(clinic.Timezone);
+                        if (daysBefore.Value > DateOnly.MaxValue.DayNumber - today.DayNumber) continue;
+                        var targetDate = today.AddDays(daysBefore.Value);
+                        var appointments = await db.Appointments.AsNoTracking().Where(a => a.TenantId == tenantId &&
+                            a.ClinicId == clinic.Id && a.Date == targetDate && a.Status == AppointmentStatus.Booked &&
+                            a.Patient.TenantId == tenantId && a.Patient.Consents.Any(c => c.TenantId == tenantId &&
+                                c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null))
+                            .Select(a => new { a.Id, a.PatientId }).ToListAsync(ct);
+                        foreach (var appointment in appointments)
+                            await notifier.SendRuleAsync(appointment.PatientId, appointment.Id, rule.Id, ct);
+                    }
                 }
-                catch (Exception ex) { _logger.LogError(ex, "Error evaluating rule {RuleId} for tenant {TenantId}", rule.Id, tenantId); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception ex) { logger.LogError("Notification rule {RuleId} for tenant {TenantId} failed: {FailureType}", rule.Id, tenantId, ex.GetType().Name); }
             }
         }
     }
 
-    private async Task EvaluateRuleAsync(
-        HospitalCrmDbContext db, INotificationService notifier, NotificationRule rule, DateOnly today, CancellationToken ct)
+    internal static int? GetDaysBefore(string timingConfig)
     {
-        var cfg = JsonSerializer.Deserialize<JsonElement>(rule.TimingConfigJson);
-
-        switch (rule.RuleType)
+        try
         {
-            case NotificationRuleType.RemindNDaysBefore:
-                if (!cfg.TryGetProperty("daysBefore", out var daysBeforeProp))
-                    return;
-                var daysBefore = daysBeforeProp.GetInt32();
-                var targetDate = today.AddDays(daysBefore);
-                await FireForAppointmentsOnAsync(db, notifier, rule, targetDate, ct);
-                break;
-
-            case NotificationRuleType.RemindIfNoVisitNMonths:
-                if (!cfg.TryGetProperty("months", out var monthsProp))
-                    return;
-                var months = monthsProp.GetInt32();
-                var cutoff = today.AddMonths(-months);
-                var lastVisitCutoff = today.AddDays(-30); // give a 30-day grace
-                var patientsDue = await db.Patients
-                    .Where(p => !db.Appointments.Any(a => a.PatientId == p.Id && a.Date >= lastVisitCutoff))
-                    .Take(100)
-                    .ToListAsync(ct);
-                _logger.LogInformation("Rule {RuleId} matched {Count} patients with no visit in {Months} months",
-                    rule.Id, patientsDue.Count, months);
-                break;
-
-            // Phase 1 defaults: appointment_confirmation and appointment_reminder
-            // are already handled by the booking flow and ReminderSchedulerService.
-            // They exist as rule types so admins can configure message templates,
-            // but the system continues to fire them via the Phase 1 path.
-            case NotificationRuleType.AppointmentConfirmation:
-            case NotificationRuleType.AppointmentReminder:
-                break;
+            using var config = JsonDocument.Parse(timingConfig);
+            return config.RootElement.ValueKind == JsonValueKind.Object &&
+                config.RootElement.TryGetProperty("daysBefore", out var days) && days.ValueKind == JsonValueKind.Number &&
+                days.TryGetInt32(out var value) && value >= 0 ? value : null;
         }
-    }
-
-    private async Task FireForAppointmentsOnAsync(
-        HospitalCrmDbContext db, INotificationService notifier, NotificationRule rule, DateOnly date, CancellationToken ct)
-    {
-        var appointments = await db.Appointments
-            .Include(a => a.Patient)
-            .Include(a => a.Clinic)
-            .Where(a => a.Date == date && a.Status == AppointmentStatus.Booked)
-            .ToListAsync(ct);
-
-        foreach (var appt in appointments)
-        {
-            // Idempotency: skip if this rule already fired for this appointment today
-            var alreadyFired = await db.NotificationLogs.AnyAsync(n =>
-                n.RuleId == rule.Id &&
-                n.AppointmentId == appt.Id &&
-                n.SentAt >= DateTimeOffset.UtcNow.Date, ct);
-            if (alreadyFired) continue;
-
-            var content = rule.Template.Content
-                .Replace("{{patient_name}}", appt.Patient.Name)
-                .Replace("{{clinic_name}}", appt.Clinic.Name)
-                .Replace("{{date}}", appt.Date.ToString("yyyy-MM-dd"))
-                .Replace("{{time}}", appt.TimeSlot);
-
-            var log = new NotificationLog
-            {
-                Id = Guid.NewGuid(),
-                AppointmentId = appt.Id,
-                Channel = rule.Template.Channel,
-                Template = rule.Template.Name,
-                Status = NotificationStatus.Sent,
-                SentAt = DateTimeOffset.UtcNow,
-                RuleId = rule.Id
-            };
-            db.NotificationLogs.Add(log);
-            await db.SaveChangesAsync(ct);
-
-            _logger.LogInformation("Rule {RuleId} fired for appointment {Id} -> {Phone}: {Content}",
-                rule.Id, appt.Id, appt.Patient.Phone, content);
-        }
+        catch (JsonException) { return null; }
     }
 }
