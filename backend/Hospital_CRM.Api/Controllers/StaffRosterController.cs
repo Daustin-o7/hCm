@@ -90,13 +90,12 @@ public class StaffRosterController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse")]
     public async Task<IActionResult> ListTemplates(CancellationToken ct)
     {
-        var tenantId = User.GetTenantId();
         var caller = await GetCallerAsync(ct);
         if (caller?.ClinicId is null) return Forbid();
 
         var templates = await _db.ShiftTemplates
             .AsNoTracking()
-            .Where(t => t.ClinicId == caller.ClinicId && (!tenantId.HasValue || t.TenantId == tenantId.Value) && t.IsActive)
+            .Where(t => t.ClinicId == caller.ClinicId && t.TenantId == caller.TenantId && t.IsActive)
             .OrderBy(t => t.StartTime)
             .ToListAsync(ct);
 
@@ -108,14 +107,13 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> CreateTemplate([FromBody] CreateShiftTemplateRequest request, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.ClinicAdmin);
         if (caller?.ClinicId is null) return Forbid();
-        var tenantId = User.GetTenantId() ?? caller.TenantId ?? Guid.Empty;
 
         var template = new ShiftTemplate
         {
             Id = Guid.NewGuid(),
-            TenantId = tenantId,
+            TenantId = caller.TenantId,
             ClinicId = caller.ClinicId.Value,
             Name = request.Name.Trim(),
             StartTime = request.StartTime.Trim(),
@@ -142,9 +140,8 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> CreateRoster([FromBody] CreateRosterRequest request, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.ClinicAdmin);
         if (caller?.ClinicId is null) return Forbid();
-        var tenantId = User.GetTenantId() ?? caller.TenantId ?? Guid.Empty;
 
         if (request.StartDate > request.EndDate)
             return BadRequest(new { error = "start_date_must_be_before_end_date" });
@@ -152,14 +149,14 @@ public class StaffRosterController : ControllerBase
         var roster = new StaffRoster
         {
             Id = Guid.NewGuid(),
-            TenantId = tenantId,
+            TenantId = caller.TenantId,
             ClinicId = caller.ClinicId.Value,
             Title = request.Title.Trim(),
             StartDate = request.StartDate,
             EndDate = request.EndDate,
             Status = RosterStatus.Draft,
             CreatedAt = DateTimeOffset.UtcNow,
-            CreatedBy = caller.Id
+            CreatedBy = caller.UserId
         };
 
         _db.StaffRosters.Add(roster);
@@ -173,12 +170,11 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> PublishRoster(Guid id, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.ClinicAdmin);
         if (caller?.ClinicId is null) return Forbid();
 
         var roster = await _db.StaffRosters
-            .Include(r => r.Shifts)
-            .FirstOrDefaultAsync(r => r.Id == id && r.ClinicId == caller.ClinicId, ct);
+            .FirstOrDefaultAsync(r => r.Id == id && r.TenantId == caller.TenantId && r.ClinicId == caller.ClinicId, ct);
 
         if (roster is null) return NotFound(new { error = "roster_not_found" });
         if (roster.Status != RosterStatus.Draft)
@@ -186,12 +182,12 @@ public class StaffRosterController : ControllerBase
 
         roster.Status = RosterStatus.Published;
         roster.PublishedAt = DateTimeOffset.UtcNow;
-        roster.PublishedBy = caller.Id;
+        roster.PublishedBy = caller.UserId;
 
         // Shifts posted through /shifts carry no RosterId; adopt this window's shifts so
         // publishing is what makes them part of the roster (and lockable later).
         var unrostered = await _db.NurseShifts
-            .Where(s => s.ClinicId == caller.ClinicId && s.RosterId == null &&
+            .Where(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId && s.RosterId == null &&
                 s.Date >= roster.StartDate && s.Date <= roster.EndDate)
             .ToListAsync(ct);
 
@@ -200,7 +196,7 @@ public class StaffRosterController : ControllerBase
 
         await _db.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Roster {RosterId} published by {CallerId}", id, caller.Id);
+        _logger.LogInformation("Roster {RosterId} published by {CallerId}", id, caller.UserId);
         return Ok(new { id = roster.Id, status = roster.Status.ToString(), publishedAt = roster.PublishedAt });
     }
 
@@ -209,12 +205,12 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> LockRoster(Guid id, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.ClinicAdmin);
         if (caller?.ClinicId is null) return Forbid();
 
         var roster = await _db.StaffRosters
-            .Include(r => r.Shifts)
-            .FirstOrDefaultAsync(r => r.Id == id && r.ClinicId == caller.ClinicId, ct);
+            .Include(r => r.Shifts.Where(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId))
+            .FirstOrDefaultAsync(r => r.Id == id && r.TenantId == caller.TenantId && r.ClinicId == caller.ClinicId, ct);
 
         if (roster is null) return NotFound(new { error = "roster_not_found" });
         if (roster.Status != RosterStatus.Published)
@@ -222,9 +218,9 @@ public class StaffRosterController : ControllerBase
 
         roster.Status = RosterStatus.Locked;
         roster.LockedAt = DateTimeOffset.UtcNow;
-        roster.LockedBy = caller.Id;
+        roster.LockedBy = caller.UserId;
 
-        foreach (var shift in roster.Shifts)
+        foreach (var shift in roster.Shifts.Where(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId))
         {
             shift.IsLocked = true;
         }
@@ -242,7 +238,7 @@ public class StaffRosterController : ControllerBase
 
         var rosters = await _db.StaffRosters
             .AsNoTracking()
-            .Where(r => r.ClinicId == caller.ClinicId)
+            .Where(r => r.TenantId == caller.TenantId && r.ClinicId == caller.ClinicId)
             .OrderByDescending(r => r.StartDate)
             .Select(r => new
             {
@@ -251,7 +247,7 @@ public class StaffRosterController : ControllerBase
                 startDate = r.StartDate,
                 endDate = r.EndDate,
                 status = r.Status.ToString(),
-                shiftCount = r.Shifts.Count,
+                shiftCount = r.Shifts.Count(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId),
                 publishedAt = r.PublishedAt,
                 lockedAt = r.LockedAt
             })
@@ -269,20 +265,27 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> RequestShiftChange([FromBody] RequestShiftChangeRequest request, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.Nurse);
         if (caller?.ClinicId is null) return Forbid();
 
-        var myProfile = await _db.NurseProfiles
-            .FirstOrDefaultAsync(p => p.UserId == caller.Id && p.User.ClinicId == caller.ClinicId, ct);
+        var profiles = NursingScope.Profiles(_db, caller);
+        var myProfile = await profiles.FirstOrDefaultAsync(p => p.UserId == caller.UserId, ct);
         if (myProfile is null) return Forbid();
 
         var myShift = await _db.NurseShifts
-            .FirstOrDefaultAsync(s => s.Id == request.RequesterShiftId && s.NurseProfileId == myProfile.Id, ct);
+            .FirstOrDefaultAsync(s => s.Id == request.RequesterShiftId && s.TenantId == caller.TenantId &&
+                s.ClinicId == caller.ClinicId && s.NurseProfileId == myProfile.Id, ct);
         if (myShift is null)
             return NotFound(new { error = "requester_shift_not_found" });
 
         if (myShift.IsLocked)
             return Conflict(new { error = "shift_is_locked_in_finalized_roster" });
+
+        if (request.TargetNurseProfileId.HasValue && !await profiles.AnyAsync(p => p.Id == request.TargetNurseProfileId, ct))
+            return NotFound(new { error = "nurse_not_found" });
+        if (request.TargetShiftId.HasValue && !await _db.NurseShifts.AnyAsync(s => s.Id == request.TargetShiftId &&
+            s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId && s.NurseProfileId == request.TargetNurseProfileId, ct))
+            return NotFound(new { error = "target_shift_not_found" });
 
         // If DirectSwap, validate target shift and target nurse
         if (request.RequestType == ShiftChangeType.DirectSwap)
@@ -294,9 +297,12 @@ public class StaffRosterController : ControllerBase
                 return BadRequest(new { error = "cannot_swap_with_yourself" });
 
             var targetShift = await _db.NurseShifts
-                .FirstOrDefaultAsync(s => s.Id == request.TargetShiftId.Value && s.NurseProfileId == request.TargetNurseProfileId.Value, ct);
+                .FirstOrDefaultAsync(s => s.Id == request.TargetShiftId.Value && s.TenantId == caller.TenantId &&
+                    s.ClinicId == caller.ClinicId && s.NurseProfileId == request.TargetNurseProfileId.Value, ct);
             if (targetShift is null)
                 return NotFound(new { error = "target_shift_not_found" });
+            if (targetShift.IsLocked)
+                return Conflict(new { error = "shift_is_locked_in_finalized_roster" });
         }
 
         var changeRequest = new ShiftChangeRequest
@@ -330,20 +336,22 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> AcceptShiftChange(Guid id, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.Nurse);
         if (caller?.ClinicId is null) return Forbid();
 
-        var myProfile = await _db.NurseProfiles
-            .FirstOrDefaultAsync(p => p.UserId == caller.Id && p.User.ClinicId == caller.ClinicId, ct);
+        var myProfile = await NursingScope.Profiles(_db, caller)
+            .FirstOrDefaultAsync(p => p.UserId == caller.UserId, ct);
         if (myProfile is null) return Forbid();
 
         var swap = await _db.ShiftChangeRequests
             .Include(s => s.RequesterShift)
-            .FirstOrDefaultAsync(s => s.Id == id && s.ClinicId == caller.ClinicId, ct);
+            .FirstOrDefaultAsync(s => s.Id == id && s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId, ct);
 
         if (swap is null) return NotFound(new { error = "swap_request_not_found" });
         if (swap.Status != ShiftChangeStatus.Requested)
             return Conflict(new { error = "swap_not_in_requested_status" });
+
+        if (!await ValidSwapPartiesAsync(swap, caller, ct)) return Forbid();
 
         // For open cover, target nurse claims the shift
         if (swap.RequestType == ShiftChangeType.OpenCover)
@@ -362,7 +370,7 @@ public class StaffRosterController : ControllerBase
 
         // Re-validate against double-assignment!
         var hasConflict = await _db.NurseShifts
-            .AnyAsync(s => s.NurseProfileId == myProfile.Id &&
+            .AnyAsync(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId && s.NurseProfileId == myProfile.Id &&
                 s.Date == swap.RequesterShift.Date &&
                 s.ShiftType == swap.RequesterShift.ShiftType &&
                 s.Status == ShiftStatus.Assigned, ct);
@@ -384,9 +392,14 @@ public class StaffRosterController : ControllerBase
         var caller = await GetCallerAsync(ct);
         if (caller?.ClinicId is null) return Forbid();
 
+        var profiles = NursingScope.Profiles(_db, caller);
         var query = _db.ShiftChangeRequests
             .AsNoTracking()
-            .Where(s => s.ClinicId == caller.ClinicId);
+            .Where(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId &&
+                profiles.Any(n => n.Id == s.RequesterNurseProfileId) &&
+                (s.TargetNurseProfileId == null || profiles.Any(n => n.Id == s.TargetNurseProfileId)) &&
+                s.RequesterShift.TenantId == caller.TenantId && s.RequesterShift.ClinicId == caller.ClinicId &&
+                (s.TargetShift == null || (s.TargetShift.TenantId == caller.TenantId && s.TargetShift.ClinicId == caller.ClinicId)));
 
         if (!string.IsNullOrWhiteSpace(status) && Enum.TryParse<ShiftChangeStatus>(status, true, out var parsed))
             query = query.Where(s => s.Status == parsed);
@@ -419,23 +432,24 @@ public class StaffRosterController : ControllerBase
     [RequireModule(ModuleRegistry.StaffRoster)]
     public async Task<IActionResult> ClaimOpenShift(Guid id, CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.Nurse);
         if (caller?.ClinicId is null) return Forbid();
 
         var shift = await _db.NurseShifts
-            .FirstOrDefaultAsync(s => s.Id == id && s.ClinicId == caller.ClinicId, ct);
+            .FirstOrDefaultAsync(s => s.Id == id && s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId, ct);
 
         if (shift is null) return NotFound(new { error = "open_shift_not_found" });
-        if (shift.Status != ShiftStatus.Open && shift.NurseProfileId is not null)
+        if (shift.Status != ShiftStatus.Open || shift.NurseProfileId is not null)
             return Conflict(new { error = "shift_not_open" });
+        if (shift.IsLocked) return Conflict(new { error = "shift_is_locked_in_finalized_roster" });
         if (shift.Date < DateOnly.FromDateTime(DateTime.UtcNow))
             return Conflict(new { error = "shift_already_in_the_past" });
 
-        var myProfile = await _db.NurseProfiles
-            .FirstOrDefaultAsync(p => p.UserId == caller.Id && p.User.ClinicId == caller.ClinicId, ct);
+        var myProfile = await NursingScope.Profiles(_db, caller)
+            .FirstOrDefaultAsync(p => p.UserId == caller.UserId, ct);
         if (myProfile is null) return Forbid();
 
-        if (await HasDoubleAssignmentAsync(myProfile.Id, shift.Date, shift.ShiftType, shift.Id, ct))
+        if (await HasDoubleAssignmentAsync(caller.TenantId, caller.ClinicId.Value, myProfile.Id, shift.Date, shift.ShiftType, shift.Id, ct))
             return Conflict(new { error = "double_assignment_conflict_detected" });
 
         // A claim still needs head-nurse/admin approval, so it enters the workflow as Accepted.
@@ -474,7 +488,7 @@ public class StaffRosterController : ControllerBase
         var swap = await _db.ShiftChangeRequests
             .Include(s => s.RequesterShift)
             .Include(s => s.TargetShift)
-            .FirstOrDefaultAsync(s => s.Id == id && s.ClinicId == caller.ClinicId, ct);
+            .FirstOrDefaultAsync(s => s.Id == id && s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId, ct);
 
         if (swap is null) return NotFound(new { error = "swap_request_not_found" });
         if (swap.Status != ShiftChangeStatus.Accepted)
@@ -483,35 +497,30 @@ public class StaffRosterController : ControllerBase
         // Check authority proxy or admin rights
         Guid? approvedOnBehalfOf = null;
 
+        var myProfileId = await _db.NurseProfiles.Where(p => p.TenantId == caller.TenantId && p.UserId == caller.UserId)
+            .Select(p => (Guid?)p.Id).FirstOrDefaultAsync(ct);
+        if (IsSwapParty(swap, myProfileId))
+            return BadRequest(new { error = "cannot_approve_own_swap_request" });
+
         if (caller.Role == UserRole.Nurse)
         {
-            var myProfile = await _db.NurseProfiles
-                .FirstOrDefaultAsync(p => p.UserId == caller.Id && p.User.ClinicId == caller.ClinicId, ct);
-
             // Must have active authority proxy delegation with roster.approve permission
-            var activeProxy = await _db.AuthorityProxies
-                .FirstOrDefaultAsync(p => p.DesigneeUserId == caller.Id &&
-                    p.ClinicId == caller.ClinicId &&
-                    !p.IsRevoked &&
-                    p.ValidFrom <= DateTimeOffset.UtcNow &&
-                    p.ValidUntil >= DateTimeOffset.UtcNow &&
-                    p.Permissions.Contains("roster.approve"), ct);
+            var activeProxy = await NursingScope.ActiveProxyAsync(_db, caller, "roster.approve", ct);
 
             if (activeProxy is null)
                 return Forbid();
 
             // Neither the acting approver nor the person they act for may decide their own swap.
             var delegatorProfile = await _db.NurseProfiles
-                .FirstOrDefaultAsync(p => p.UserId == activeProxy.DelegatorUserId, ct);
-
-            if (IsSwapParty(swap, myProfile?.Id))
-                return BadRequest(new { error = "cannot_approve_own_swap_request" });
+                .FirstOrDefaultAsync(p => p.TenantId == caller.TenantId && p.UserId == activeProxy.DelegatorUserId, ct);
 
             if (IsSwapParty(swap, delegatorProfile?.Id))
                 return BadRequest(new { error = "cannot_approve_on_behalf_of_swap_participant" });
 
             approvedOnBehalfOf = activeProxy.DelegatorUserId;
         }
+
+        if (!await ValidSwapPartiesAsync(swap, caller, ct)) return Forbid();
 
         // Re-validate at approval: a shift can be taken by either nurse between accept and
         // approve, so the accept-time check alone would silently create a double assignment.
@@ -550,7 +559,7 @@ public class StaffRosterController : ControllerBase
             swap.Status = ShiftChangeStatus.Applied;
             swap.ApprovedAt = DateTimeOffset.UtcNow;
             swap.AppliedAt = DateTimeOffset.UtcNow;
-            swap.ApprovedByUserId = caller.Id;
+            swap.ApprovedByUserId = caller.UserId;
             swap.ApprovedOnBehalfOfUserId = approvedOnBehalfOf;
 
             await _db.SaveChangesAsync(ct);
@@ -558,14 +567,14 @@ public class StaffRosterController : ControllerBase
                 await tx.CommitAsync(ct);
 
             _logger.LogInformation("ShiftChangeRequest {SwapId} approved & applied by {CallerId} (OnBehalfOf: {OnBehalfOf})",
-                swap.Id, caller.Id, approvedOnBehalfOf);
+                swap.Id, caller.UserId, approvedOnBehalfOf);
 
             return Ok(new
             {
                 id = swap.Id,
                 status = swap.Status.ToString(),
                 appliedAt = swap.AppliedAt,
-                approvedBy = caller.Name,
+                approvedBy = caller.User.Name,
                 approvedOnBehalfOf = approvedOnBehalfOf,
                 restGapWarnings
             });
@@ -588,9 +597,9 @@ public class StaffRosterController : ControllerBase
         var openShifts = await _db.NurseShifts
             .AsNoTracking()
             .Include(s => s.ShiftTemplate)
-            .Where(s => s.ClinicId == caller.ClinicId &&
+            .Where(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId &&
                 s.Date >= DateOnly.FromDateTime(DateTime.UtcNow) &&
-                (s.Status == ShiftStatus.Open || s.NurseProfileId == null))
+                s.Status == ShiftStatus.Open && s.NurseProfileId == null && !s.IsLocked)
             .OrderBy(s => s.Date)
             .Select(s => new
             {
@@ -598,7 +607,8 @@ public class StaffRosterController : ControllerBase
                 date = s.Date,
                 shiftType = s.ShiftType.ToString(),
                 stationOrWard = s.StationOrWard,
-                templateName = s.ShiftTemplate != null ? s.ShiftTemplate.Name : null,
+                templateName = s.ShiftTemplate != null && s.ShiftTemplate.TenantId == caller.TenantId &&
+                    s.ShiftTemplate.ClinicId == caller.ClinicId ? s.ShiftTemplate.Name : null,
                 notes = s.Notes,
                 durationHours = s.DurationHours
             })
@@ -621,9 +631,13 @@ public class StaffRosterController : ControllerBase
         if (request.StartDate > request.EndDate)
             return BadRequest(new { error = "start_date_must_be_before_end_date" });
 
+        if (!await NursingScope.Profiles(_db, caller).AnyAsync(p => p.Id == request.NurseProfileId &&
+            (caller.Role != UserRole.Nurse || p.UserId == caller.UserId), ct))
+            return NotFound(new { error = "nurse_not_found" });
+
         var assignedShifts = await _db.NurseShifts
             .AsNoTracking()
-            .Where(s => s.ClinicId == caller.ClinicId &&
+            .Where(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId &&
                 s.NurseProfileId == request.NurseProfileId &&
                 s.Date >= request.StartDate &&
                 s.Date <= request.EndDate &&
@@ -635,7 +649,7 @@ public class StaffRosterController : ControllerBase
         // single-nurse OPD triage station do not have the same gap.
         var requiredCoverage = await _db.ShiftTemplates
             .AsNoTracking()
-            .Where(t => t.ClinicId == caller.ClinicId)
+            .Where(t => t.TenantId == caller.TenantId && t.ClinicId == caller.ClinicId)
             .ToDictionaryAsync(t => t.Id, t => t.RequiredCoverage, ct);
 
         var impacts = new List<object>();
@@ -643,7 +657,7 @@ public class StaffRosterController : ControllerBase
         foreach (var shift in assignedShifts)
         {
             var totalAssignedOnShift = await _db.NurseShifts
-                .CountAsync(s => s.ClinicId == caller.ClinicId &&
+                .CountAsync(s => s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId &&
                     s.Date == shift.Date &&
                     s.ShiftType == shift.ShiftType &&
                     s.Status == ShiftStatus.Assigned, ct);
@@ -683,7 +697,7 @@ public class StaffRosterController : ControllerBase
         [FromBody] CreateAuthorityProxyRequest request,
         CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.ClinicAdmin);
         if (caller?.ClinicId is null) return Forbid();
 
         // Delegation is an admin act: a nurse naming themselves delegator was a
@@ -699,11 +713,9 @@ public class StaffRosterController : ControllerBase
         if (request.DesigneeUserId == request.DelegatorUserId)
             return BadRequest(new { error = "cannot_delegate_to_yourself" });
 
-        var parties = await _db.Users
-            .Where(u => (u.Id == request.DelegatorUserId || u.Id == request.DesigneeUserId) &&
-                u.ClinicId == caller.ClinicId &&
-                (u.Role == UserRole.ClinicAdmin || u.Role == UserRole.Nurse))
-            .Select(u => u.Id)
+        var parties = await NursingScope.ProxyParties(_db, caller)
+            .Where(m => m.UserId == request.DelegatorUserId || m.UserId == request.DesigneeUserId)
+            .Select(m => m.UserId).Distinct()
             .ToListAsync(ct);
 
         if (parties.Count != 2)
@@ -720,7 +732,7 @@ public class StaffRosterController : ControllerBase
         var proxy = new AuthorityProxy
         {
             Id = Guid.NewGuid(),
-            TenantId = caller.TenantId ?? Guid.Empty,
+            TenantId = caller.TenantId,
             ClinicId = caller.ClinicId.Value,
             DelegatorUserId = request.DelegatorUserId,
             DesigneeUserId = request.DesigneeUserId,
@@ -729,14 +741,14 @@ public class StaffRosterController : ControllerBase
             ValidUntil = request.ValidUntil,
             Reason = request.Reason,
             CreatedAt = DateTimeOffset.UtcNow,
-            CreatedBy = caller.Id
+            CreatedBy = caller.UserId
         };
 
         _db.AuthorityProxies.Add(proxy);
         await _db.SaveChangesAsync(ct);
 
         _logger.LogInformation("Authority proxy {ProxyId} created by {CallerId}: {Delegator} -> {Designee} ({Permissions})",
-            proxy.Id, caller.Id, proxy.DelegatorUserId, proxy.DesigneeUserId, proxy.Permissions);
+            proxy.Id, caller.UserId, proxy.DelegatorUserId, proxy.DesigneeUserId, proxy.Permissions);
 
         return Ok(proxy);
     }
@@ -750,18 +762,18 @@ public class StaffRosterController : ControllerBase
         if (caller?.ClinicId is null) return Forbid();
 
         var proxy = await _db.AuthorityProxies
-            .FirstOrDefaultAsync(p => p.Id == id && p.ClinicId == caller.ClinicId, ct);
+            .FirstOrDefaultAsync(p => p.Id == id && p.TenantId == caller.TenantId && p.ClinicId == caller.ClinicId, ct);
 
         if (proxy is null) return NotFound(new { error = "proxy_not_found" });
 
         // The clinic admin owns delegation; the delegator can always take their own back.
-        if (caller.Role != UserRole.ClinicAdmin && caller.Id != proxy.DelegatorUserId)
+        if (caller.Role is not (UserRole.ClinicAdmin or UserRole.Owner) && caller.UserId != proxy.DelegatorUserId)
             return Forbid();
 
         proxy.IsRevoked = true;
         await _db.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Authority proxy {ProxyId} revoked by {CallerId}", proxy.Id, caller.Id);
+        _logger.LogInformation("Authority proxy {ProxyId} revoked by {CallerId}", proxy.Id, caller.UserId);
         return Ok(new { id = proxy.Id, isRevoked = proxy.IsRevoked });
     }
 
@@ -772,23 +784,26 @@ public class StaffRosterController : ControllerBase
         var caller = await GetCallerAsync(ct);
         if (caller?.ClinicId is null) return Forbid();
 
+        var parties = NursingScope.ProxyParties(_db, caller);
         var proxies = await _db.AuthorityProxies
             .AsNoTracking()
             .Include(p => p.DelegatorUser)
             .Include(p => p.DesigneeUser)
-            .Where(p => p.ClinicId == caller.ClinicId && !p.IsRevoked)
+            .Where(p => p.TenantId == caller.TenantId && p.ClinicId == caller.ClinicId && !p.IsRevoked)
             .OrderByDescending(p => p.ValidUntil)
             .Select(p => new
             {
                 id = p.Id,
-                delegatorName = p.DelegatorUser.Name,
+                delegatorName = parties.Any(m => m.UserId == p.DelegatorUserId) ? p.DelegatorUser.Name : null,
                 delegatorId = p.DelegatorUserId,
-                designeeName = p.DesigneeUser.Name,
+                designeeName = parties.Any(m => m.UserId == p.DesigneeUserId) ? p.DesigneeUser.Name : null,
                 designeeId = p.DesigneeUserId,
                 permissions = p.Permissions,
                 validFrom = p.ValidFrom,
                 validUntil = p.ValidUntil,
-                isActive = p.ValidFrom <= DateTimeOffset.UtcNow && p.ValidUntil >= DateTimeOffset.UtcNow,
+                isActive = p.ValidFrom <= DateTimeOffset.UtcNow && p.ValidUntil >= DateTimeOffset.UtcNow &&
+                    p.DelegatorUserId != p.DesigneeUserId && parties.Any(m => m.UserId == p.DelegatorUserId) &&
+                    parties.Any(m => m.UserId == p.DesigneeUserId),
                 reason = p.Reason
             })
             .ToListAsync(ct);
@@ -804,13 +819,13 @@ public class StaffRosterController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse", "Doctor")]
     public async Task<IActionResult> ListAnnouncements(CancellationToken ct)
     {
-        var caller = await GetCallerAsync(ct);
+        var caller = await GetCallerAsync(ct, UserRole.ClinicAdmin, UserRole.Nurse, UserRole.Doctor);
         if (caller?.ClinicId is null) return Forbid();
 
         var announcements = await _db.StaffAnnouncements
             .AsNoTracking()
             .Include(a => a.AuthorUser)
-            .Where(a => a.ClinicId == caller.ClinicId && (a.ExpiresAt == null || a.ExpiresAt > DateTimeOffset.UtcNow))
+            .Where(a => a.TenantId == caller.TenantId && a.ClinicId == caller.ClinicId && (a.ExpiresAt == null || a.ExpiresAt > DateTimeOffset.UtcNow))
             .OrderByDescending(a => a.CreatedAt)
             .Take(50)
             .Select(a => new
@@ -819,7 +834,8 @@ public class StaffRosterController : ControllerBase
                 title = a.Title,
                 content = a.Content,
                 priority = a.Priority,
-                authorName = a.AuthorUser.Name,
+                authorName = _db.TenantMemberships.Any(m => m.UserId == a.AuthorUserId && m.TenantId == caller.TenantId &&
+                    m.ClinicId == caller.ClinicId) ? a.AuthorUser.Name : null,
                 createdAt = a.CreatedAt
             })
             .ToListAsync(ct);
@@ -837,16 +853,20 @@ public class StaffRosterController : ControllerBase
         var caller = await GetCallerAsync(ct);
         if (caller?.ClinicId is null) return Forbid();
 
+        if (request.TeamId.HasValue && !await _db.StaffTeams.AnyAsync(t => t.Id == request.TeamId &&
+            t.TenantId == caller.TenantId && t.ClinicId == caller.ClinicId, ct))
+            return NotFound(new { error = "team_not_found" });
+
         var announcement = new StaffAnnouncement
         {
             Id = Guid.NewGuid(),
-            TenantId = caller.TenantId ?? Guid.Empty,
+            TenantId = caller.TenantId,
             ClinicId = caller.ClinicId.Value,
             TeamId = request.TeamId,
             Title = request.Title.Trim(),
             Content = request.Content.Trim(),
             Priority = string.Equals(request.Priority, "urgent", StringComparison.OrdinalIgnoreCase) ? "urgent" : "normal",
-            AuthorUserId = caller.Id,
+            AuthorUserId = caller.UserId,
             CreatedAt = DateTimeOffset.UtcNow
         };
 
@@ -882,20 +902,20 @@ public class StaffRosterController : ControllerBase
     {
         if (!swap.TargetNurseProfileId.HasValue) return false;
 
-        if (await HasDoubleAssignmentAsync(swap.TargetNurseProfileId.Value,
+        if (await HasDoubleAssignmentAsync(swap.TenantId, swap.ClinicId, swap.TargetNurseProfileId.Value,
                 swap.RequesterShift.Date, swap.RequesterShift.ShiftType, swap.RequesterShift.Id, ct))
             return true;
 
         if (swap.RequestType != ShiftChangeType.DirectSwap || swap.TargetShift is null)
             return false;
 
-        return await HasDoubleAssignmentAsync(swap.RequesterNurseProfileId,
+        return await HasDoubleAssignmentAsync(swap.TenantId, swap.ClinicId, swap.RequesterNurseProfileId,
             swap.TargetShift.Date, swap.TargetShift.ShiftType, swap.TargetShift.Id, ct);
     }
 
     private Task<bool> HasDoubleAssignmentAsync(
-        Guid nurseProfileId, DateOnly date, ShiftType shiftType, Guid excludeShiftId, CancellationToken ct) =>
-        _db.NurseShifts.AnyAsync(s => s.NurseProfileId == nurseProfileId &&
+        Guid tenantId, Guid clinicId, Guid nurseProfileId, DateOnly date, ShiftType shiftType, Guid excludeShiftId, CancellationToken ct) =>
+        _db.NurseShifts.AnyAsync(s => s.TenantId == tenantId && s.ClinicId == clinicId && s.NurseProfileId == nurseProfileId &&
             s.Date == date &&
             s.ShiftType == shiftType &&
             s.Status == ShiftStatus.Assigned &&
@@ -910,7 +930,7 @@ public class StaffRosterController : ControllerBase
         var warnings = new List<object>();
         var templates = await _db.ShiftTemplates
             .AsNoTracking()
-            .Where(t => t.ClinicId == swap.ClinicId)
+            .Where(t => t.TenantId == swap.TenantId && t.ClinicId == swap.ClinicId)
             .ToDictionaryAsync(t => t.Id, ct);
 
         async Task CheckAsync(Guid nurseProfileId, NurseShift shift, Guid excludeShiftId)
@@ -925,7 +945,7 @@ public class StaffRosterController : ControllerBase
 
             var neighbours = await _db.NurseShifts
                 .AsNoTracking()
-                .Where(s => s.NurseProfileId == nurseProfileId &&
+                .Where(s => s.TenantId == swap.TenantId && s.ClinicId == swap.ClinicId && s.NurseProfileId == nurseProfileId &&
                     s.Status == ShiftStatus.Assigned &&
                     s.Id != excludeShiftId &&
                     (s.Date == shift.Date.AddDays(-1) || s.Date == shift.Date.AddDays(1)))
@@ -970,10 +990,21 @@ public class StaffRosterController : ControllerBase
         return warnings;
     }
 
-    private async Task<User?> GetCallerAsync(CancellationToken ct)
+    private async Task<bool> ValidSwapPartiesAsync(ShiftChangeRequest swap, TenantMembership caller, CancellationToken ct)
     {
-        var userId = User.GetUserId();
-        if (!userId.HasValue) return null;
-        return await _db.Users.FindAsync([userId.Value], ct);
+        var profiles = NursingScope.Profiles(_db, caller);
+        return await profiles.AnyAsync(p => p.Id == swap.RequesterNurseProfileId, ct) &&
+            (!swap.TargetNurseProfileId.HasValue || await profiles.AnyAsync(p => p.Id == swap.TargetNurseProfileId, ct)) &&
+            await _db.NurseShifts.AnyAsync(s => s.Id == swap.RequesterShiftId && s.TenantId == caller.TenantId &&
+                s.ClinicId == caller.ClinicId && !s.IsLocked &&
+                ((s.NurseProfileId == swap.RequesterNurseProfileId && s.Status == ShiftStatus.Assigned) ||
+                 (swap.RequestType == ShiftChangeType.OpenCover && swap.RequesterNurseProfileId == swap.TargetNurseProfileId &&
+                  s.NurseProfileId == null && s.Status == ShiftStatus.Open)), ct) &&
+            (!swap.TargetShiftId.HasValue || await _db.NurseShifts.AnyAsync(s => s.Id == swap.TargetShiftId &&
+                s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId && !s.IsLocked &&
+                s.NurseProfileId == swap.TargetNurseProfileId && s.Status == ShiftStatus.Assigned, ct));
     }
+
+    private Task<TenantMembership?> GetCallerAsync(CancellationToken ct, params UserRole[] roles) =>
+        NursingScope.SelectedAsync(_db, User, ct, roles.Length == 0 ? [UserRole.ClinicAdmin, UserRole.Nurse] : roles);
 }

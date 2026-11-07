@@ -50,7 +50,7 @@ public class SectionZeroTests
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(name ?? $"SectionZero_{Guid.NewGuid()}")
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static AuthController CreateController(HospitalCrmDbContext db, IConfiguration? config = null)
@@ -119,15 +119,18 @@ public class SectionZeroTests
         using var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var primaryClinic = Guid.NewGuid();
+        var primaryTenant = Guid.NewGuid();
         var selectedClinic = Guid.NewGuid();
         var userId = Guid.NewGuid();
         var raw = "clinic-scoped-refresh-token";
 
-        db.Tenants.Add(ActiveTenant(tenantId));
+        db.Tenants.AddRange(ActiveTenant(tenantId), ActiveTenant(primaryTenant));
+        db.Clinics.AddRange(new Clinic { Id = primaryClinic, TenantId = primaryTenant },
+            new Clinic { Id = selectedClinic, TenantId = tenantId });
         db.Users.Add(new User
         {
             Id = userId,
-            TenantId = tenantId,
+            TenantId = primaryTenant,
             ClinicId = primaryClinic,
             Email = "multi@clinic.com",
             Name = "Dr Multi",
@@ -137,7 +140,7 @@ public class SectionZeroTests
         db.TenantMemberships.AddRange(
             new TenantMembership
             {
-                Id = Guid.NewGuid(), UserId = userId, TenantId = tenantId,
+                Id = Guid.NewGuid(), UserId = userId, TenantId = primaryTenant,
                 ClinicId = primaryClinic, Role = UserRole.Doctor, Status = "active"
             },
             new TenantMembership
@@ -230,8 +233,14 @@ public class SectionZeroTests
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
         var raw = "racing-refresh-token";
+        var clinicId = Guid.NewGuid();
 
         db.Tenants.Add(ActiveTenant(tenantId));
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId });
+        db.TenantMemberships.Add(new TenantMembership
+        {
+            UserId = userId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor
+        });
         db.Users.Add(new User
         {
             Id = userId,
@@ -244,6 +253,7 @@ public class SectionZeroTests
         db.RefreshTokens.Add(new RefreshToken
         {
             Id = Guid.NewGuid(), UserId = userId, TenantId = tenantId,
+            ClinicId = clinicId,
             Role = UserRole.Doctor, FamilyId = Guid.NewGuid(),
             TokenHash = raw.HashToken(),
             IssuedAt = DateTimeOffset.UtcNow,
@@ -308,8 +318,10 @@ public class SectionZeroTests
         using var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
 
         db.Tenants.Add(ActiveTenant(tenantId));
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId });
         // Primary role is Nurse (no MFA), but this membership is an admin at the clinic.
         db.Users.Add(new User
         {
@@ -323,7 +335,7 @@ public class SectionZeroTests
         db.TenantMemberships.Add(new TenantMembership
         {
             Id = Guid.NewGuid(), UserId = userId, TenantId = tenantId,
-            Role = UserRole.ClinicAdmin, Status = "active", IsDefault = true
+            Role = UserRole.ClinicAdmin, Status = "active", IsDefault = true, ClinicId = clinicId
         });
         await db.SaveChangesAsync();
 
@@ -343,8 +355,10 @@ public class SectionZeroTests
         using var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
 
         db.Tenants.Add(ActiveTenant(tenantId));
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId });
         db.Users.Add(new User
         {
             Id = userId,
@@ -357,7 +371,7 @@ public class SectionZeroTests
         db.TenantMemberships.Add(new TenantMembership
         {
             Id = Guid.NewGuid(), UserId = userId, TenantId = tenantId,
-            Role = UserRole.Doctor, Status = "active", IsDefault = true
+            Role = UserRole.Doctor, Status = "active", IsDefault = true, ClinicId = clinicId
         });
         await db.SaveChangesAsync();
 

@@ -15,7 +15,8 @@ using Xunit;
 
 namespace Hospital_CRM.Tests;
 
-public class Section1HardeningTests
+public class Section1HardeningTests(Part2TenantBoundaryPostgresFixture postgres)
+    : IClassFixture<Part2TenantBoundaryPostgresFixture>
 {
     private class StubNotification : INotificationService
     {
@@ -28,7 +29,7 @@ public class Section1HardeningTests
         var options = new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static JsonElement ToJson(object? value)
@@ -37,11 +38,14 @@ public class Section1HardeningTests
         return JsonDocument.Parse(json).RootElement;
     }
 
-    private (AppointmentsController controller, Guid userId, Guid clinicId) CreateAppointmentsController(HospitalCrmDbContext db, string role = "Receptionist")
+    private (AppointmentsController controller, Guid userId, Guid clinicId, Guid tenantId) CreateAppointmentsController(HospitalCrmDbContext db, string role = "Receptionist")
     {
         var userId = Guid.NewGuid();
         var clinicId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
+        db.AddRange(new Tenant { Id = tenantId }, new Clinic { Id = clinicId, TenantId = tenantId },
+            new User { Id = userId, TenantId = tenantId, ClinicId = clinicId, Email = "staff@synthetic.invalid", PasswordHash = "unused", Role = Enum.Parse<UserRole>(role) },
+            new TenantMembership { UserId = userId, TenantId = tenantId, ClinicId = clinicId, Role = Enum.Parse<UserRole>(role), Status = "active" });
 
         var inMemorySettings = new Dictionary<string, string?>
         {
@@ -56,39 +60,36 @@ public class Section1HardeningTests
         {
             new Claim("sub", userId.ToString()),
             new Claim("role", role),
-            new Claim("tenant_id", tenantId.ToString())
+            new Claim("tenant_id", tenantId.ToString()),
+            new Claim("clinicId", clinicId.ToString())
         };
         controller.ControllerContext = new ControllerContext
         {
             HttpContext = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth")) }
         };
 
-        return (controller, userId, clinicId);
+        return (controller, userId, clinicId, tenantId);
     }
 
     [Fact]
     public async Task CheckIn_IsIdempotent_AndAssignsPerDoctorCounter()
     {
         var db = CreateInMemoryDb();
-        var (controller, userId, clinicId) = CreateAppointmentsController(db);
+        var (controller, userId, clinicId, tenantId) = CreateAppointmentsController(db);
 
         var doctorId = Guid.NewGuid();
         var doctor = new User
         {
             Id = doctorId,
+            TenantId = tenantId,
+            ClinicId = clinicId,
             Email = "doctor1@example.com",
             Name = "Dr. Sharma",
             Role = UserRole.Doctor,
             PasswordHash = "hash"
         };
-        var clinic = new Clinic
-        {
-            Id = clinicId,
-            Name = "Apollo Multispecialty Clinic"
-        };
-
-        var patient1 = new Patient { Id = Guid.NewGuid(), Name = "Aarav Patel", Phone = "9876543210" };
-        var patient2 = new Patient { Id = Guid.NewGuid(), Name = "Bhavna Patel", Phone = "9876543211" };
+        var patient1 = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Aarav Patel", Phone = "9876543210" };
+        var patient2 = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Bhavna Patel", Phone = "9876543211" };
 
         var apt1 = new Appointment
         {
@@ -96,6 +97,7 @@ public class Section1HardeningTests
             ClinicId = clinicId,
             DoctorId = doctorId,
             PatientId = patient1.Id,
+            TenantId = tenantId,
             Date = DateOnly.FromDateTime(DateTime.UtcNow),
             TimeSlot = "09:00",
             Status = AppointmentStatus.Booked
@@ -107,6 +109,7 @@ public class Section1HardeningTests
             ClinicId = clinicId,
             DoctorId = doctorId,
             PatientId = patient2.Id,
+            TenantId = tenantId,
             Date = DateOnly.FromDateTime(DateTime.UtcNow),
             TimeSlot = "09:30",
             Status = AppointmentStatus.Booked
@@ -114,7 +117,7 @@ public class Section1HardeningTests
 
         db.Patients.AddRange(patient1, patient2);
         db.Users.Add(doctor);
-        db.Clinics.Add(clinic);
+        db.TenantMemberships.Add(new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor });
         db.Appointments.AddRange(apt1, apt2);
         await db.SaveChangesAsync();
 
@@ -142,21 +145,25 @@ public class Section1HardeningTests
         Assert.Equal(2, token2);
     }
 
-    [Fact]
+    [Part2TenantBoundaryPostgresFact]
     public async Task QueueStatus_ExposesOnlyZeroPhi_AndAccuratePosition()
     {
-        var db = CreateInMemoryDb();
-        var doctorId = Guid.NewGuid();
-        var date = DateOnly.FromDateTime(DateTime.UtcNow);
+        await using var owner = postgres.OwnerDb();
+        var doctorId = postgres.Doctor;
+        var date = new DateOnly(2038, 1, 1);
 
         var apt1 = new Appointment
         {
             Id = Guid.NewGuid(),
             DoctorId = doctorId,
+            TenantId = postgres.TenantA,
+            ClinicId = postgres.ClinicA,
+            PatientId = postgres.PatientA,
             Date = date,
             TimeSlot = "09:00",
             QueueToken = 1,
-            QueueTrackingToken = "qtrk_patient_one_token_12345",
+            QueueTrackingToken = "qtrk_" + Guid.NewGuid().ToString("N"),
+            QueueTrackingExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
             Status = AppointmentStatus.InConsultation
         };
 
@@ -164,17 +171,23 @@ public class Section1HardeningTests
         {
             Id = Guid.NewGuid(),
             DoctorId = doctorId,
+            TenantId = postgres.TenantA,
+            ClinicId = postgres.ClinicA,
+            PatientId = postgres.PatientA,
             Date = date,
             TimeSlot = "09:30",
             QueueToken = 2,
-            QueueTrackingToken = "qtrk_patient_two_token_67890",
+            QueueTrackingToken = "qtrk_" + Guid.NewGuid().ToString("N"),
+            QueueTrackingExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
             Status = AppointmentStatus.CheckedIn
         };
 
-        db.Appointments.AddRange(apt1, apt2);
-        await db.SaveChangesAsync();
+        owner.Appointments.AddRange(apt1, apt2);
+        await owner.SaveChangesAsync();
 
-        var queueController = new QueueStatusController(db);
+        var tenantContext = new TenantContext();
+        await using var db = postgres.AppDb(tenantContext);
+        var queueController = new QueueStatusController(db, tenantContext);
         var result = await queueController.GetStatus(apt2.QueueTrackingToken, CancellationToken.None) as OkObjectResult;
 
         Assert.NotNull(result);
@@ -195,12 +208,13 @@ public class Section1HardeningTests
     public async Task AppointmentStateMachine_EnforcesValidAndTerminalTransitions()
     {
         var db = CreateInMemoryDb();
-        var (controller, userId, clinicId) = CreateAppointmentsController(db);
+        var (controller, userId, clinicId, tenantId) = CreateAppointmentsController(db);
 
         var apt = new Appointment
         {
             Id = Guid.NewGuid(),
             ClinicId = clinicId,
+            TenantId = tenantId,
             DoctorId = Guid.NewGuid(),
             PatientId = Guid.NewGuid(),
             Date = DateOnly.FromDateTime(DateTime.UtcNow),
@@ -291,6 +305,8 @@ public class Section1HardeningTests
             Consent: new ConsentRequest(true, "direct_care"),
             IdempotencyKey: $"IDEMP-PAT-{Guid.NewGuid()}",
             WhatsAppOptIn: false,
+            GuardianName: "Rajesh Kumar",
+            GuardianRelationship: "Father",
             ConfirmDifferentPersonOnSamePhone: false
         );
 
@@ -362,7 +378,7 @@ public class Section1HardeningTests
 
         var result = await new QueueStatusController(db).GetStatus("1", CancellationToken.None);
 
-        Assert.IsType<BadRequestObjectResult>(result);
+        Assert.IsType<NotFoundObjectResult>(result);
     }
 
     [Fact]
@@ -412,22 +428,26 @@ public class Section1HardeningTests
     public async Task Reschedule_RejectsOccupiedSlot_And_TerminalAppointment()
     {
         var db = CreateInMemoryDb();
-        var (controller, _, clinicId) = CreateAppointmentsController(db);
+        var (controller, _, clinicId, tenantId) = CreateAppointmentsController(db);
         var doctorId = Guid.NewGuid();
+        var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Synthetic", Phone = "9000000000" };
+        db.AddRange(patient,
+            new User { Id = doctorId, TenantId = tenantId, ClinicId = clinicId, Email = "doctor@synthetic.invalid", PasswordHash = "unused", Role = UserRole.Doctor },
+            new TenantMembership { UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor });
 
         var target = new Appointment
         {
-            Id = Guid.NewGuid(), ClinicId = clinicId, DoctorId = doctorId, PatientId = Guid.NewGuid(),
+            Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, DoctorId = doctorId, PatientId = patient.Id,
             Date = new DateOnly(2026, 11, 2), TimeSlot = "09:00", Status = AppointmentStatus.Booked
         };
         var occupying = new Appointment
         {
-            Id = Guid.NewGuid(), ClinicId = clinicId, DoctorId = doctorId, PatientId = Guid.NewGuid(),
+            Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, DoctorId = doctorId, PatientId = patient.Id,
             Date = new DateOnly(2026, 11, 3), TimeSlot = "10:00", Status = AppointmentStatus.Booked
         };
         var cancelled = new Appointment
         {
-            Id = Guid.NewGuid(), ClinicId = clinicId, DoctorId = doctorId, PatientId = Guid.NewGuid(),
+            Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, DoctorId = doctorId, PatientId = patient.Id,
             Date = new DateOnly(2026, 11, 4), TimeSlot = "11:00", Status = AppointmentStatus.Cancelled
         };
         db.Appointments.AddRange(target, occupying, cancelled);
@@ -446,23 +466,26 @@ public class Section1HardeningTests
     public async Task List_FiltersByPatient_AndReturnsAppointmentDate()
     {
         var db = CreateInMemoryDb();
-        var (controller, _, clinicId) = CreateAppointmentsController(db);
+        var (controller, _, clinicId, tenantId) = CreateAppointmentsController(db);
         var doctor = new User
         {
             Id = Guid.NewGuid(),
             Email = "doctor@example.com",
+            TenantId = tenantId,
+            ClinicId = clinicId,
             Name = "Dr. Mehta",
             Role = UserRole.Doctor,
             PasswordHash = "hash"
         };
-        var patient = new Patient { Id = Guid.NewGuid(), Name = "Aarav Patel", Phone = "9876543210" };
-        var otherPatient = new Patient { Id = Guid.NewGuid(), Name = "Diya Patel", Phone = "9876543211" };
+        var patient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Aarav Patel", Phone = "9876543210" };
+        var otherPatient = new Patient { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Diya Patel", Phone = "9876543211" };
         var appointment = new Appointment
         {
             Id = Guid.NewGuid(),
             ClinicId = clinicId,
             DoctorId = doctor.Id,
             PatientId = patient.Id,
+            TenantId = tenantId,
             Date = new DateOnly(2026, 10, 28),
             TimeSlot = "09:00",
             Status = AppointmentStatus.Completed
@@ -473,6 +496,7 @@ public class Section1HardeningTests
             ClinicId = clinicId,
             DoctorId = doctor.Id,
             PatientId = otherPatient.Id,
+            TenantId = tenantId,
             Date = new DateOnly(2026, 10, 29),
             TimeSlot = "10:00",
             Status = AppointmentStatus.Completed
@@ -494,10 +518,10 @@ public class Section1HardeningTests
     public async Task Nurse_CanMoveThroughNursing_ButNotComplete()
     {
         var db = CreateInMemoryDb();
-        var (controller, _, clinicId) = CreateAppointmentsController(db, "Nurse");
+        var (controller, _, clinicId, tenantId) = CreateAppointmentsController(db, "Nurse");
         var appointment = new Appointment
         {
-            Id = Guid.NewGuid(), ClinicId = clinicId, DoctorId = Guid.NewGuid(), PatientId = Guid.NewGuid(),
+            Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, DoctorId = Guid.NewGuid(), PatientId = Guid.NewGuid(),
             Date = DateOnly.FromDateTime(DateTime.UtcNow), TimeSlot = "09:00", Status = AppointmentStatus.CheckedIn
         };
         db.Appointments.Add(appointment);
@@ -515,10 +539,10 @@ public class Section1HardeningTests
     public async Task Receptionist_Emergency_Triage_RequiresStructuredCode()
     {
         var db = CreateInMemoryDb();
-        var (controller, _, clinicId) = CreateAppointmentsController(db);
+        var (controller, _, clinicId, tenantId) = CreateAppointmentsController(db);
         var appointment = new Appointment
         {
-            Id = Guid.NewGuid(), ClinicId = clinicId, DoctorId = Guid.NewGuid(), PatientId = Guid.NewGuid(),
+            Id = Guid.NewGuid(), TenantId = tenantId, ClinicId = clinicId, DoctorId = Guid.NewGuid(), PatientId = Guid.NewGuid(),
             Date = DateOnly.FromDateTime(DateTime.UtcNow), TimeSlot = "09:00", Status = AppointmentStatus.Booked
         };
         db.Appointments.Add(appointment);

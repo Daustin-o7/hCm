@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { userManager, isEntraConfigured } from '../services/oidc'
-import { setAccessToken } from '../services/api'
+import { getSessionGeneration, setAccessToken } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 
 export default function AuthCallback() {
@@ -10,14 +10,23 @@ export default function AuthCallback() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    let active = true
+    const generation = getSessionGeneration()
+    const current = () => active && generation === getSessionGeneration()
     const handleCallback = async () => {
+      let installing = false
       if (!isEntraConfigured || !userManager) {
         navigate('/login')
         return
       }
 
       try {
+        // StrictMode retires its first effect before a one-use callback is consumed.
+        await Promise.resolve()
+        if (!current()) return
         const oidcUser = await userManager.signinRedirectCallback()
+        if (!current()) return
+        installing = true
         if (oidcUser && oidcUser.access_token) {
           setAccessToken(oidcUser.access_token)
           const profile = oidcUser.profile
@@ -35,13 +44,13 @@ export default function AuthCallback() {
         } else {
           throw new Error('No access token received from authentication provider')
         }
-      } catch (err: any) {
-        console.error('OIDC callback failed:', err)
-        setError(err.message || 'Authentication callback failed')
+      } catch {
+        if (active && (installing || current())) setError('Sign-in could not be completed. Please try again.')
       }
     }
 
-    handleCallback()
+    void handleCallback()
+    return () => { active = false }
   }, [navigate, setUserFromEntra])
 
   if (error) {

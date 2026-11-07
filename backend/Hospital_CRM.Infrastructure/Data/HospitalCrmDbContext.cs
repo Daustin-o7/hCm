@@ -21,6 +21,7 @@ public class HospitalCrmDbContext : DbContext
     public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
     public DbSet<PasswordResetToken> PasswordResetTokens => Set<PasswordResetToken>();
     public DbSet<StaffInvite> StaffInvites => Set<StaffInvite>();
+    public DbSet<TenantProvisioningReceipt> TenantProvisioningReceipts => Set<TenantProvisioningReceipt>();
     public DbSet<Tenant> Tenants => Set<Tenant>();
     public DbSet<TenantMembership> TenantMemberships => Set<TenantMembership>();
     public DbSet<AuthAuditLog> AuthAuditLogs => Set<AuthAuditLog>();
@@ -41,6 +42,7 @@ public class HospitalCrmDbContext : DbContext
     public DbSet<InvoiceLineItem> InvoiceLineItems => Set<InvoiceLineItem>();
     public DbSet<Payment> Payments => Set<Payment>();
     public DbSet<NotificationLog> NotificationLogs => Set<NotificationLog>();
+    public DbSet<NotificationIntent> NotificationIntents => Set<NotificationIntent>();
     public DbSet<PrecheckSubmission> PrecheckSubmissions => Set<PrecheckSubmission>();
     public DbSet<PriorityLog> PriorityLogs => Set<PriorityLog>();
     public DbSet<ConsultTemplate> ConsultTemplates => Set<ConsultTemplate>();
@@ -95,13 +97,14 @@ public class HospitalCrmDbContext : DbContext
 
 
     public Guid CurrentTenantId => _tenantContext?.CurrentTenantId ?? Guid.Empty;
-    public bool BypassTenantFilter => _tenantContext == null || _tenantContext.IsPlatformAdmin;
+    public bool BypassTenantFilter => _tenantContext?.IsPlatformAdmin == true;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
         modelBuilder.UseOpenIddict();
         ApplyConfigurations(modelBuilder);
+        modelBuilder.ApplyConfiguration(new NotificationIntentConfiguration());
         ApplyTenantFilters(modelBuilder);
     }
 
@@ -125,7 +128,7 @@ public class HospitalCrmDbContext : DbContext
     private void ConfigureTenantFilter<TEntity>(ModelBuilder modelBuilder) where TEntity : class, ITenantScoped
     {
         modelBuilder.Entity<TEntity>().HasQueryFilter(e =>
-            BypassTenantFilter || e.TenantId == CurrentTenantId);
+            BypassTenantFilter || CurrentTenantId != Guid.Empty && e.TenantId == CurrentTenantId);
     }
 
     private static void ApplyConfigurations(ModelBuilder modelBuilder)
@@ -184,6 +187,15 @@ public class HospitalCrmDbContext : DbContext
             e.Property(x => x.TokenHash).HasMaxLength(512);
             e.HasIndex(x => x.TokenHash).IsUnique();
             e.HasOne(x => x.User).WithMany(u => u.PasswordResetTokens).HasForeignKey(x => x.UserId);
+        });
+
+        modelBuilder.Entity<TenantProvisioningReceipt>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.IdempotencyKey).HasMaxLength(128);
+            e.Property(x => x.RequestHash).HasMaxLength(64);
+            e.HasIndex(x => new { x.ActorId, x.IdempotencyKey }).IsUnique();
+            // A cancelled invite or removed tenant must not erase the replay boundary.
         });
 
         modelBuilder.Entity<StaffInvite>(e =>
@@ -400,7 +412,7 @@ public class HospitalCrmDbContext : DbContext
             e.HasIndex(x => new { x.TenantId, x.Phone }); // tenant-scoped lookup used by registration
             e.HasIndex(x => new { x.TenantId, x.Uhid }).IsUnique().HasFilter("\"Uhid\" IS NOT NULL");
             e.HasIndex(x => x.Name); // trigram GIN index added via migration separately
-            e.HasIndex(x => x.IdempotencyKey).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
+            e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
             e.Property(x => x.Name).HasMaxLength(255);
             e.Property(x => x.Uhid).HasMaxLength(50);
             e.Property(x => x.Phone).HasMaxLength(50);
@@ -523,7 +535,7 @@ public class HospitalCrmDbContext : DbContext
             e.HasIndex(x => new { x.Status, x.CreatedAt });
             e.HasIndex(x => x.AppointmentId);
             e.HasIndex(x => new { x.TenantId, x.PatientId, x.Status });
-            e.HasIndex(x => x.IdempotencyKey).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
+            e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
             e.HasIndex(x => new { x.TenantId, x.FinancialYear, x.Series, x.InvoiceNumber })
                 .IsUnique()
                 .HasFilter("\"InvoiceNumber\" > 0");
@@ -531,6 +543,7 @@ public class HospitalCrmDbContext : DbContext
             e.Property(x => x.CreatedAt).HasDefaultValueSql("now()");
             e.Property(x => x.UpdatedAt).HasDefaultValueSql("now()").IsConcurrencyToken();
             e.HasOne(x => x.Appointment).WithMany().HasForeignKey(x => x.AppointmentId);
+            e.Property(x => x.CheckoutRequestHash).HasMaxLength(64);
         });
 
         modelBuilder.Entity<InvoiceLineItem>(e =>
@@ -551,12 +564,15 @@ public class HospitalCrmDbContext : DbContext
             e.HasKey(x => x.Id);
             e.HasIndex(x => x.InvoiceId);
             e.HasIndex(x => new { x.TenantId, x.CreatedAt });
-            e.HasIndex(x => x.IdempotencyKey).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
+            e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
+            e.HasIndex(x => new { x.TenantId, x.Method, x.RazorpayPaymentId }).IsUnique()
+                .HasFilter("\"RazorpayPaymentId\" IS NOT NULL AND \"Amount\" > 0 AND \"Method\" = 5");
             e.Property(x => x.RazorpayPaymentId).HasMaxLength(255);
             e.Property(x => x.RazorpayOrderId).HasMaxLength(255);
             e.Property(x => x.Utr).HasMaxLength(64);
             e.Property(x => x.CreatedAt).HasDefaultValueSql("now()");
             e.HasOne(x => x.Invoice).WithMany(inv => inv.Payments).HasForeignKey(x => x.InvoiceId);
+            e.HasOne<Payment>().WithMany().HasForeignKey(x => x.RefundSourcePaymentId).OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<TenantIntegration>(e =>
@@ -582,7 +598,7 @@ public class HospitalCrmDbContext : DbContext
         modelBuilder.Entity<ProcessedWebhookEvent>(e =>
         {
             e.HasKey(x => x.Id);
-            e.HasIndex(x => new { x.Provider, x.EventId }).IsUnique();
+            e.HasIndex(x => new { x.TenantId, x.Provider, x.EventId }).IsUnique();
             e.HasIndex(x => new { x.TenantId, x.Status });
             e.Property(x => x.Provider).HasMaxLength(32).IsRequired();
             e.Property(x => x.EventId).HasMaxLength(255).IsRequired();
@@ -765,12 +781,15 @@ public class HospitalCrmDbContext : DbContext
             e.HasKey(x => x.Id);
             e.HasIndex(x => new { x.TenantId, x.DispensedAt });
             e.HasIndex(x => x.PrescriptionId);
+            e.HasIndex(x => new { x.TenantId, x.InvoiceId }).IsUnique().HasFilter("\"InvoiceId\" IS NOT NULL");
             e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
             e.Property(x => x.WalkInCustomerName).HasMaxLength(255);
             e.Property(x => x.IdempotencyKey).HasMaxLength(128);
             e.HasOne(x => x.Prescription).WithMany().HasForeignKey(x => x.PrescriptionId);
+            e.Property(x => x.RequestHash).HasMaxLength(64);
             e.HasOne(x => x.Patient).WithMany().HasForeignKey(x => x.PatientId);
             e.HasOne(x => x.Dispenser).WithMany().HasForeignKey(x => x.DispensedBy);
+            e.HasOne<Invoice>().WithMany().HasForeignKey(x => x.InvoiceId).OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<DispenseItem>(e =>
@@ -974,6 +993,8 @@ public class HospitalCrmDbContext : DbContext
         modelBuilder.Entity<PatientDeposit>(e =>
         {
             e.HasKey(x => x.Id);
+            e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
+            e.Property(x => x.UpdatedAt).IsConcurrencyToken();
             e.HasIndex(x => new { x.TenantId, x.ReceiptNumber }).IsUnique();
             e.HasIndex(x => new { x.TenantId, x.FinancialYear, x.SequenceNumber })
                 .IsUnique()
@@ -990,6 +1011,7 @@ public class HospitalCrmDbContext : DbContext
             e.HasIndex(x => new { x.TenantId, x.InvoiceId });
             e.HasOne(x => x.PatientDeposit).WithMany(d => d.Allocations).HasForeignKey(x => x.PatientDepositId).OnDelete(DeleteBehavior.Restrict);
             e.HasOne(x => x.Invoice).WithMany().HasForeignKey(x => x.InvoiceId).OnDelete(DeleteBehavior.Restrict);
+            e.HasOne<Payment>().WithMany().HasForeignKey(x => x.PaymentId).OnDelete(DeleteBehavior.Restrict);
         });
     }
 

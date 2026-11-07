@@ -1,4 +1,4 @@
-import axios from 'axios'
+import axios, { CanceledError, type InternalAxiosRequestConfig } from 'axios'
 
 const isCapacitorOrWebView = typeof window !== 'undefined' && (
   !!(window as any).Capacitor ||
@@ -10,7 +10,7 @@ const resolveApiBaseUrl = (): string => {
     return import.meta.env.VITE_API_BASE_URL
   }
   if (typeof window !== 'undefined') {
-    const custom = localStorage.getItem('hospital_crm_api_base_url')
+    const custom = getCustomApiBaseUrl()
     if (custom && custom.trim()) {
       return custom.trim()
     }
@@ -32,15 +32,46 @@ export function setCustomApiBaseUrl(url: string) {
 
 export function getCustomApiBaseUrl(): string {
   if (typeof window === 'undefined') return ''
-  return localStorage.getItem('hospital_crm_api_base_url') || ''
+  try {
+    return window.localStorage.getItem('hospital_crm_api_base_url') || ''
+  } catch {
+    return ''
+  }
 }
 
 const API_BASE_URL = resolveApiBaseUrl()
 
 let inMemoryAccessToken: string | null = null
+let sessionGeneration = 0
+let sessionController = new AbortController()
+let sessionRefreshEnabled = false
+let sessionActive = false
+
+export function getSessionGeneration() { return sessionGeneration }
+export function isSessionActive() { return sessionActive && !!inMemoryAccessToken }
+
+// Invalidate before starting an identity change, not after its network response.
+export function beginSessionTransition() {
+  sessionActive = false
+  sessionGeneration += 1
+  sessionController.abort()
+  sessionController = new AbortController()
+  sessionRefreshEnabled = false
+  return sessionGeneration
+}
+
+export function setSessionRefreshEnabled(enabled: boolean) {
+  sessionRefreshEnabled = enabled
+}
+
+export function assertSessionGeneration(generation: number) {
+  if (generation !== sessionGeneration) throw new CanceledError('Session changed')
+}
 
 export function setAccessToken(token: string | null) {
+  beginSessionTransition()
   inMemoryAccessToken = token
+  sessionActive = !!token
 }
 
 export function getAccessToken(): string | null {
@@ -50,7 +81,7 @@ export function getAccessToken(): string | null {
 // The refresh token lives only in the HttpOnly cookie set by the API. Never in JS storage:
 // XSS on a shared front-desk browser must not be able to exfiltrate a 7-day credential.
 export function clearTokens() {
-  inMemoryAccessToken = null
+  setAccessToken(null)
 }
 
 const api = axios.create({
@@ -61,25 +92,6 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
 })
-
-// PERF: In-flight GET request deduplication to prevent duplicate concurrent network calls
-const inFlightGetMap = new Map<string, Promise<any>>()
-const rawGet = api.get.bind(api)
-
-;(api as any).get = function (url: string, config?: any) {
-  if (config?.skipDedupe) {
-    return rawGet(url, config)
-  }
-  const key = `${url}::${JSON.stringify(config?.params || {})}`
-  if (inFlightGetMap.has(key)) {
-    return inFlightGetMap.get(key)!
-  }
-  const promise = rawGet(url, config).finally(() => {
-    inFlightGetMap.delete(key)
-  })
-  inFlightGetMap.set(key, promise)
-  return promise
-}
 
 export const refreshClient = axios.create({
   baseURL: API_BASE_URL,
@@ -102,28 +114,59 @@ export interface RefreshPayload {
 
 // One shared refresh: the proactive timer, the session restore and a burst of 401s must not
 // race the rotation, or the losers are rejected and the user is logged out for no reason.
-let refreshInFlight: Promise<RefreshPayload | null> | null = null
+let refreshInFlight: { generation: number; promise: Promise<RefreshPayload | null> } | null = null
+
+function tokenScope(token: string): string {
+  const claims = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))
+  return JSON.stringify([claims.sub, claims.tenant_id, claims.clinicId ?? claims.clinic_id,
+    claims.role ?? claims.roles, claims.session_id, claims.impersonation_id, claims.impersonated_by,
+    claims.must_change_password, claims.mfa_enrolment_required, claims.read_only])
+}
+
+export function setRefreshedAccessToken(token: string, generation: number) {
+  assertSessionGeneration(generation)
+  if (inMemoryAccessToken && tokenScope(inMemoryAccessToken) !== tokenScope(token)) {
+    throw new Error('The refreshed identity changed. Please sign in again.')
+  }
+  inMemoryAccessToken = token
+  sessionActive = true
+}
 
 export function refreshSession(): Promise<RefreshPayload | null> {
-  refreshInFlight ??= refreshClient
-    .post('/auth/refresh', {})
+  const generation = sessionGeneration
+  if (!sessionRefreshEnabled) return Promise.reject(new CanceledError('Session refresh is disabled'))
+  if (refreshInFlight?.generation === generation) return refreshInFlight.promise
+  const promise = refreshClient
+    .post('/auth/refresh', {}, { signal: sessionController.signal })
     .then((res) => {
+      assertSessionGeneration(generation)
+      if (!sessionRefreshEnabled) throw new CanceledError('Session refresh is disabled')
       // 204 = no session on this device.
       if (res.status === 204 || !res.data?.accessToken) return null
-      setAccessToken(res.data.accessToken)
+      // Cookie rotation keeps the identity generation; selection/login use setAccessToken.
+      setRefreshedAccessToken(res.data.accessToken, generation)
       return res.data as RefreshPayload
     })
     .finally(() => {
-      refreshInFlight = null
+      if (refreshInFlight?.promise === promise) refreshInFlight = null
     })
-
-  return refreshInFlight
+  refreshInFlight = { generation, promise }
+  return promise
 }
 
+type SessionRequest = InternalAxiosRequestConfig & { sessionGeneration?: number; _retry?: boolean }
+
 api.interceptors.request.use(
-  (config) => {
+  (config: SessionRequest) => {
+    if (config.sessionGeneration !== undefined) assertSessionGeneration(config.sessionGeneration)
+    config.sessionGeneration = sessionGeneration
+    config.signal = config.signal
+      ? AbortSignal.any([config.signal as AbortSignal, sessionController.signal])
+      : sessionController.signal
     if (inMemoryAccessToken) {
       config.headers.Authorization = `Bearer ${inMemoryAccessToken}`
+    } else {
+      config.headers.delete('Authorization')
     }
     try {
       const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -135,28 +178,37 @@ api.interceptors.request.use(
     }
     return config
   },
-  (error) => Promise.reject(error)
+  (error) => { throw error },
+  { synchronous: true },
 )
 
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    assertSessionGeneration((response.config as SessionRequest).sessionGeneration!)
+    return response
+  },
   async (error) => {
-    const originalRequest = error.config
+    const originalRequest = error.config as SessionRequest | undefined
+    if (originalRequest?.sessionGeneration !== undefined) assertSessionGeneration(originalRequest.sessionGeneration)
 
     const isAuthRoute = originalRequest?.url?.includes('/auth/')
-    if (error.response?.status === 401 && originalRequest && !originalRequest._retry && !isAuthRoute) {
+    if (error.response?.status === 401 && originalRequest && !originalRequest._retry && !isAuthRoute && sessionRefreshEnabled) {
+      const generation = sessionGeneration
       originalRequest._retry = true
       try {
+        // A concurrent 401 may arrive after the shared refresh already finished.
+        if (originalRequest.headers.Authorization !== `Bearer ${inMemoryAccessToken}`) return api(originalRequest)
         const session = await refreshSession()
+        assertSessionGeneration(generation)
         if (!session?.accessToken) throw new Error('refresh_failed')
 
         originalRequest.headers.Authorization = `Bearer ${session.accessToken}`
         return api(originalRequest)
       } catch (refreshError) {
+        assertSessionGeneration(generation)
+        if (axios.isCancel(refreshError)) throw refreshError
         clearTokens()
-        if (window.location.pathname !== '/login') {
-          window.location.href = '/login'
-        }
+        window.dispatchEvent(new Event('samstack:session-ended'))
         return Promise.reject(refreshError)
       }
     }
@@ -164,4 +216,4 @@ api.interceptors.response.use(
   }
 )
 
-export default api
+export default api

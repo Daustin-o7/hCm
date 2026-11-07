@@ -9,7 +9,7 @@ namespace Hospital_CRM.Api.Services;
 /// auto-generated on first run if missing; in non-Development environments
 /// the service fails fast so a missing key is never silently replaced.
 /// </summary>
-public class PemFileKeyService : IPersistentKeyService
+public class PemFileKeyService : IPersistentKeyService, IDisposable
 {
     private readonly IConfiguration _config;
     private readonly IWebHostEnvironment _env;
@@ -18,7 +18,7 @@ public class PemFileKeyService : IPersistentKeyService
     private RSA? _rsa;
     private RsaSecurityKey? _privateKey;
     private RsaSecurityKey? _publicKey;
-    private string? _keyId;
+    private IReadOnlyList<RsaSecurityKey>? _validationKeys;
 
     public string KeySource => "PemFile";
 
@@ -31,19 +31,17 @@ public class PemFileKeyService : IPersistentKeyService
 
     public Task LoadAsync(CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var path = _config["Jwt:PemFilePath"] ?? "./keys/jwt-private.pem";
         var absolute = Path.IsPathRooted(path)
             ? path
             : Path.Combine(_env.ContentRootPath, path);
-        var dir = Path.GetDirectoryName(absolute);
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
+        using var rsa = RSA.Create();
         if (File.Exists(absolute))
         {
             _logger.LogInformation("Loading RS256 private key from {Path}", absolute);
             var pem = File.ReadAllText(absolute);
-            _rsa = RSA.Create();
-            _rsa.ImportFromPem(pem);
+            rsa.ImportFromPem(pem);
         }
         else
         {
@@ -52,55 +50,42 @@ public class PemFileKeyService : IPersistentKeyService
                     $"RS256 key file not found at '{absolute}'. In non-Development environments the key must be provisioned before startup.");
 
             _logger.LogWarning("No PEM key found at {Path}. Generating a development key (DEV ONLY).", absolute);
-            _rsa = RSA.Create(2048);
-            var pem = _rsa.ExportRSAPrivateKeyPem();
-            File.WriteAllText(absolute, pem);
-            // Gitignore-friendly best-effort: lock to current user on Windows.
-            try
-            {
-                if (OperatingSystem.IsWindows())
-                {
-                    var info = new FileInfo(absolute);
-                    // No portable ACL API cross-platform here — just ensure file exists.
-                }
-            }
-            catch { /* best effort */ }
+            Directory.CreateDirectory(Path.GetDirectoryName(absolute)!);
+            rsa.KeySize = 2048;
+            var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows())
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            using var writer = new StreamWriter(new FileStream(absolute, options));
+            writer.Write(rsa.ExportPkcs8PrivateKeyPem());
         }
 
-        _keyId = _config["Jwt:KeyId"] ?? "hospital-crm-rsa-key-1";
-        _privateKey = new RsaSecurityKey(_rsa) { KeyId = _keyId };
-        _publicKey = new RsaSecurityKey(_rsa.ExportParameters(false)) { KeyId = _keyId };
+        if (rsa.KeySize < 2048)
+            throw new InvalidOperationException("The RS256 signing key must be at least 2048 bits.");
+        // Export fails for public-only PEMs; do not advertise a key that cannot sign.
+        var privateParameters = rsa.ExportParameters(true);
+        var keyId = _config["Jwt:KeyId"] ?? "hospital-crm-rsa-key-1";
+        var publicKey = new RsaSecurityKey(rsa.ExportParameters(false)) { KeyId = keyId };
+        var validationKeys = JwtValidationKeys.Load(_config, _env, publicKey);
+        _rsa?.Dispose();
+        _rsa = RSA.Create(privateParameters);
+        _privateKey = new RsaSecurityKey(_rsa) { KeyId = keyId };
+        _publicKey = publicKey;
+        _validationKeys = validationKeys;
         return Task.CompletedTask;
     }
 
     public RsaSecurityKey GetPrivateKey() => _privateKey ?? throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
     public RsaSecurityKey GetPublicKey() => _publicKey ?? throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
+    public IReadOnlyList<RsaSecurityKey> GetValidationKeys() => _validationKeys ?? throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
 
-    public async Task<byte[]> SignAsync(byte[] data, CancellationToken ct = default)
+    public Task<byte[]> SignAsync(byte[] data, CancellationToken ct = default)
     {
         if (_rsa == null) throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
-        return await Task.Run(() => _rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1), ct);
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(_rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1));
     }
 
-    public object GetJwks()
-    {
-        if (_rsa is null || _keyId is null)
-            throw new InvalidOperationException("Key not loaded. Call LoadAsync() at startup.");
-        var p = _rsa.ExportParameters(false);
-        return new
-        {
-            keys = new[]
-            {
-                new
-                {
-                    kty = "RSA",
-                    use = "sig",
-                    alg = "RS256",
-                    kid = _keyId,
-                    n = Base64UrlEncoder.Encode(p.Modulus),
-                    e = Base64UrlEncoder.Encode(p.Exponent)
-                }
-            }
-        };
-    }
+    public void Dispose() => _rsa?.Dispose();
+
+    public object GetJwks() => JwtValidationKeys.GetJwks(GetValidationKeys());
 }

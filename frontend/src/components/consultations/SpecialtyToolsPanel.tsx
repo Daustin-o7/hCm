@@ -179,7 +179,7 @@ export default function SpecialtyToolsPanel({
       {/* 1. GENERAL MEDICINE: Vitals Strip & Systemic Review */}
       {selectedSpecialty === 'general' && (
         <div className="card p-5 border-teal-200 space-y-5">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>🩺</span> OPD Vitals &amp; Systemic Examination Panel
@@ -196,7 +196,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-[11px] font-bold text-slate-600 block mb-1">BP (Systolic)</label>
               <input
                 type="number"
@@ -207,7 +207,7 @@ export default function SpecialtyToolsPanel({
               <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">mmHg</span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-[11px] font-bold text-slate-600 block mb-1">BP (Diastolic)</label>
               <input
                 type="number"
@@ -218,7 +218,7 @@ export default function SpecialtyToolsPanel({
               <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">mmHg</span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-[11px] font-bold text-slate-600 block mb-1">Pulse Rate</label>
               <input
                 type="number"
@@ -229,7 +229,7 @@ export default function SpecialtyToolsPanel({
               <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">bpm</span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-[11px] font-bold text-slate-600 block mb-1">Temperature</label>
               <input
                 type="number"
@@ -241,7 +241,7 @@ export default function SpecialtyToolsPanel({
               <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">°F</span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-[11px] font-bold text-slate-600 block mb-1">SpO2 Oxygen</label>
               <input
                 type="number"
@@ -252,7 +252,7 @@ export default function SpecialtyToolsPanel({
               <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">%</span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-[11px] font-bold text-slate-600 block mb-1">Blood Glucose</label>
               <input
                 type="number"
@@ -289,7 +289,7 @@ export default function SpecialtyToolsPanel({
                     className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
                       active
                         ? 'bg-teal-600 text-white border-teal-600 shadow-xs'
-                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-100'
+                        : 'bg-[var(--color-surface)] border-[var(--color-border)] text-slate-700 hover:bg-[var(--color-surface-hover)]'
                     }`}
                   >
                     {active ? '✓ ' : '+ '}{sys}
@@ -304,7 +304,7 @@ export default function SpecialtyToolsPanel({
       {/* 2. DENTAL: FDI Two-Digit Odontogram */}
       {selectedSpecialty === 'dental' && (
         <div className="card p-5 animate-fadein space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>🦷</span> FDI Two-Digit Dental Odontogram
@@ -355,7 +355,7 @@ export default function SpecialtyToolsPanel({
                     tooth.status === 'filling' ? 'bg-amber-50 border-amber-300 text-amber-800' :
                     tooth.status === 'missing' ? 'bg-slate-100 border-slate-200 text-slate-400 line-through' :
                     tooth.status === 'crown' ? 'bg-purple-50 border-purple-300 text-purple-800' :
-                    'bg-white border-slate-200 text-slate-800 hover:border-teal-500 hover:shadow-xs'
+                    'bg-[var(--color-surface)] border-[var(--color-border)] text-slate-800 hover:border-teal-500 hover:shadow-xs'
                   }`}
                 >
                   <div className="text-xs font-bold font-mono">{tooth.label}</div>
@@ -382,7 +382,7 @@ export default function SpecialtyToolsPanel({
                     tooth.status === 'filling' ? 'bg-amber-50 border-amber-300 text-amber-800' :
                     tooth.status === 'missing' ? 'bg-slate-100 border-slate-200 text-slate-400 line-through' :
                     tooth.status === 'crown' ? 'bg-purple-50 border-purple-300 text-purple-800' :
-                    'bg-white border-slate-200 text-slate-800 hover:border-teal-500 hover:shadow-xs'
+                    'bg-[var(--color-surface)] border-[var(--color-border)] text-slate-800 hover:border-teal-500 hover:shadow-xs'
                   }`}
                 >
                   <div className="text-xs font-bold font-mono">{tooth.label}</div>
@@ -397,7 +397,7 @@ export default function SpecialtyToolsPanel({
       {/* 3. PHYSIOTHERAPY: Functional Exam, ROM, VAS */}
       {selectedSpecialty === 'physiotherapy' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>🏃‍♂️</span> Physiotherapy &amp; Rehabilitation Functional Exam
@@ -413,7 +413,7 @@ export default function SpecialtyToolsPanel({
             </button>
           </div>
 
-          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200">
+          <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
             <div className="flex items-center justify-between mb-2">
               <label className="text-xs font-bold text-slate-800 uppercase tracking-wide font-mono">
                 Pain Severity (VAS 0–10)
@@ -441,7 +441,7 @@ export default function SpecialtyToolsPanel({
                         : score <= 6
                         ? 'bg-amber-500 text-white shadow-sm'
                         : 'bg-rose-600 text-white shadow-sm'
-                      : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                      : 'bg-[var(--color-surface)] border border-[var(--color-border)] text-slate-700 hover:bg-[var(--color-surface-hover)]'
                   }`}
                 >
                   {score}
@@ -451,7 +451,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Target Joint / Spine Segment</label>
               <input
                 type="text"
@@ -468,7 +468,7 @@ export default function SpecialtyToolsPanel({
               />
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Manual Muscle Testing (MMT Grade)</label>
               <select
                 value={physioMmt}
@@ -486,7 +486,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono block">Clinical Modalities</label>
               <div className="flex flex-wrap gap-1.5">
                 {['TENS (15 mins)', 'Moist Heat Pack (15 mins)', 'Therapeutic Ultrasound (1MHz)', 'Interferential Therapy (IFT)', 'Cervical / Lumbar Traction'].map(mod => {
@@ -497,7 +497,7 @@ export default function SpecialtyToolsPanel({
                       type="button"
                       onClick={() => setPhysioModalities(prev => active ? prev.filter(m => m !== mod) : [...prev, mod])}
                       className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
-                        active ? 'bg-teal-600 text-white border-teal-600' : 'bg-white border-slate-200 text-slate-700'
+                        active ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--brand-primary)]'
                       }`}
                     >
                       {active ? '✓ ' : '+ '}{mod}
@@ -507,7 +507,7 @@ export default function SpecialtyToolsPanel({
               </div>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono block">Prescribed Home Exercises</label>
               <div className="flex flex-wrap gap-1.5">
                 {['Core Isometric Bracing', 'Hamstring Static Stretch', 'Scapular Retraction', 'Quadriceps Sets', 'Pelvic Bridging (10 reps x 3 sets)'].map(ex => {
@@ -518,7 +518,7 @@ export default function SpecialtyToolsPanel({
                       type="button"
                       onClick={() => setPhysioExercises(prev => active ? prev.filter(e => e !== ex) : [...prev, ex])}
                       className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
-                        active ? 'bg-teal-600 text-white border-teal-600' : 'bg-white border-slate-200 text-slate-700'
+                        active ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--brand-primary)]'
                       }`}
                     >
                       {active ? '✓ ' : '+ '}{ex}
@@ -534,7 +534,7 @@ export default function SpecialtyToolsPanel({
       {/* 4. PEDIATRICS: Anthropometry & Weight-Based Dosing */}
       {selectedSpecialty === 'pediatrics' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>👶</span> Pediatric Growth &amp; Weight-Based Dosing Panel
@@ -551,7 +551,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-xs font-bold text-slate-700 block mb-1">Body Weight (kg)</label>
               <input
                 type="number"
@@ -565,7 +565,7 @@ export default function SpecialtyToolsPanel({
               </span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-xs font-bold text-slate-700 block mb-1">Height / Length (cm)</label>
               <input
                 type="number"
@@ -576,7 +576,7 @@ export default function SpecialtyToolsPanel({
               <span className="text-[10px] text-slate-400 mt-1 block">WHO Growth standard</span>
             </div>
 
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
               <label className="text-xs font-bold text-slate-700 block mb-1">Head Circumference (cm)</label>
               <input
                 type="number"
@@ -589,7 +589,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Developmental Milestones</label>
               <select
                 value={pediaMilestoneStatus}
@@ -603,7 +603,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Immunization Schedule Status</label>
               <select
                 value={pediaImmunization}
@@ -622,7 +622,7 @@ export default function SpecialtyToolsPanel({
       {/* 5. CARDIOLOGY: Hemodynamics & Classification */}
       {selectedSpecialty === 'cardiology' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>❤️</span> Cardiovascular Evaluation &amp; NYHA Staging
@@ -639,7 +639,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">NYHA Functional Class (Heart Failure)</label>
               <select
                 value={cardioNyha}
@@ -653,7 +653,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Canadian Cardiovascular Society (CCS Angina)</label>
               <select
                 value={cardioCcs}
@@ -668,7 +668,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Cardiac Auscultation Murmurs</label>
               <input
                 type="text"
@@ -678,7 +678,7 @@ export default function SpecialtyToolsPanel({
               />
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Peripheral Congestion &amp; Edema</label>
               <select
                 value={cardioEdema}
@@ -698,7 +698,7 @@ export default function SpecialtyToolsPanel({
       {/* 6. ORTHOPEDICS: Joint Tests & Stability */}
       {selectedSpecialty === 'orthopedics' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>🦴</span> Orthopedic Physical Exam &amp; Provocative Tests
@@ -714,7 +714,7 @@ export default function SpecialtyToolsPanel({
             </button>
           </div>
 
-          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+          <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
             <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Target Joint / Anatomical Region</label>
             <select
               value={orthoJoint}
@@ -733,14 +733,14 @@ export default function SpecialtyToolsPanel({
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {Object.entries(orthoTests).map(([testName, status]) => (
-              <div key={testName} className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+              <div key={testName} className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
                 <span className="text-xs font-bold text-slate-800 block truncate">{testName}</span>
                 <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     onClick={() => setOrthoTests(prev => ({ ...prev, [testName]: prev[testName] === 'pos' ? 'untested' : 'pos' }))}
                     className={`text-xs px-2 py-1 rounded flex-1 font-semibold transition-all ${
-                      status === 'pos' ? 'bg-rose-600 text-white' : 'bg-white border border-slate-200 text-slate-600'
+                      status === 'pos' ? 'bg-rose-600 text-white' : 'bg-[var(--color-surface)] border border-[var(--color-border)] text-slate-600'
                     }`}
                   >
                     + Positive
@@ -749,7 +749,7 @@ export default function SpecialtyToolsPanel({
                     type="button"
                     onClick={() => setOrthoTests(prev => ({ ...prev, [testName]: prev[testName] === 'neg' ? 'untested' : 'neg' }))}
                     className={`text-xs px-2 py-1 rounded flex-1 font-semibold transition-all ${
-                      status === 'neg' ? 'bg-emerald-600 text-white' : 'bg-white border border-slate-200 text-slate-600'
+                      status === 'neg' ? 'bg-emerald-600 text-white' : 'bg-[var(--color-surface)] border border-[var(--color-border)] text-slate-600'
                     }`}
                   >
                     - Negative
@@ -764,7 +764,7 @@ export default function SpecialtyToolsPanel({
       {/* 7. DERMATOLOGY: Cutaneous Profile */}
       {selectedSpecialty === 'dermatology' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>🔬</span> Cutaneous Lesion Morphology &amp; Phototype
@@ -781,7 +781,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Primary Lesion Morphology</label>
               <select
                 value={dermaLesion}
@@ -797,7 +797,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Fitzpatrick Phototype</label>
               <select
                 value={dermaFitzpatrick}
@@ -814,7 +814,7 @@ export default function SpecialtyToolsPanel({
             </div>
           </div>
 
-          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+          <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
             <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono block">Special Dermatologic Signs</label>
             <div className="flex flex-wrap gap-2">
               {[
@@ -831,7 +831,7 @@ export default function SpecialtyToolsPanel({
                     type="button"
                     onClick={() => setDermaSigns(prev => active ? prev.filter(s => s !== sign) : [...prev, sign])}
                     className={`text-xs px-2.5 py-1 rounded-lg border font-medium transition-all ${
-                      active ? 'bg-teal-600 text-white border-teal-600' : 'bg-white border-slate-200 text-slate-700'
+                      active ? 'btn-primary shadow-xs' : 'bg-[var(--color-surface)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--brand-primary)]'
                     }`}
                   >
                     {active ? '✓ ' : '+ '}{sign}
@@ -846,7 +846,7 @@ export default function SpecialtyToolsPanel({
       {/* 8. ENT: Otoscopy & Rhinoscopy */}
       {selectedSpecialty === 'ent' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>👂</span> ENT &amp; Otolaryngology Examination
@@ -863,7 +863,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Right TM (Otoscopy)</label>
               <select
                 value={entRightTm}
@@ -877,7 +877,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Left TM (Otoscopy)</label>
               <select
                 value={entLeftTm}
@@ -891,7 +891,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Nasal Septum (Rhinoscopy)</label>
               <input
                 type="text"
@@ -901,7 +901,7 @@ export default function SpecialtyToolsPanel({
               />
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Tonsillar Hypertrophy Grade</label>
               <select
                 value={entTonsils}
@@ -921,7 +921,7 @@ export default function SpecialtyToolsPanel({
       {/* 9. OPHTHALMOLOGY: Visual Acuity & IOP */}
       {selectedSpecialty === 'ophthalmology' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>👁️</span> Ophthalmic Assessment (Snellen VA &amp; Tonometry)
@@ -938,7 +938,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Right Eye (OD) Visual Acuity</label>
               <select
                 value={ophthOdVa}
@@ -958,7 +958,7 @@ export default function SpecialtyToolsPanel({
               />
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Left Eye (OS) Visual Acuity</label>
               <select
                 value={ophthOsVa}
@@ -984,7 +984,7 @@ export default function SpecialtyToolsPanel({
       {/* 10. AYURVEDA: Ashta Vidha Pariksha */}
       {selectedSpecialty === 'ayurveda' && (
         <div className="card p-5 border-teal-200 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--color-border)]">
             <div>
               <h3 className="text-sm font-bold text-slate-800 font-heading flex items-center gap-2">
                 <span>🌿</span> Ayurvedic Ashta Vidha Pariksha &amp; Agni
@@ -1001,7 +1001,7 @@ export default function SpecialtyToolsPanel({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Nadi Gati (Pulse)</label>
               <select
                 value={ayurNadi}
@@ -1016,7 +1016,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Jihva (Tongue Pariksha)</label>
               <select
                 value={ayurJihva}
@@ -1030,7 +1030,7 @@ export default function SpecialtyToolsPanel({
               </select>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] space-y-2">
               <label className="text-xs font-bold text-slate-700 uppercase tracking-wide font-mono">Agni (Digestive Fire)</label>
               <select
                 value={ayurAgni}

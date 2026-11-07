@@ -14,4 +14,7 @@ public interface ITenantContext
     /// Dispose to restore the previous scope.
     /// </summary>
     IDisposable PushTenant(Guid tenantId);
+
+    /// <summary>Explicit no-HTTP startup/maintenance inventory only; tenant business work uses PushTenant.</summary>
+    IDisposable PushMaintenance() => throw new NotSupportedException("Maintenance scope is not available.");
 }

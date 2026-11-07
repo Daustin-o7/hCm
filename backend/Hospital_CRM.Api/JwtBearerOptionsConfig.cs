@@ -10,7 +10,12 @@ public sealed class JwtBearerOptionsConfig(IPersistentKeyService keyService) : I
     public void PostConfigure(string? name, JwtBearerOptions options)
     {
         options.TokenValidationParameters ??= new TokenValidationParameters();
-        options.TokenValidationParameters.IssuerSigningKey ??= keyService.GetPublicKey();
+        var keys = keyService.GetValidationKeys();
+        options.TokenValidationParameters.IssuerSigningKey = null;
+        options.TokenValidationParameters.IssuerSigningKeys = keys;
+        options.TokenValidationParameters.TryAllIssuerSigningKeys = false;
+        options.TokenValidationParameters.IssuerSigningKeyResolver = (_, _, kid, _) =>
+            keys.Where(key => string.Equals(key.KeyId, kid, StringComparison.Ordinal));
         options.TokenValidationParameters.ValidAlgorithms ??= new[] { SecurityAlgorithms.RsaSha256 };
     }
 }

@@ -4,9 +4,6 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-# Copy solution-level props first (so restore can find target framework etc.)
-COPY ["Directory.Build.props", "./"]
-
 # Copy csproj files for restore (caching)
 COPY ["Hospital_CRM.Api/Hospital_CRM.Api.csproj", "Hospital_CRM.Api/"]
 COPY ["Hospital_CRM.Application/Hospital_CRM.Application.csproj", "Hospital_CRM.Application/"]
@@ -30,9 +27,9 @@ RUN dotnet publish "Hospital_CRM.Api/Hospital_CRM.Api.csproj" \
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 
-# Install curl for healthcheck probe in minimal runtime image
+# Install healthcheck tooling and the prescription renderer's native dependency
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libfontconfig1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for production

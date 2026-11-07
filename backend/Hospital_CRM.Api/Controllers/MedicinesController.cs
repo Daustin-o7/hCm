@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Security.Cryptography;
 using System.Text;
 using Hospital_CRM.Api.Authorization;
@@ -38,10 +39,24 @@ public class MedicinesController : ControllerBase
     [HttpGet("search")]
     public async Task<IActionResult> Search([FromQuery] string? q, [FromQuery] int limit = 10, CancellationToken ct = default)
     {
-        var userId = User.GetUserId();
-        if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
+        try
+        {
+            return await SearchAsync(q, limit, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested && ex is SearchUnavailableException or DbException)
+        {
+            _logger.LogWarning("Medicine search unavailable ({FailureType})", ex.GetType().Name);
+            return StatusCode(503, new { error = "search_unavailable", message = "Database search is temporarily unavailable. Retry the search before proceeding." });
+        }
+    }
 
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
+    private async Task<IActionResult> SearchAsync(string? q, int limit, CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        if (!userId.HasValue || userId == Guid.Empty) return Unauthorized(new { error = "invalid_token" });
+        if (!await HasSelectedContextAsync(ct)) return StatusCode(403, new { error = "invalid_selected_clinic" });
+
+        var tenantId = User.GetTenantId()!.Value;
 
         if (string.IsNullOrWhiteSpace(q))
             return Ok(Array.Empty<object>());
@@ -55,29 +70,29 @@ public class MedicinesController : ControllerBase
         // Fetch corresponding DB records to preserve verified schedule, datasource, etc.
         var hitIds = hits.Select(h => h.Id).ToList();
         var dbDrugs = await _db.Drugs.AsNoTracking()
-            .Where(d => hitIds.Contains(d.Id))
+            .Where(d => d.TenantId == tenantId && hitIds.Contains(d.Id))
             .ToDictionaryAsync(d => d.Id, ct);
 
         var results = new List<object>();
 
         foreach (var h in hits)
         {
-            dbDrugs.TryGetValue(h.Id, out var drug);
+            if (!dbDrugs.TryGetValue(h.Id, out var drug)) continue;
             results.Add(new
             {
-                id = h.Id,
-                name = h.Name,
-                genericName = h.GenericName,
-                commonBrands = h.CommonBrands,
-                strength = h.Strength,
-                dosageForm = h.DosageForm,
-                scheduleClass = drug?.ScheduleClass.ToString(),
-                dataSource = drug?.DataSource ?? "HospitalMaster",
-                isUnverified = drug?.IsUnverified ?? false,
-                checkpointMessage = (drug?.IsUnverified ?? false) ? "Open Source - Needs Pharmacist Review" : null,
-                indicativeMrp = drug?.IndicativeMrp ?? 0m,
-                gstRate = drug?.GstRate ?? 12m,
-                hsnCode = drug?.HsnCode,
+                id = drug.Id,
+                name = drug.Name,
+                genericName = drug.GenericName,
+                commonBrands = drug.CommonBrands,
+                strength = drug.Strength,
+                dosageForm = drug.DosageForm,
+                scheduleClass = drug.ScheduleClass.ToString(),
+                dataSource = drug.DataSource,
+                isUnverified = drug.IsUnverified,
+                checkpointMessage = drug.IsUnverified ? "Open Source - Needs Pharmacist Review" : null,
+                indicativeMrp = drug.IndicativeMrp,
+                gstRate = drug.GstRate,
+                hsnCode = drug.HsnCode,
                 score = h.Score
             });
         }
@@ -134,9 +149,9 @@ public class MedicinesController : ControllerBase
                 });
                 await _db.SaveChangesAsync(ct);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
-                _logger.LogWarning(ex, "Failed to record medicine search miss log for {Query}", cleanQuery);
+                _logger.LogWarning("Failed to record medicine search miss ({FailureType})", ex.GetType().Name);
             }
         }
 
@@ -147,16 +162,19 @@ public class MedicinesController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Pharmacist")]
     public async Task<IActionResult> CurateMedicineFromSource([FromBody] CurateMedicineRequest req, CancellationToken ct)
     {
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
+        if (User.GetUserId() is not { } userId || userId == Guid.Empty) return Unauthorized(new { error = "invalid_token" });
+        if (!await HasSelectedContextAsync(ct)) return StatusCode(403, new { error = "invalid_selected_clinic" });
+        var tenantId = User.GetTenantId()!.Value;
 
         if (string.IsNullOrWhiteSpace(req.Name) || string.IsNullOrWhiteSpace(req.GenericName))
             return BadRequest(new { error = "name_and_generic_required" });
 
         var schedule = ScheduleClass.General;
-        if (!string.IsNullOrWhiteSpace(req.ScheduleClass) && Enum.TryParse<ScheduleClass>(req.ScheduleClass, true, out var parsedSched))
-        {
-            schedule = parsedSched;
-        }
+        if (!string.IsNullOrWhiteSpace(req.ScheduleClass)
+            && (!Enum.TryParse(req.ScheduleClass, true, out schedule) || !Enum.IsDefined(schedule)))
+            return BadRequest(new { error = "invalid_schedule_class" });
+        if (req.GstRate < 0 || req.GstRate > 100 || req.IndicativeMrp < 0)
+            return BadRequest(new { error = "invalid_price_or_gst" });
 
         var drug = new Drug
         {
@@ -164,12 +182,12 @@ public class MedicinesController : ControllerBase
             TenantId = tenantId,
             Name = req.Name.Trim(),
             GenericName = req.GenericName.Trim(),
-            TherapeuticCategory = req.TherapeuticCategory,
-            DosageForm = req.DosageForm,
-            Strength = req.Strength,
+            TherapeuticCategory = !string.IsNullOrWhiteSpace(req.TherapeuticCategory) ? req.TherapeuticCategory.Trim() : "General",
+            DosageForm = !string.IsNullOrWhiteSpace(req.DosageForm) ? req.DosageForm.Trim() : "Tablet",
+            Strength = req.Strength?.Trim() ?? "",
             ScheduleClass = schedule,
-            HsnCode = req.HsnCode,
-            GstRate = req.GstRate > 0 ? req.GstRate : 12m,
+            HsnCode = !string.IsNullOrWhiteSpace(req.HsnCode) ? req.HsnCode.Trim() : "30049099",
+            GstRate = req.GstRate,
             IndicativeMrp = req.IndicativeMrp,
             StandardPackSize = req.StandardPackSize ?? "10 Tablets",
             CommonBrands = req.CommonBrands ?? req.Name.Trim(),
@@ -182,6 +200,22 @@ public class MedicinesController : ControllerBase
 
         _db.Drugs.Add(drug);
         await _db.SaveChangesAsync(ct);
+
+        if (ct.IsCancellationRequested || _db.Database.CurrentTransaction != null || System.Transactions.Transaction.Current != null)
+            _logger.LogWarning("Medicine index deferred for tenant {TenantId}; reconciliation required", tenantId);
+        else
+        {
+            try
+            {
+                await _search.IndexMedicineAsync(drug, ct);
+            }
+            catch (Exception ex)
+            {
+                // Derived indexing must not turn a saved mutation into a retry, including cancellation.
+                _logger.LogWarning("Medicine index failed for tenant {TenantId}, record {DrugId} ({FailureType}); reconciliation required",
+                    tenantId, drug.Id, ex.GetType().Name);
+            }
+        }
 
         return StatusCode(201, new
         {
@@ -199,10 +233,12 @@ public class MedicinesController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Pharmacist")]
     public async Task<IActionResult> GetSearchMissLogs([FromQuery] int limit = 50, CancellationToken ct = default)
     {
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
+        if (User.GetUserId() is not { } userId || userId == Guid.Empty) return Unauthorized(new { error = "invalid_token" });
+        if (!await HasSelectedContextAsync(ct)) return StatusCode(403, new { error = "invalid_selected_clinic" });
+        var tenantId = User.GetTenantId()!.Value;
 
         var misses = await _db.MedicineSearchMissLogs.AsNoTracking()
-            .Where(m => tenantId == Guid.Empty || m.TenantId == tenantId)
+            .Where(m => m.TenantId == tenantId)
             .OrderByDescending(m => m.SearchedAt)
             .Take(Math.Clamp(limit, 1, 200))
             .Select(m => new
@@ -215,6 +251,19 @@ public class MedicinesController : ControllerBase
             .ToListAsync(ct);
 
         return Ok(misses);
+    }
+
+    private async Task<bool> HasSelectedContextAsync(CancellationToken ct)
+    {
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        var userId = User.GetUserId();
+        if (tenantId is null || tenantId == Guid.Empty || tenantId != _db.CurrentTenantId
+            || clinicId is null || clinicId == Guid.Empty)
+            return false;
+        return await _db.Clinics.AnyAsync(c => c.Id == clinicId && c.TenantId == tenantId, ct)
+            && await _db.TenantMemberships.AnyAsync(m => m.UserId == userId && m.TenantId == tenantId
+                && m.ClinicId == clinicId && m.Status == "active", ct);
     }
 
     private static Guid CreateDeterministicGuid(string input)

@@ -22,15 +22,18 @@ public class SubscriptionWebhooksController : ControllerBase
     private readonly HospitalCrmDbContext _db;
     private readonly IConfiguration _config;
     private readonly ILogger<SubscriptionWebhooksController> _logger;
+    private readonly ITenantContext? _tenantContext;
 
     public SubscriptionWebhooksController(
         HospitalCrmDbContext db,
         IConfiguration config,
-        ILogger<SubscriptionWebhooksController> logger)
+        ILogger<SubscriptionWebhooksController> logger,
+        ITenantContext? tenantContext = null)
     {
         _db = db;
         _config = config;
         _logger = logger;
+        _tenantContext = tenantContext;
     }
 
     [HttpPost("subscriptions/{provider}")]
@@ -54,7 +57,7 @@ public class SubscriptionWebhooksController : ControllerBase
         if (billingEvent is null)
             return Ok(new { status = "ignored" });
 
-        if (billingEvent.TenantId is null)
+        if (billingEvent.TenantId is null || billingEvent.TenantId == Guid.Empty)
         {
             // Nothing to scope the dedupe row to, so this cannot be recorded per tenant.
             _logger.LogWarning("Subscription webhook for {Provider} carried no notes.tenant_id", provider);
@@ -62,6 +65,7 @@ public class SubscriptionWebhooksController : ControllerBase
         }
 
         var tenantId = billingEvent.TenantId.Value;
+        using var tenantScope = _tenantContext?.PushTenant(tenantId);
         var eventId = Request.Headers["X-Razorpay-Event-Id"].ToString();
         if (string.IsNullOrWhiteSpace(eventId))
             eventId = PaymentWebhookCodec.SignSha256(body);
@@ -86,7 +90,7 @@ public class SubscriptionWebhooksController : ControllerBase
             }
 
             var already = await _db.ProcessedWebhookEvents.IgnoreQueryFilters()
-                .AnyAsync(e => e.Provider == eventProvider && e.EventId == eventId, ct);
+                .AnyAsync(e => e.TenantId == tenantId && e.Provider == eventProvider && e.EventId == eventId, ct);
             if (already)
             {
                 await transaction.CommitAsync(ct);

@@ -24,33 +24,34 @@ public class Section5PharmacyBillingLinkTests
             .UseInMemoryDatabase(databaseName: dbName ?? Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
-    private static ClaimsPrincipal CreatePrincipal(Guid tenantId, Guid userId, string role = "Receptionist")
+    private static ClaimsPrincipal CreatePrincipal(Guid tenantId, Guid userId, Guid clinicId, string role)
     {
         var identity = new ClaimsIdentity(new[]
         {
             new Claim("tenant_id", tenantId.ToString()),
             new Claim("sub", userId.ToString()),
+            new Claim("clinicId", clinicId.ToString()),
             new Claim(ClaimTypes.Role, role)
         }, "TestAuth");
         return new ClaimsPrincipal(identity);
     }
 
-    private static InvoicesController CreateInvoicesController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "Receptionist")
+    private static InvoicesController CreateInvoicesController(HospitalCrmDbContext db, Guid tenantId, Guid userId, Guid clinicId, string role)
     {
         var config = new ConfigurationBuilder().AddInMemoryCollection().Build();
         var controller = new InvoicesController(db, config, null!);
         controller.ControllerContext = new ControllerContext
         {
-            HttpContext = new DefaultHttpContext { User = CreatePrincipal(tenantId, userId, role) }
+            HttpContext = new DefaultHttpContext { User = CreatePrincipal(tenantId, userId, clinicId, role) }
         };
         return controller;
     }
 
-    private static (Clinic clinic, User doctor, User pharmacist, Patient patient, Appointment appointment, Consultation consultation, Prescription rx, Drug drug, DrugBatch batch)
-        SeedFullClinicalPharmacySetup(HospitalCrmDbContext db, Guid tenantId, Guid doctorId, Guid pharmacistId)
+    private static (Clinic clinic, User doctor, User staff, Patient patient, Appointment appointment, Consultation consultation, Prescription rx, Drug drug, DrugBatch batch)
+        SeedFullClinicalPharmacySetup(HospitalCrmDbContext db, Guid tenantId, Guid doctorId, Guid staffId, UserRole staffRole)
     {
         var clinic = new Clinic
         {
@@ -72,15 +73,18 @@ public class Section5PharmacyBillingLinkTests
         };
         db.Users.Add(doctor);
 
-        var pharmacist = new User
+        var staff = new User
         {
-            Id = pharmacistId,
+            Id = staffId,
             TenantId = tenantId,
             Name = "Ramesh Kumar",
-            Role = UserRole.Pharmacist,
+            Role = staffRole,
             ClinicId = clinic.Id
         };
-        db.Users.Add(pharmacist);
+        db.Users.Add(staff);
+        db.TenantMemberships.AddRange(
+            new TenantMembership { UserId = doctor.Id, TenantId = tenantId, ClinicId = clinic.Id, Role = UserRole.Doctor },
+            new TenantMembership { UserId = staff.Id, TenantId = tenantId, ClinicId = clinic.Id, Role = staffRole });
 
         var patient = new Patient
         {
@@ -105,6 +109,7 @@ public class Section5PharmacyBillingLinkTests
         var consultation = new Consultation
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             AppointmentId = appointment.Id,
             DoctorId = doctor.Id,
             DoctorRegistrationNumber = "MCI-45892",
@@ -116,6 +121,7 @@ public class Section5PharmacyBillingLinkTests
         var rx = new Prescription
         {
             Id = Guid.NewGuid(),
+            TenantId = tenantId,
             ConsultationId = consultation.Id
         };
         db.Prescriptions.Add(rx);
@@ -171,7 +177,7 @@ public class Section5PharmacyBillingLinkTests
 
         db.SaveChanges();
 
-        return (clinic, doctor, pharmacist, patient, appointment, consultation, rx, drug, batch);
+        return (clinic, doctor, staff, patient, appointment, consultation, rx, drug, batch);
     }
 
     [Fact]
@@ -182,7 +188,7 @@ public class Section5PharmacyBillingLinkTests
         var doctorId = Guid.NewGuid();
         var pharmacistId = Guid.NewGuid();
 
-        var setup = SeedFullClinicalPharmacySetup(db, tenantId, doctorId, pharmacistId);
+        var setup = SeedFullClinicalPharmacySetup(db, tenantId, doctorId, pharmacistId, UserRole.Pharmacist);
 
         // Pre-create OPD Consultation invoice for appointment
         var consultationInvoice = new Invoice
@@ -206,7 +212,7 @@ public class Section5PharmacyBillingLinkTests
         var controller = new PharmacyComplianceController(db, NullLogger<PharmacyComplianceController>.Instance);
         controller.ControllerContext = new ControllerContext
         {
-            HttpContext = new DefaultHttpContext { User = CreatePrincipal(tenantId, pharmacistId, "Pharmacist") }
+            HttpContext = new DefaultHttpContext { User = CreatePrincipal(tenantId, pharmacistId, setup.clinic.Id, "Pharmacist") }
         };
 
         var dispenseReq = new DispensePrescriptionRequest(
@@ -264,7 +270,7 @@ public class Section5PharmacyBillingLinkTests
         var doctorId = Guid.NewGuid();
         var staffId = Guid.NewGuid();
 
-        var setup = SeedFullClinicalPharmacySetup(db, tenantId, doctorId, staffId);
+        var setup = SeedFullClinicalPharmacySetup(db, tenantId, doctorId, staffId, UserRole.Receptionist);
 
         var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTime.UtcNow);
 
@@ -306,7 +312,7 @@ public class Section5PharmacyBillingLinkTests
         db.Invoices.Add(consultationInvoice);
         await db.SaveChangesAsync();
 
-        var invoicesController = CreateInvoicesController(db, tenantId, staffId, "Receptionist");
+        var invoicesController = CreateInvoicesController(db, tenantId, staffId, setup.clinic.Id, "Receptionist");
 
         // 1. GetInvoice on consultation invoice includes linkedPharmacyInvoice summary
         var getResult = await invoicesController.GetInvoice(consultationInvoice.Id, CancellationToken.None);
@@ -346,6 +352,10 @@ public class Section5PharmacyBillingLinkTests
         var pharmacistId = Guid.NewGuid();
 
         var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTime.UtcNow);
+        var clinic = new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Pharmacy clinic" };
+        db.Clinics.Add(clinic);
+        db.Users.Add(new User { Id = pharmacistId, TenantId = tenantId, ClinicId = clinic.Id, Name = "Pharmacist", Role = UserRole.Pharmacist });
+        db.TenantMemberships.Add(new TenantMembership { UserId = pharmacistId, TenantId = tenantId, ClinicId = clinic.Id, Role = UserRole.Pharmacist });
 
         var pharmInvoice = new Invoice
         {
@@ -366,7 +376,7 @@ public class Section5PharmacyBillingLinkTests
         var paymentsController = new PaymentsController(db);
         paymentsController.ControllerContext = new ControllerContext
         {
-            HttpContext = new DefaultHttpContext { User = CreatePrincipal(tenantId, pharmacistId, "Pharmacist") }
+            HttpContext = new DefaultHttpContext { User = CreatePrincipal(tenantId, pharmacistId, clinic.Id, "Pharmacist") }
         };
 
         var confirmReq = new ConfirmPaymentRequest(
@@ -406,6 +416,10 @@ public class Section5PharmacyBillingLinkTests
         var staffId = Guid.NewGuid();
 
         var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTime.UtcNow);
+        var clinic = new Clinic { Id = Guid.NewGuid(), TenantId = tenantId, Name = "Billing clinic" };
+        db.Clinics.Add(clinic);
+        db.Users.Add(new User { Id = staffId, TenantId = tenantId, ClinicId = clinic.Id, Name = "Receptionist", Role = UserRole.Receptionist });
+        db.TenantMemberships.Add(new TenantMembership { UserId = staffId, TenantId = tenantId, ClinicId = clinic.Id, Role = UserRole.Receptionist });
 
         var consultationInvoice = new Invoice
         {
@@ -445,7 +459,7 @@ public class Section5PharmacyBillingLinkTests
         db.Invoices.Add(pharmInvoice);
         await db.SaveChangesAsync();
 
-        var controller = CreateInvoicesController(db, tenantId, staffId, "Receptionist");
+        var controller = CreateInvoicesController(db, tenantId, staffId, clinic.Id, "Receptionist");
 
         // 1. Linking a non-pharmacy invoice returns BadRequest
         var invalidResult = await controller.LinkPharmacyInvoice(
@@ -474,7 +488,7 @@ public class Section5PharmacyBillingLinkTests
         var doctorId = Guid.NewGuid();
         var staffId = Guid.NewGuid();
 
-        var setup = SeedFullClinicalPharmacySetup(db, tenantId, doctorId, staffId);
+        var setup = SeedFullClinicalPharmacySetup(db, tenantId, doctorId, staffId, UserRole.Receptionist);
 
         var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTime.UtcNow);
 
@@ -495,7 +509,7 @@ public class Section5PharmacyBillingLinkTests
         db.Invoices.Add(pharmInvoice);
         await db.SaveChangesAsync();
 
-        var controller = CreateInvoicesController(db, tenantId, staffId, "Receptionist");
+        var controller = CreateInvoicesController(db, tenantId, staffId, setup.clinic.Id, "Receptionist");
 
         // Receptionist generates consultation invoice afterwards without explicitly passing LinkedPharmacyInvoiceId
         var generateReq = new GenerateInvoiceRequest(

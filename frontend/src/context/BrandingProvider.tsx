@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback } from 'react'
-import api, { getAccessToken } from '../services/api'
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
+import api, { getAccessToken, getSessionGeneration } from '../services/api'
 import { useAuth } from './AuthContext'
 import {
   BrandingContext,
@@ -37,15 +37,20 @@ function darken(hex: string, amount: number): string {
   return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`
 }
 
+const defaultFavicon = document.querySelector<HTMLLinkElement>('link[rel~="icon"]')?.getAttribute('href')
+
 function applyDocumentBranding(branding: OrganizationBranding) {
-  if (branding.faviconUrl) {
+  const favicon = branding.faviconUrl || defaultFavicon
+  if (favicon) {
     let link = document.querySelector<HTMLLinkElement>('link[rel~="icon"]')
     if (!link) {
       link = document.createElement('link')
       link.rel = 'icon'
       document.head.appendChild(link)
     }
-    link.href = branding.faviconUrl
+    link.href = favicon
+  } else {
+    document.querySelector('link[rel~="icon"]')?.remove()
   }
   document.title = branding.organizationName
     ? `${branding.organizationName} — SAMSTACK AI`
@@ -53,24 +58,33 @@ function applyDocumentBranding(branding: OrganizationBranding) {
 }
 
 export function BrandingProvider({ children }: { children: React.ReactNode }) {
-  const { user } = useAuth()
+  const { user, currentTenantId, currentClinicId, sessionGeneration, loading: authLoading } = useAuth()
   const [branding, setBranding] = useState<OrganizationBranding>(SAMSTACK_DEFAULTS)
+  const [resolvedScope, setResolvedScope] = useState('')
   const [loading, setLoading] = useState(true)
+  const request = useRef<AbortController | null>(null)
+  const scope = `${sessionGeneration}:${user?.id}:${currentTenantId}:${currentClinicId}`
 
   const fetchBranding = useCallback(async () => {
+    request.current?.abort()
+    const controller = new AbortController()
+    request.current = controller
+    const generation = getSessionGeneration()
     const token = getAccessToken()
     const isPlatformAdmin = String(user?.role).toLowerCase() === 'platformadmin'
 
     // A PlatformAdmin has no clinic: /clinic/profile answers 403 by design, so don't ask.
-    if (!token || isPlatformAdmin) {
+    if (!token || isPlatformAdmin || authLoading) {
       setBranding(SAMSTACK_DEFAULTS)
+      setResolvedScope(scope)
       setLoading(false)
       return
     }
 
     try {
       setLoading(true)
-      const res = await api.get('/clinic/profile')
+      const res = await api.get('/clinic/profile', { signal: controller.signal })
+      if (controller.signal.aborted || generation !== getSessionGeneration()) return
       const data = res.data
       const resolved: OrganizationBranding = {
         organizationName: data.name || data.organizationName || SAMSTACK_DEFAULTS.organizationName,
@@ -94,23 +108,34 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
         enabledModules:   Array.isArray(data.activatedModules) ? data.activatedModules : null,
       }
       setBranding(resolved)
+      setResolvedScope(scope)
       applyBrandColors(resolved.primaryColor, resolved.secondaryColor)
       applyDocumentBranding(resolved)
     } catch {
-      // Silently fall back to defaults
+      if (!controller.signal.aborted && generation === getSessionGeneration()) {
+        setBranding(SAMSTACK_DEFAULTS)
+        setResolvedScope(scope)
+        applyBrandColors(SAMSTACK_DEFAULTS.primaryColor, SAMSTACK_DEFAULTS.secondaryColor)
+        applyDocumentBranding(SAMSTACK_DEFAULTS)
+      }
     } finally {
-      setLoading(false)
+      if (!controller.signal.aborted && generation === getSessionGeneration()) setLoading(false)
     }
-  }, [user?.role])
+  }, [user?.role, scope, authLoading])
+
+  useLayoutEffect(() => {
+    applyBrandColors(SAMSTACK_DEFAULTS.primaryColor, SAMSTACK_DEFAULTS.secondaryColor)
+    applyDocumentBranding(SAMSTACK_DEFAULTS)
+  }, [scope])
 
   useEffect(() => {
-    fetchBranding()
-    // Refetch when the signed-in user changes: the profile (and its module entitlements) is
-    // only readable with a token, so the boot call runs before login.
-  }, [fetchBranding, user?.id])
+    void fetchBranding()
+    return () => { request.current?.abort() }
+  }, [fetchBranding])
 
   return (
-    <BrandingContext.Provider value={{ branding, loading, refresh: fetchBranding }}>
+    <BrandingContext.Provider value={{ branding: resolvedScope === scope ? branding : SAMSTACK_DEFAULTS,
+      loading: loading || resolvedScope !== scope, refresh: fetchBranding }}>
       {children}
     </BrandingContext.Provider>
   )

@@ -26,7 +26,7 @@ public class PharmacyGateEndpointTests
             .UseInMemoryDatabase(databaseName: $"PharmGateDb_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static (PharmacyComplianceController controller, HospitalCrmDbContext db, Guid tenantId, Guid doctorId, Guid prescriptionId) CreateControllerWithFixture(
@@ -228,7 +228,7 @@ public class PharmacyGateEndpointTests
 
         Assert.True(await ModuleGateAllows(controller, db));
 
-        var req = new DispensePrescriptionRequest(prescriptionId, null, null, null, null, null);
+        var req = new DispensePrescriptionRequest(prescriptionId, IdempotencyKey: "module-gate");
         var result = await controller.DispensePrescription(req, CancellationToken.None);
 
         // Status code must NOT be 403 pharmacy_feature_disabled

@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { isAxiosError } from 'axios'
 import { EmptyState, SkeletonTableRow } from '../components/ui/EmptyState'
 import { friendlyError } from '../components/ui/Alert'
 import { Modal, Confirm } from '../components/ui/Modal'
@@ -6,7 +7,7 @@ import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import TwoFactorSettings from '../components/TwoFactorSettings'
 import { fmtDate } from '../utils/format'
-import api from '../services/api'
+import api, { getSessionGeneration } from '../services/api'
 
 // Mirrors ModuleRegistry (backend, A2). The API rejects unknown codes with 400 unknown_module_code.
 const MODULE_CODES = ['core', 'pharmacy', 'lab', 'inventory', 'finance', 'wishlist', 'emergency', 'precheck', 'notifications']
@@ -85,7 +86,7 @@ const toDateInput = (iso: string | null | undefined) => (iso ? iso.slice(0, 10) 
 const sameSet = (a: string[], b: string[]) => [...a].sort().join(',') === [...b].sort().join(',')
 
 export default function PlatformAdmin() {
-  const { startImpersonation } = useAuth()
+  const { startImpersonation, sessionGeneration } = useAuth()
   const { toast } = useToast()
 
   const [tenants, setTenants] = useState<Tenant[]>([])
@@ -110,22 +111,41 @@ export default function PlatformAdmin() {
   const [impReason, setImpReason] = useState('')
   const [impMinutes, setImpMinutes] = useState(15)
   const [starting, setStarting] = useState(false)
+  const impersonationLifetime = useRef(0)
+
+  useEffect(() => {
+    setStarting(false)
+    return () => { impersonationLifetime.current++ }
+  }, [openId, impTarget?.id])
 
   const [auditFor, setAuditFor] = useState<ImpersonationLog | null>(null)
   const [audit, setAudit] = useState<PhiRead[] | null>(null)
 
-  // B3 provisioning. The idempotency key is minted once per opened form, so pressing
-  // "Provision" twice replays the first response instead of creating a second tenant.
+  // shortcut: retries survive modal closure only; reload/navigation recovery needs a protected receipt lookup.
   const [provOpen, setProvOpen] = useState(false)
-  const [provKey, setProvKey] = useState('')
+  const [provAttempt, setProvAttempt] = useState<{ key: string; payload: string; generation: number } | null>(null)
+  const provBusy = useRef(false)
+  const provLifetime = useRef(0)
   const [provSaving, setProvSaving] = useState(false)
   const [provError, setProvError] = useState<string | null>(null)
-  const [provResult, setProvResult] = useState<{ tenantId: string; inviteToken: string; inviteExpiresAt: string } | null>(null)
+  const [provResult, setProvResult] = useState<{ tenantId: string; inviteToken: string; inviteExpiresAt: string; emailStatus?: string } | null>(null)
+  const [inviteCopyStatus, setInviteCopyStatus] = useState('')
   const [prov, setProv] = useState({
     name: '', clinicName: '', adminName: '', adminEmail: '',
     tier: 'trial', status: 'trial', endsAt: '', timezone: 'Asia/Kolkata', currency: 'INR',
     modules: ['core'] as string[],
   })
+
+  useEffect(() => {
+    setProvOpen(false)
+    setProvAttempt(null)
+    setProvResult(null)
+    setProvError(null)
+    setInviteCopyStatus('')
+    setProvSaving(false)
+    provBusy.current = false
+    return () => { provLifetime.current++ }
+  }, [sessionGeneration])
 
   const fetchTenants = useCallback(async (q: string) => {
     try {
@@ -286,6 +306,9 @@ export default function PlatformAdmin() {
 
   const runImpersonation = async () => {
     if (!detail || !impTarget) return
+    const generation = getSessionGeneration()
+    const lifetime = impersonationLifetime.current
+    const current = () => lifetime === impersonationLifetime.current && generation === getSessionGeneration()
     if (impReason.trim().length < 10) {
       toast('Enter a reason of at least 10 characters', 'error')
       return
@@ -298,6 +321,7 @@ export default function PlatformAdmin() {
         reason: impReason.trim(),
         durationMinutes: impMinutes,
       })
+      if (!current()) return
       startImpersonation({
         impersonationId: res.data.impersonationId,
         accessToken: res.data.accessToken,
@@ -306,6 +330,7 @@ export default function PlatformAdmin() {
         reason: impReason.trim(),
       })
     } catch (err) {
+      if (!current()) return
       toast(friendlyError(err), 'error')
       setStarting(false)
     }
@@ -324,45 +349,79 @@ export default function PlatformAdmin() {
   }
 
   const submitProvision = async () => {
-    if (!prov.name.trim() || !prov.adminName.trim() || !prov.adminEmail.trim()) {
+    if (provBusy.current || provResult || sessionGeneration !== getSessionGeneration()) return
+    if (provAttempt && provAttempt.generation !== getSessionGeneration()) return
+    if (!provAttempt && (!prov.name.trim() || !prov.adminName.trim() || !prov.adminEmail.trim())) {
       setProvError('Tenant name, admin name and admin email are required.')
       return
     }
+    const generation = getSessionGeneration()
+    const lifetime = provLifetime.current
+    const current = () => lifetime === provLifetime.current && generation === getSessionGeneration()
     try {
+      provBusy.current = true
       setProvSaving(true)
       setProvError(null)
-      const res = await api.post('/platform-admin/tenants', {
-        name: prov.name.trim(),
-        clinicName: prov.clinicName.trim() || null,
-        adminName: prov.adminName.trim(),
-        adminEmail: prov.adminEmail.trim(),
-        subscriptionTier: prov.tier,
-        subscriptionStatus: prov.status,
-        activatedModules: prov.modules,
-        subscriptionEndsAt: prov.endsAt ? new Date(`${prov.endsAt}T00:00:00Z`).toISOString() : null,
-        timezone: prov.timezone,
-        currency: prov.currency,
-      }, { headers: { 'X-Idempotency-Key': provKey } })
+      const attempt = provAttempt ?? {
+        key: crypto.randomUUID(), generation,
+        payload: JSON.stringify({
+          name: prov.name.trim(),
+          clinicName: prov.clinicName.trim() || null,
+          adminName: prov.adminName.trim(),
+          adminEmail: prov.adminEmail.trim(),
+          subscriptionTier: prov.tier,
+          subscriptionStatus: prov.status,
+          activatedModules: prov.modules,
+          subscriptionEndsAt: prov.endsAt ? new Date(`${prov.endsAt}T00:00:00Z`).toISOString() : null,
+          timezone: prov.timezone,
+          currency: prov.currency,
+        }),
+      }
+      setProvAttempt(attempt)
+      const res = await api.post('/platform-admin/tenants', attempt.payload, { headers: { 'X-Idempotency-Key': attempt.key } })
+      if (!current()) return
       setProvResult(res.data)
-      toast('Tenant provisioned. Send the invite link to the clinic admin.', 'success')
-      void fetchTenants(query.trim())
+      setInviteCopyStatus('')
+      toast('Tenant provisioned. Review the invitation details.', 'success')
+      void api.get('/platform-admin/tenants', { params: query.trim() ? { q: query.trim() } : {} }).then(res => {
+        if (!current()) return
+        setTenants(Array.isArray(res.data) ? res.data : [])
+        setError(null)
+      }).catch(err => {
+        if (current()) setError(friendlyError(err))
+      })
     } catch (err) {
-      setProvError(friendlyError(err))
+      if (!current()) return
+      const status = isAxiosError(err) ? err.response?.status : undefined
+      const code = isAxiosError(err) ? err.response?.data?.error : undefined
+      // The endpoint returns 400 before creation; conflicts and uncertain delivery keep the frozen attempt.
+      if (status === 400) setProvAttempt(null)
+      setProvError(code === 'provisioning_receipt_unavailable'
+        ? 'The saved provisioning receipt is unavailable. Keep this attempt and retry later; do not provision this tenant again.'
+        : status === 409
+          ? 'Provisioning conflict. The original details and retry key have been retained. Contact platform support before starting another provisioning attempt.'
+          : friendlyError(err))
     } finally {
-      setProvSaving(false)
+      if (current()) {
+        provBusy.current = false
+        setProvSaving(false)
+      }
     }
   }
 
   const inviteUrl = provResult
-    ? `${window.location.origin}/accept-invite?token=${provResult.inviteToken}`
+    ? `${window.location.origin}/accept-invite?token=${encodeURIComponent(provResult.inviteToken)}`
     : ''
 
   const copyInvite = async () => {
+    const generation = getSessionGeneration()
+    const lifetime = provLifetime.current
+    const current = () => lifetime === provLifetime.current && generation === getSessionGeneration()
     try {
       await navigator.clipboard.writeText(inviteUrl)
-      toast('Invite link copied.', 'success')
+      if (current()) setInviteCopyStatus('Invite link copied.')
     } catch {
-      toast('Could not copy - select the link and copy it manually.', 'error')
+      if (current()) setInviteCopyStatus('Could not copy. Select the link and copy it manually.')
     }
   }
 
@@ -386,14 +445,17 @@ export default function PlatformAdmin() {
           type="button"
           className="btn btn-primary"
           onClick={() => {
-            setProv({ name: '', clinicName: '', adminName: '', adminEmail: '', tier: 'trial', status: 'trial', endsAt: '', timezone: 'Asia/Kolkata', currency: 'INR', modules: ['core'] })
-            setProvError(null)
-            setProvResult(null)
-            setProvKey(crypto.randomUUID())
+            if (sessionGeneration !== getSessionGeneration()) return
+            if (!provAttempt || provResult) {
+              setProv({ name: '', clinicName: '', adminName: '', adminEmail: '', tier: 'trial', status: 'trial', endsAt: '', timezone: 'Asia/Kolkata', currency: 'INR', modules: ['core'] })
+              setProvError(null)
+              setProvResult(null)
+              setProvAttempt(null)
+            }
             setProvOpen(true)
           }}
         >
-          Provision tenant
+          {provAttempt && !provResult ? 'Resume provisioning' : 'Provision tenant'}
         </button>
       </div>
 
@@ -807,21 +869,21 @@ export default function PlatformAdmin() {
 
       {/* B3: provision a tenant end to end - no manual SQL, no generated password. */}
       <Modal
-        open={provOpen}
+        open={provOpen && sessionGeneration === getSessionGeneration()}
         onClose={() => !provSaving && setProvOpen(false)}
         size="lg"
         title={provResult ? 'Tenant provisioned' : 'Provision tenant'}
         description={provResult
-          ? 'Send this single-use link to the clinic admin. They choose their own password.'
+          ? 'Review email handoff and keep the single-use link available for the clinic admin.'
           : 'Creates the tenant, clinic, module entitlements and a pending ClinicAdmin invite in one transaction.'}
         footer={provResult
           ? <button className="btn btn-primary" onClick={() => setProvOpen(false)}>Done</button>
           : (
             <div className="flex justify-end gap-2">
-              <button className="btn btn-secondary" onClick={() => setProvOpen(false)} disabled={provSaving}>Cancel</button>
+              <button className="btn btn-secondary" onClick={() => setProvOpen(false)} disabled={provSaving}>{provAttempt ? 'Close' : 'Cancel'}</button>
               <button className="btn btn-primary" onClick={submitProvision} disabled={provSaving}>
                 {provSaving && <span className="spinner spinner-sm" />}
-                Provision tenant
+                {provSaving ? 'Provisioning…' : provAttempt ? 'Retry same attempt' : 'Provision tenant'}
               </button>
             </div>
           )}
@@ -831,22 +893,39 @@ export default function PlatformAdmin() {
             <div className="alert alert-success">
               Tenant and clinic created. The invite expires {fmtDate(provResult.inviteExpiresAt)}.
             </div>
+            <p role="status" className="text-sm text-[var(--color-text)]">
+              {provResult.emailStatus === 'handoff'
+                ? 'The mail server accepted the invitation email. This does not confirm inbox delivery.'
+                : provResult.emailStatus === 'failed'
+                  ? 'Email handoff failed. The invitation is still valid; share the link directly.'
+                  : provResult.emailStatus === 'not_configured'
+                    ? 'Email is not configured. Share the invitation link directly.'
+                    : 'Email handoff could not be confirmed. Check with the recipient or share this same link directly.'}
+            </p>
             <div>
               <label htmlFor="prov-invite" className="form-label">Single-use invite link</label>
-              <div className="flex gap-2">
-                <input id="prov-invite" className="form-input w-full mono" readOnly value={inviteUrl} onFocus={(e) => e.target.select()} />
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input id="prov-invite" className="form-input w-full mono text-base" readOnly value={inviteUrl} onFocus={(e) => e.target.select()} />
                 <button type="button" className="btn btn-secondary whitespace-nowrap" onClick={copyInvite}>Copy link</button>
               </div>
+              <p role="status" className="text-sm mt-2">{inviteCopyStatus}</p>
             </div>
             <p className="text-xs text-[var(--color-text-muted)]">
               Tenant ID <span className="mono">{provResult.tenantId}</span>. The link stops working after the
               first successful acceptance.
+              {' '}Keep it private. If the link is lost or expires, contact platform support to reissue the admin
+              invitation for this tenant. Do not provision the tenant again.
             </p>
           </div>
         ) : (
           <div className="space-y-4">
-            {provError && <div className="alert alert-error">{provError}</div>}
+            {provError && <div role="alert" className="alert alert-error">{provError}</div>}
+            {provAttempt && <p role="status" className="text-sm text-[var(--color-text-muted)]">
+              Original details and retry key are frozen. Closing this dialog keeps the attempt on this page.
+              Retry here before leaving or reloading; if the attempt is lost, contact platform support before provisioning again.
+            </p>}
 
+            <fieldset disabled={!!provAttempt || provSaving} className="space-y-4">
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
                 <label htmlFor="prov-name" className="form-label">Tenant name</label>
@@ -915,6 +994,7 @@ export default function PlatformAdmin() {
                 ))}
               </div>
               <p className="text-xs text-[var(--color-text-muted)] mt-1">Core is always included.</p>
+            </fieldset>
             </fieldset>
           </div>
         )}

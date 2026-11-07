@@ -24,7 +24,7 @@ public class Section5PaymentIntegrationsTests
         new(new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase($"Sec5Integrations_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(InMemoryEventId.TransactionIgnoredWarning))
-            .Options);
+            .Options, TestMaintenanceTenantContext.Instance);
 
     private static PaymentIntegrationsController ControllerFor(HospitalCrmDbContext db, Guid tenantId, Guid userId)
     {

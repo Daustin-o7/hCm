@@ -5,7 +5,8 @@ import { PillIcon, CheckIcon } from '../components/icons/Index'
 
 interface VerifiedPrescription {
   verified: boolean
-  status: 'valid' | 'superseded'
+  status: 'valid' | 'superseded' | 'invalid' | 'legacy_limited'
+  contentIntegrity: 'full_content' | 'legacy_limited' | 'invalid'
   isSuperseded: boolean
   supersededOn?: string
   latestVersion: number
@@ -44,12 +45,21 @@ export default function VerifyRx() {
   const versionParam = searchParams.get('v')
   const expParam = searchParams.get('exp')
   const sigParam = searchParams.get('sig')
+  return <VerificationResult key={JSON.stringify([code, versionParam, expParam, sigParam])}
+    code={code} versionParam={versionParam} expParam={expParam} sigParam={sigParam} />
+}
+
+function VerificationResult({ code, versionParam, expParam, sigParam }: {
+  code?: string; versionParam: string | null; expParam: string | null; sigParam: string | null
+}) {
   
   const [data, setData] = useState<VerifiedPrescription | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    const controller = new AbortController()
+    setData(null)
     if (!code) {
       setError('Missing verification code in URL.')
       setLoading(false)
@@ -58,6 +68,8 @@ export default function VerifyRx() {
 
     const verify = async () => {
       setLoading(true)
+      setError(null)
+      setData(null)
       try {
         // Shared links carry exp+sig; without them the server checks a printed code only.
         const params = new URLSearchParams()
@@ -65,9 +77,10 @@ export default function VerifyRx() {
         if (expParam) params.set('exp', expParam)
         if (sigParam) params.set('sig', sigParam)
         const qs = params.toString()
-        const res = await api.get(`/consultations/verify-rx/${encodeURIComponent(code)}${qs ? `?${qs}` : ''}`)
-        setData(res.data)
+        const res = await api.get(`/consultations/verify-rx/${encodeURIComponent(code)}${qs ? `?${qs}` : ''}`, { signal: controller.signal })
+        if (!controller.signal.aborted) setData(res.data)
       } catch (err: unknown) {
+        if (controller.signal.aborted) return
         const apiError = (err as { response?: { data?: { error?: string } } })?.response?.data?.error
         const messages: Record<string, string> = {
           prescription_not_found_or_unverified: 'Prescription could not be verified. It may be invalid, unsigned, or fraudulent.',
@@ -78,16 +91,17 @@ export default function VerifyRx() {
         }
         setError(messages[apiError ?? ''] ?? 'Failed to verify prescription with the server. Please try again.')
       } finally {
-        setLoading(false)
+        if (!controller.signal.aborted) setLoading(false)
       }
     }
 
     verify()
+    return () => controller.abort()
   }, [code, versionParam, expParam, sigParam])
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
+      <div className="min-h-screen bg-[var(--color-bg)] flex flex-col items-center justify-center p-4">
         <div className="w-10 h-10 rounded-full border-2 border-teal-600 border-t-transparent animate-spin mb-3"></div>
         <p className="text-sm font-semibold text-slate-600">Verifying prescription authenticity with clinic records…</p>
       </div>
@@ -96,7 +110,7 @@ export default function VerifyRx() {
 
   if (error || !data) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+      <div className="min-h-screen bg-[var(--color-bg)] flex items-center justify-center p-4">
         <div className="bg-white rounded-lg shadow-sm border border-rose-200 max-w-md w-full p-6 text-center space-y-4">
           <div className="w-14 h-14 rounded-full bg-rose-100 text-rose-700 flex items-center justify-center text-2xl mx-auto font-bold">
             ⚠️
@@ -118,23 +132,30 @@ export default function VerifyRx() {
     )
   }
 
+  const contentVerified = data.verified && data.signatureValid && data.status === 'valid' && !data.isSuperseded
+  const legacyLimited = data.status === 'legacy_limited'
+
   return (
-    <div className="min-h-screen bg-slate-100 py-8 px-4 flex justify-center">
-      <div className="max-w-2xl w-full bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden space-y-6 pb-6">
+    <div className="min-h-screen bg-[var(--color-bg)] py-8 px-4 flex justify-center">
+      <div className="max-w-2xl w-full card rounded-lg shadow-sm border border-[var(--color-border)] overflow-hidden space-y-6 pb-6">
         {/* Top Header Banner */}
-        <div className={`p-6 text-white ${data.isSuperseded ? 'bg-rose-900 border-b border-rose-800' : 'bg-[#0F1F17] border-b border-[#1E3A2E]'}`}>
+        <div className={`p-6 text-white ${data.status === 'invalid' || data.isSuperseded ? 'bg-rose-900 border-b border-rose-800' : legacyLimited ? 'bg-amber-900 border-b border-amber-800' : 'bg-[var(--color-text)] border-b border-slate-800'}`}>
           <div className="flex items-start justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 mb-1.5">
-                {data.isSuperseded ? (
-                  <span className="badge bg-rose-500 text-white font-bold text-xs px-2.5 py-0.5 rounded-full uppercase tracking-wider animate-pulse">
-                    ⚠️ Superseded Prescription
+                {!data.signatureValid || !data.verified ? (
+                  <span className={`badge ${legacyLimited ? 'badge-warning' : 'badge-danger'} text-xs`}>
+                    {legacyLimited ? 'Legacy seal — content not verified' : 'Content verification failed'}
                   </span>
-                ) : (
+                ) : data.isSuperseded ? (
+                  <span className="badge badge-danger text-xs">
+                    Superseded prescription
+                  </span>
+                ) : contentVerified ? (
                   <span className="badge bg-emerald-500 text-white font-bold text-xs px-2.5 py-0.5 rounded-full uppercase tracking-wider flex items-center gap-1">
-                    <CheckIcon /> Authenticity Verified
+                    <CheckIcon /> Clinical content verified
                   </span>
-                )}
+                ) : <span className="badge badge-warning text-xs">Verification unavailable</span>}
                 <span className="text-xs text-teal-200">v{data.currentVersion}</span>
               </div>
               <h1 className="text-xl font-bold font-heading">{data.clinicName || 'Clinic Prescription Verification'}</h1>
@@ -148,6 +169,13 @@ export default function VerifyRx() {
             </div>
           </div>
         </div>
+
+        {!contentVerified && !data.isSuperseded && (
+          <div role="alert" className={`mx-6 p-4 rounded-xl border text-sm ${legacyLimited ? 'bg-amber-50 border-amber-300 text-amber-900' : 'bg-rose-50 border-rose-200 text-rose-900'}`}>
+            <p>{data.statusDescription}</p>
+            <p className="mt-2 font-semibold">Do not dispense based on this verification. Contact the clinic to confirm the original record.</p>
+          </div>
+        )}
 
         {/* Superseded Warning Banner if amended */}
         {data.isSuperseded && (
@@ -173,21 +201,21 @@ export default function VerifyRx() {
 
         <div className="px-6 space-y-6">
           {/* Prescriber & Patient Metadata Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-slate-50 p-4 rounded-xl border border-slate-200 text-xs">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-[var(--color-surface-raised)] p-4 rounded-xl border border-[var(--color-border)] text-xs">
             <div className="space-y-1.5">
               <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Prescribing Practitioner</span>
               <div className="font-bold text-slate-900 text-sm">{data.doctorName || 'Attending Physician'}</div>
               <div className="text-slate-600">
                 MCI/NMC Reg No: <strong className="font-mono text-slate-900">{data.doctorRegistrationNumber || 'Not recorded'}</strong>
               </div>
-              <div className="text-slate-500">{data.doctorQualifications || 'MBBS'}</div>
+              <div className="text-slate-500">{data.doctorQualifications || 'Not recorded'}</div>
             </div>
 
-            <div className="space-y-1.5 border-t sm:border-t-0 sm:border-l border-slate-200 pt-3 sm:pt-0 sm:pl-4">
+            <div className="space-y-1.5 border-t sm:border-t-0 sm:border-l border-[var(--color-border)] pt-3 sm:pt-0 sm:pl-4">
               <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Patient Identification</span>
               <div className="font-bold text-slate-900 text-sm">{data.patientInitials || 'Patient'}</div>
               <div className="text-slate-600">
-                Age: {data.patientAge ? `${data.patientAge} yrs` : '—'} • Gender: {data.patientGender || '—'}
+                Age: {data.patientAge != null ? `${data.patientAge} yrs` : '—'} • Gender: {data.patientGender || '—'}
               </div>
               <div className="text-slate-500">
                 Finalized On: {new Date(data.date).toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' })}
@@ -204,9 +232,9 @@ export default function VerifyRx() {
               <span className="badge badge-brand text-[10px]">{data.medicines.length} items</span>
             </div>
 
-            <div className="overflow-x-auto border border-slate-200 rounded-xl">
+            <div className="overflow-x-auto border border-[var(--color-border)] rounded-xl">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold">
+                <thead className="bg-[var(--color-surface-raised)] border-b border-[var(--color-border)] text-slate-500 font-semibold">
                   <tr>
                     <th className="p-2.5">Medicine / Generic</th>
                     <th className="p-2.5">Dosage Form</th>
@@ -217,18 +245,19 @@ export default function VerifyRx() {
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {data.medicines.map((med, idx) => (
-                    <tr key={idx} className="hover:bg-slate-50/50">
+                    <tr key={idx} className="hover:bg-[var(--color-surface-hover)]">
                       <td className="p-2.5 font-bold text-slate-900">
                         {med.brandName || med.genericName || 'Medicine'}
                         {med.genericName && med.brandName && (
                           <span className="block text-[11px] font-normal text-slate-500">
-                            Generic: {med.genericName} {med.strength}
+                            Generic: {med.genericName}
                           </span>
                         )}
+                        {med.strength && <span className="block text-[11px] font-normal text-slate-600">Strength: {med.strength}</span>}
                       </td>
-                      <td className="p-2.5 text-slate-600">{med.dosageForm || 'Tab'}</td>
-                      <td className="p-2.5 text-slate-700 font-medium">{med.frequency || '1-0-1'}</td>
-                      <td className="p-2.5 text-slate-600">{med.duration || '5 Days'}</td>
+                      <td className="p-2.5 text-slate-600">{med.dosageForm || '—'}</td>
+                      <td className="p-2.5 text-slate-700 font-medium">{med.frequency || '—'}</td>
+                      <td className="p-2.5 text-slate-600">{med.duration || '—'}</td>
                       <td className="p-2.5 text-right font-mono font-bold text-slate-900">{med.quantity ?? '—'}</td>
                     </tr>
                   ))}
@@ -238,34 +267,31 @@ export default function VerifyRx() {
           </div>
 
           {/* Tamper-Evident SHA-256 Signature Verification */}
-          <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+          <div className="p-4 bg-[var(--color-surface-raised)] rounded-xl border border-[var(--color-border)] space-y-2">
             <div className="flex items-center justify-between text-xs">
               <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">
-                Cryptographic Signature Hash (SHA-256)
+                Clinical content seal (SHA-256)
               </span>
               <span className={`badge ${data.signatureValid ? 'badge-success' : 'badge-warning'} text-[10px]`}>
-                {data.signatureValid ? 'Signature Authentic' : 'Check Hash'}
+                {data.signatureValid && data.verified ? 'Content seal matches' : legacyLimited ? 'Limited legacy seal' : 'Content seal invalid'}
               </span>
             </div>
-            <div className="font-mono text-[10px] text-slate-600 break-all bg-white p-2.5 rounded-lg border border-slate-200">
-              {data.digitalSignatureHash || '0x...'}
+            <div className="font-mono text-[10px] text-slate-600 break-all bg-white p-2.5 rounded-lg border border-[var(--color-border)]">
+              {data.digitalSignatureHash || 'Not recorded'}
             </div>
             <p className="text-[10px] text-slate-400 leading-tight">
-              Calculated and sealed at consultation completion. Any unauthorized alteration of medicine names, doses, or practitioner details invalidates this digital seal.
+              {legacyLimited
+                ? 'Historical identity-only hashes do not bind medicine or note content. No stronger seal has been fabricated for this record.'
+                : 'The versioned seal binds immutable clinical content and signer credentials. It is a tamper-evidence check, not a certificate-backed digital signature; dispensing state is excluded.'}
             </p>
           </div>
 
-          {/* Print Button */}
+           {/* Verification is not a prescription printout. */}
           <div className="flex items-center justify-between pt-2">
             <span className="text-[11px] text-slate-500">
               Hospital CRM Regulated Verification System
             </span>
-            <button
-              onClick={() => window.print()}
-              className="btn btn-secondary btn-sm flex items-center gap-1.5"
-            >
-              🖨️ Print Verification
-            </button>
+            <span className="text-xs text-slate-500">Request the prescription PDF from the clinic.</span>
           </div>
         </div>
       </div>

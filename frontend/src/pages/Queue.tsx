@@ -259,7 +259,7 @@ export default function Queue() {
 
       {/* Calling Banner */}
       {callingToken && (
-        <div className="p-4 rounded-xl bg-teal-500 text-white font-bold flex items-center justify-between shadow-lg animate-bounce">
+        <div className="p-4 rounded-xl bg-[var(--brand-primary)] text-white font-bold flex items-center justify-between shadow-lg border border-[var(--brand-primary-hover)] animate-bounce">
           <div className="flex items-center gap-3">
             <span className="text-2xl">📢</span>
             <div>
@@ -361,8 +361,8 @@ export default function Queue() {
                 onClick={() => setSelectedSpecialty(spec.id)}
                 className={`flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-semibold whitespace-nowrap transition-all cursor-pointer border ${
                   isSelected
-                    ? 'bg-teal-600 text-white border-teal-700 shadow-sm'
-                    : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-teal-500'
+                    ? 'btn-primary shadow-xs'
+                    : 'bg-[var(--color-surface)] dark:bg-slate-800 text-[var(--color-text-secondary)] border-[var(--color-border)] hover:border-[var(--brand-primary)]'
                 }`}
               >
                 <span>{spec.icon}</span>

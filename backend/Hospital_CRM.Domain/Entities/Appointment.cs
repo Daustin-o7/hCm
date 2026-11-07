@@ -21,6 +21,15 @@ public class Appointment : ITenantScoped
     [MaxLength(128)]
     public string? QueueTrackingToken { get; set; }
 
+    public DateTimeOffset? QueueTrackingExpiresAt { get; set; }
+
+    public void EndQueueTracking(DateTimeOffset endedAt)
+    {
+        // Terminal transitions can shorten a link, never renew it (including legacy links).
+        if (QueueTrackingExpiresAt > endedAt.AddHours(2))
+            QueueTrackingExpiresAt = endedAt.AddHours(2);
+    }
+
     [MaxLength(50)]
     public string? TriageReasonCode { get; set; }
 

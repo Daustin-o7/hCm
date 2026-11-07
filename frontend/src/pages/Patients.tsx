@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import api from '../services/api'
+import api, { getSessionGeneration } from '../services/api'
+import { captureOutboxSession, enqueueOutbox, flushOutbox, readOutbox, retryOutboxItem, type OutboxItem, type OutboxSession } from '../services/offlineOutbox'
 import { Modal } from '../components/ui/Modal'
 import { Alert, friendlyError } from '../components/ui/Alert'
 import { EmptyState, EmptySearch } from '../components/ui/EmptyState'
@@ -11,26 +12,83 @@ import { SkeletonRow } from '../components/ui/Skeleton'
 import { Badge } from '../components/ui/Badge'
 import { fmtDate as formatDate } from '../utils/format'
 import { useAuth } from '../context/AuthContext'
+import { useBranding } from '../context/BrandingContext'
+import { getTodayDateString } from '../utils/timezone'
 
-const patientSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
+function normalizePhone(phone: string) {
+  const clean = phone.replace(/[\s\-()]/g, '')
+  return clean.startsWith('+91') ? clean.slice(3) : clean.length === 12 && clean.startsWith('91') ? clean.slice(2) : clean
+}
+
+function ageOn(dob: string, today: string) {
+  return Number(today.slice(0, 4)) - Number(dob.slice(0, 4)) - (today.slice(5) < dob.slice(5) ? 1 : 0)
+}
+
+const patientSchema = (today: string) => z.object({
+  name: z.string().trim().min(2, 'Enter at least 2 characters for the name').max(100, 'Name cannot exceed 100 characters'),
   phone: z.string().refine(val => {
-    const clean = (val || '').replace(/[\s\-()]/g, '').replace(/^\+?91/, '')
-    return /^[6-9]\d{9}$/.test(clean)
+    return /^[6-9]\d{9}$/.test(normalizePhone(val))
   }, 'Enter a valid 10-digit Indian mobile number (starting with 6-9)'),
   dob: z.string().optional(),
-  approxAge: z.string().optional(),
-  gender: z.string().optional(),
-  address: z.string().optional(),
+  approxAge: z.string().refine(value => !value || /^\d+$/.test(value) && Number(value) <= 130, 'Age must be a whole number from 0 to 130').optional(),
+  gender: z.enum(['', 'Male', 'Female', 'Other', 'PreferNotToSay']).optional(),
+  address: z.string().trim().max(500, 'Address cannot exceed 500 characters').optional(),
   whatsAppOptIn: z.boolean().optional(),
-  guardianName: z.string().optional(),
-  guardianRelationship: z.string().optional(),
+  guardianName: z.string().trim().max(100, 'Guardian name cannot exceed 100 characters').optional(),
+  guardianRelationship: z.string().trim().max(50, 'Relationship cannot exceed 50 characters').optional(),
   consent: z.object({
     accepted: z.boolean().refine(v => v === true, 'Patient consent is required under DPDP Act'),
-    purpose: z.string().min(1, 'Consent purpose is required'),
+    purpose: z.literal('care_delivery'),
   }),
+}).superRefine((data, ctx) => {
+  if (!data.dob && !data.approxAge) ctx.addIssue({ code: 'custom', path: ['approxAge'], message: 'Enter a date of birth or approximate age' })
+  if (data.dob) {
+    const parsed = new Date(`${data.dob}T00:00:00Z`)
+    const oldest = new Date(`${today}T00:00:00Z`)
+    const month = oldest.getUTCMonth()
+    oldest.setUTCFullYear(oldest.getUTCFullYear() - 130)
+    if (oldest.getUTCMonth() !== month) oldest.setUTCDate(0)
+    if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== data.dob || data.dob > today || parsed < oldest) {
+      ctx.addIssue({ code: 'custom', path: ['dob'], message: 'Date of birth must be within the last 130 years and cannot be in the future' })
+      return
+    }
+  }
+  const age = data.dob ? ageOn(data.dob, today) : data.approxAge ? Number(data.approxAge) : null
+  if (age !== null && age < 18) {
+    if (!data.guardianName) ctx.addIssue({ code: 'custom', path: ['guardianName'], message: 'Guardian name is required for patients under 18' })
+    if (!data.guardianRelationship) ctx.addIssue({ code: 'custom', path: ['guardianRelationship'], message: 'Guardian relationship is required for patients under 18' })
+  }
 })
-type PatientForm = z.infer<typeof patientSchema>
+type PatientForm = z.infer<ReturnType<typeof patientSchema>>
+
+const persistedId = z.string().uuid().refine(id => id !== '00000000-0000-0000-0000-000000000000')
+const consentEvidence = z.object({
+  id: persistedId, patientId: persistedId, purpose: z.string(), noticeVersion: z.string().trim().min(1),
+  language: z.string().trim().min(1), captureMethod: z.string().trim().min(1), capturedBy: persistedId,
+  capturedAt: z.string().datetime({ offset: true }), withdrawnAt: z.string().datetime({ offset: true }).nullable().optional(),
+  guardianName: z.string().nullable().optional(), guardianRelationship: z.string().nullable().optional(),
+})
+type ConsentEvidence = z.infer<typeof consentEvidence>
+
+function consentStatus(patient: Patient) {
+  const care = Array.isArray(patient.consents) ? patient.consents.filter(c => consentEvidence.safeParse(c).success
+    && c.patientId === patient.id && ['care_delivery', 'direct_care'].includes(c.purpose)) : []
+  if (!care?.length) return 'Consent not verified'
+  return care.some(c => !c.withdrawnAt) ? 'Care consent recorded' : 'Care consent withdrawn'
+}
+
+function registrationPayload(data: PatientForm, confirmDifferentPerson = false) {
+  return {
+    name: data.name, phone: normalizePhone(data.phone), dob: data.dob || null,
+    approxAge: data.dob || !data.approxAge ? null : Number(data.approxAge), gender: data.gender || 'PreferNotToSay',
+    address: data.address || null, whatsAppOptIn: !!data.whatsAppOptIn,
+    guardianName: data.guardianName || null, guardianRelationship: data.guardianRelationship || null,
+    noticeVersion: 'v1.0', language: 'en', captureMethod: 'receptionist_assisted',
+    confirmDifferentPersonOnSamePhone: confirmDifferentPerson,
+    consent: { accepted: data.consent.accepted, purpose: data.consent.purpose },
+    idempotencyKey: `IDEMP-PAT-${crypto.randomUUID()}`,
+  }
+}
 
 interface Patient {
   id: string
@@ -38,15 +96,17 @@ interface Patient {
   name: string
   phone?: string
   phoneLast4?: string
-  dob?: string
-  approxAge?: number
-  gender?: string
-  address?: string
+  dob?: string | null
+  approxAge?: number | null
+  gender?: string | null
+  address?: string | null
   createdAt: string
+  consents?: ConsentEvidence[]
 }
 
 interface DuplicateMatch {
   id: string
+  uhid?: string
   name: string
   dob?: string
   phoneLast4: string
@@ -64,6 +124,8 @@ function getInitials(name: string) {
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function Patients() {
   const navigate = useNavigate()
+  const { branding } = useBranding()
+  const today = getTodayDateString(branding.timezone || 'UTC')
   const [patients, setPatients] = useState<Patient[]>([])
   // Seed from the topbar global search: /dashboard/patients?q=…
   const [searchQuery, setSearchQuery] = useState(() => new URLSearchParams(window.location.search).get('q') ?? '')
@@ -80,12 +142,19 @@ export default function Patients() {
   const [breakGlassError, setBreakGlassError] = useState('')
   const [breakGlassBusy, setBreakGlassBusy] = useState(false)
   const [submitError, setSubmitError] = useState('')
+  const [duplicatePreflightUnavailable, setDuplicatePreflightUnavailable] = useState(false)
   
   // Duplicate Resolution State
   const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[]>([])
   const [showDuplicateModal, setShowDuplicateModal] = useState(false)
   const [pendingFormData, setPendingFormData] = useState<PatientForm | null>(null)
   const [isCreatingDuplicate, setIsCreatingDuplicate] = useState(false)
+  const [registrationUncertain, setRegistrationUncertain] = useState(false)
+  const [registrationSaving, setRegistrationSaving] = useState(false)
+  const registrationAttempt = useRef<{ item: OutboxItem; session: OutboxSession } | null>(null)
+  const registrationBusy = useRef(false)
+  const active = useRef(true)
+  useEffect(() => { active.current = true; return () => { active.current = false } }, [])
 
   const searchContainerRef = useRef<HTMLDivElement>(null)
 
@@ -94,22 +163,22 @@ export default function Patients() {
     handleSubmit,
     reset,
     setValue,
+    watch,
     formState: { errors, isSubmitting },
   } = useForm<PatientForm>({
-    resolver: zodResolver(patientSchema),
+    resolver: zodResolver(patientSchema(today)),
     defaultValues: { consent: { accepted: false, purpose: 'care_delivery' } },
   })
 
+  const dob = watch('dob')
+  const approxAge = watch('approxAge')
+  const age = dob ? ageOn(dob, today) : approxAge ? Number(approxAge) : null
+  const isMinor = age !== null && age >= 0 && age < 18
+
   // Auto-calculate approximate age from DOB
   const calculateAgeFromDob = (dob: string) => {
-    const birth = new Date(dob)
-    const today = new Date()
-    let age = today.getFullYear() - birth.getFullYear()
-    const monthDiff = today.getMonth() - birth.getMonth()
-    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
-      age--
-    }
-    return age >= 0 && age <= 150 ? age : null
+    const age = ageOn(dob, today)
+    return age >= 0 && age <= 130 ? age : null
   }
 
   const handleDobChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -126,19 +195,22 @@ export default function Patients() {
   }
 
   const fetchPatients = useCallback(async (query = '') => {
+    const generation = getSessionGeneration()
     try {
       // Blank query lists everything; /patients/search treats blank as "no results"
       const url = query.trim()
         ? `/patients/search?q=${encodeURIComponent(query)}`
         : '/patients'
       const res = await api.get(url)
+      if (!active.current || generation !== getSessionGeneration()) return
       setPatients(Array.isArray(res.data) ? res.data : [])
       if (query.trim()) setSearchResults(Array.isArray(res.data) ? res.data : [])
     } catch {
+      if (!active.current || generation !== getSessionGeneration()) return
       setPatients([])
       setSearchResults([])
     } finally {
-      setLoading(false)
+      if (active.current && generation === getSessionGeneration()) setLoading(false)
     }
   }, [])
 
@@ -180,67 +252,71 @@ export default function Patients() {
   }
 
   // Actual registration execution
-  const executeRegistration = useCallback(async (data: PatientForm, confirmDifferentPerson = false) => {
-    setSubmitError('')
-    const cleanPhone = (data.phone || '').replace(/[\s\-()]/g, '').replace(/^\+?91/, '')
-    const idempotencyKey = `IDEMP-PAT-${Date.now()}`
-    const payload = {
-      name: data.name,
-      phone: cleanPhone,
-      dob: data.dob ? data.dob : null,
-      approxAge: data.approxAge ? Number(data.approxAge) : null,
-      gender: data.gender,
-      address: data.address || null,
-      whatsAppOptIn: !!data.whatsAppOptIn,
-      guardianName: data.guardianName || null,
-      guardianRelationship: data.guardianRelationship || null,
-      noticeVersion: 'v1.0',
-      language: 'en',
-      confirmDifferentPersonOnSamePhone: confirmDifferentPerson,
-      consent: {
-        accepted: !!data.consent?.accepted,
-        purpose: data.consent?.purpose || 'care_delivery'
-      },
-      idempotencyKey
+  const executeRegistration = useCallback(async (data?: PatientForm, confirmDifferentPerson = false) => {
+    if (registrationBusy.current) return
+    const generation = getSessionGeneration()
+    if (registrationAttempt.current && registrationAttempt.current.session.generation !== generation) {
+      setSubmitError('The clinic session changed. Return to the original session to reconcile this registration before creating another.')
+      return
     }
+    registrationBusy.current = true
+    setRegistrationSaving(true)
+    setSubmitError('')
 
     try {
-      const res = await api.post('/patients', payload)
-      if (res.data?.sharedPhoneDetected && !confirmDifferentPerson) {
-        setPendingFormData({ ...data, phone: cleanPhone })
-        setShowDuplicateModal(true)
-        setSubmitError(res.data.message)
-        return
+      let attempt = registrationAttempt.current
+      if (!attempt) {
+        if (!data) return
+        const session = captureOutboxSession()
+        const payload = registrationPayload(data, confirmDifferentPerson)
+        const item: OutboxItem = { version: 1, id: crypto.randomUUID(), type: 1,
+          idempotencyKey: payload.idempotencyKey, payloadJson: JSON.stringify(payload), createdAt: new Date().toISOString() }
+        await enqueueOutbox(item, session)
+        if (!active.current || generation !== getSessionGeneration()) return
+        attempt = { item, session }
+        registrationAttempt.current = attempt
+        setRegistrationUncertain(true)
+      } else {
+        const id = attempt.item.id
+        const entry = (await readOutbox(attempt.session)).find(entry => entry.id === id)
+        if (entry && ['unknown', 'rejected'].includes(entry.status)) await retryOutboxItem(entry.id, attempt.session)
       }
-
-      const patientId = res.data?.id || res.data?.patientId
-      const newPatient: Patient = {
-        id: patientId || `pat-${Date.now()}`,
-        uhid: res.data?.uhid,
-        name: data.name,
-        phone: cleanPhone,
-        dob: data.dob || undefined,
-        approxAge: data.approxAge ? Number(data.approxAge) : undefined,
-        gender: data.gender,
-        address: data.address || undefined,
-        createdAt: new Date().toISOString()
-      }
-      setPatients(prev => [newPatient, ...prev])
+      await flushOutbox(attempt.session)
+      const retained = (await readOutbox(attempt.session)).find(entry => entry.id === attempt.item.id)
+      if (!active.current || generation !== getSessionGeneration()) return
+      if (retained) { setSubmitError(retained.message); return }
+      // Only the outbox's matching Sync result and authoritative readback can remove a committed item.
+      registrationAttempt.current = null
+      setRegistrationUncertain(false)
+      setDuplicatePreflightUnavailable(false)
       reset({ consent: { accepted: false, purpose: 'care_delivery' }, whatsAppOptIn: false })
       setShowRegister(false)
       setShowDuplicateModal(false)
       setPendingFormData(null)
       setDuplicateMatches([])
-    } catch (err) {
+      await fetchPatients()
+    } catch (err: any) {
+      if (!active.current || generation !== getSessionGeneration()) return
       setSubmitError(friendlyError(err))
     } finally {
-      setIsCreatingDuplicate(false)
+      registrationBusy.current = false
+      if (active.current && generation === getSessionGeneration()) {
+        setRegistrationSaving(false)
+        setIsCreatingDuplicate(false)
+        window.dispatchEvent(new Event('samstack:outbox-changed'))
+      }
     }
-  }, [reset])
+  }, [reset, fetchPatients])
 
   const onSubmit = useCallback(async (data: PatientForm) => {
+    if (registrationAttempt.current) {
+      await executeRegistration(data)
+      return
+    }
     setSubmitError('')
-    const cleanPhone = (data.phone || '').replace(/[\s\-()]/g, '').replace(/^\+?91/, '')
+    setDuplicatePreflightUnavailable(false)
+    const cleanPhone = normalizePhone(data.phone)
+    const generation = getSessionGeneration()
     // Step 1: Check for duplicates before creating
     try {
       const checkRes = await api.post('/patients/check-duplicate', {
@@ -248,6 +324,7 @@ export default function Patients() {
         phone: cleanPhone,
         dob: data.dob ? data.dob : undefined
       })
+      if (!active.current || generation !== getSessionGeneration()) return
       if (checkRes.data?.duplicate && Array.isArray(checkRes.data.matches) && checkRes.data.matches.length > 0) {
         setPendingFormData({ ...data, phone: cleanPhone })
         setDuplicateMatches(checkRes.data.matches)
@@ -255,13 +332,48 @@ export default function Patients() {
         return
       }
     } catch {
-      // If check fails or Typesense is in fallback, proceed to direct register
+      if (!active.current || generation !== getSessionGeneration()) return
+      setDuplicatePreflightUnavailable(true)
     }
 
+    if (!active.current || generation !== getSessionGeneration()) return
     await executeRegistration({ ...data, phone: cleanPhone })
   }, [executeRegistration])
 
+  const closeRegistration = () => {
+    if (isSubmitting || registrationBusy.current) return
+    setShowRegister(false)
+    if (!registrationAttempt.current) {
+      reset({ consent: { accepted: false, purpose: 'care_delivery' }, whatsAppOptIn: false })
+      setSubmitError('')
+      setDuplicatePreflightUnavailable(false)
+    }
+  }
+
   useEffect(() => { fetchPatients() }, [fetchPatients])
+
+  useEffect(() => {
+    let mounted = true
+    const generation = getSessionGeneration()
+    let previous: string[] = []
+    let snapshots = Promise.resolve()
+    const changed = () => {
+      if (!mounted || generation !== getSessionGeneration()) return
+      const current = Promise.resolve().then(() => readOutbox())
+        .then(entries => entries.map(entry => entry.id), () => null)
+      // Compare event-ordered snapshots; enqueue and rejected retries must not refresh the registry.
+      snapshots = snapshots.then(async () => {
+        const after = await current
+        if (!mounted || generation !== getSessionGeneration() || !after) return
+        const acknowledged = previous.some(id => !after.includes(id))
+        previous = after
+        if (acknowledged) void fetchPatients()
+      })
+    }
+    changed()
+    window.addEventListener('samstack:outbox-changed', changed)
+    return () => { mounted = false; window.removeEventListener('samstack:outbox-changed', changed) }
+  }, [fetchPatients])
 
   // Search dropdown effect - debounced (min 2 chars required to prevent unauthorized broad PHI exposure)
   useEffect(() => {
@@ -347,7 +459,7 @@ export default function Patients() {
         <button
           id="register-patient-btn"
           className="btn btn-primary"
-          onClick={() => { setSubmitError(''); setShowRegister(true) }}
+          onClick={() => { if (!registrationAttempt.current) setSubmitError(''); setShowRegister(true) }}
         >
           <PlusIcon />
           <span>New Patient Registration</span>
@@ -404,7 +516,7 @@ export default function Patients() {
                         onClick={() => { setSearchQuery(r.name); setShowSearchDropdown(false); fetchPatients(r.name); }}
                         className="flex items-center gap-3 text-left flex-1 min-w-0"
                       >
-                        <div className="avatar avatar-sm flex-shrink-0 bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold text-[11px]">
+                        <div className="avatar avatar-sm flex-shrink-0 bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs font-bold text-[11px]">
                           {getInitials(r.name)}
                         </div>
                         <div className="flex-1 min-w-0">
@@ -520,14 +632,14 @@ export default function Patients() {
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                         <div
-                          className="avatar avatar-sm bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold shadow-xs"
+                          className="avatar avatar-sm bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs font-bold shadow-xs"
                         >
                           {getInitials(p.name)}
                         </div>
                         <div>
                           <div style={{ fontWeight: 600, color: 'var(--color-text)', fontSize: '13.5px' }}>{p.name}</div>
                           <div className="mono" style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>
-                            UHID-{p.id.slice(0, 8).toUpperCase()}
+                            {p.uhid || 'UHID not recorded'}
                           </div>
                         </div>
                       </div>
@@ -538,7 +650,7 @@ export default function Patients() {
                       </span>
                     </td>
                     <td>
-                      {p.approxAge ? (
+                      {p.approxAge != null ? (
                         <div className="flex items-center gap-1.5">
                           <span className="font-semibold text-xs text-[var(--color-text)]">{p.approxAge} yrs</span>
                           <span className="text-[var(--color-text-muted)]">•</span>
@@ -554,12 +666,7 @@ export default function Patients() {
                       </span>
                     </td>
                     <td>
-                      <span className="badge badge-success">
-                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-                          <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                        </svg>
-                        <span>Consented</span>
-                      </span>
+                      <span className="badge">{consentStatus(p)}</span>
                     </td>
                     <td style={{ textAlign: 'right' }}>
                       <div className="flex items-center justify-end gap-1.5">
@@ -594,24 +701,32 @@ export default function Patients() {
 
       {/* ── Register Patient Modal ── */}
       <Modal
-        open={showRegister}
-        onClose={() => { setShowRegister(false); reset({ consent: { accepted: false, purpose: 'care_delivery' } }); setSubmitError('') }}
+        open={showRegister && !showDuplicateModal}
+        onClose={closeRegistration}
         title="Register New Patient Profile"
         description="Add a new individual to the hospital registry with statutory DPDP 2023 explicit consent."
       >
+        {duplicatePreflightUnavailable && (
+          <Alert variant="warning" className="mb-4">The preliminary duplicate check is unavailable. Sync will still check for duplicates before saving this registration.</Alert>
+        )}
         {submitError && (
           <div style={{ marginBottom: 16 }}>
             <Alert variant="error" onDismiss={() => setSubmitError('')}>{submitError}</Alert>
           </div>
         )}
 
-        <form id="register-patient-form" onSubmit={handleSubmit(onSubmit as any)} noValidate>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+        {registrationUncertain && (
+          <p role="status" className="mb-4 text-sm text-[var(--color-text-secondary)]">
+            Registration queued on this device; saved registration is not yet confirmed. Details and the retry key are frozen. Retry unchanged here or recover from Offline work on the Dashboard after navigation or reload.
+          </p>
+        )}
+        <form id="register-patient-form" onSubmit={registrationUncertain ? e => { e.preventDefault(); void executeRegistration() } : handleSubmit(onSubmit)} noValidate>
+          <fieldset disabled={registrationUncertain || isSubmitting || registrationSaving} className="grid grid-cols-1 sm:grid-cols-2 gap-4 border-0 p-0 min-w-0">
             {/* Full name */}
             <div style={{ gridColumn: '1 / -1' }}>
               <label htmlFor="reg-name" className="form-label">Full Legal Name *</label>
-              <input id="reg-name" className="form-input" {...register('name')} placeholder="e.g. Ramesh Chandra Verma" />
-              {errors.name && <p className="form-error">{errors.name.message}</p>}
+              <input id="reg-name" className="form-input" {...register('name')} maxLength={100} aria-invalid={!!errors.name} aria-describedby={errors.name ? 'reg-name-error' : undefined} placeholder="e.g. Ramesh Chandra Verma" />
+              {errors.name && <p id="reg-name-error" className="form-error">{errors.name.message}</p>}
             </div>
 
             {/* Phone */}
@@ -629,7 +744,7 @@ export default function Patients() {
                 <option value="Male">Male</option>
                 <option value="Female">Female</option>
                 <option value="Other">Other</option>
-                <option value="Prefer not to say">Prefer not to say</option>
+                <option value="PreferNotToSay">Prefer not to say</option>
               </select>
               {errors.gender && <p className="form-error">{errors.gender.message}</p>}
             </div>
@@ -637,19 +752,36 @@ export default function Patients() {
             {/* DOB */}
             <div>
               <label htmlFor="reg-dob" className="form-label">Date of Birth</label>
-              <input id="reg-dob" className="form-input" {...register('dob')} type="date" onChange={(e) => { register('dob').onChange(e); handleDobChange(e); }} />
+              <input id="reg-dob" className="form-input" {...register('dob')} type="date" max={today} aria-invalid={!!errors.dob} aria-describedby={errors.dob ? 'reg-dob-error' : undefined} onChange={(e) => { register('dob').onChange(e); handleDobChange(e); }} />
+              {errors.dob && <p id="reg-dob-error" className="form-error">{errors.dob.message}</p>}
             </div>
 
             {/* Approx age */}
             <div>
               <label htmlFor="reg-age" className="form-label">Approximate Age (years)</label>
-              <input id="reg-age" className="form-input" {...register('approxAge')} type="number" min="0" max="150" placeholder="e.g. 35" />
+              <input id="reg-age" className="form-input" {...register('approxAge')} type="number" min="0" max="130" step="1" readOnly={!!dob} aria-invalid={!!errors.approxAge} aria-describedby="reg-age-help reg-age-error" placeholder="e.g. 35" />
+              <p id="reg-age-help" className="mt-1 text-xs text-[var(--color-text-muted)]">Required when date of birth is unknown. Use 0 for a baby under one year.</p>
+              <p id="reg-age-error" className="form-error">{errors.approxAge?.message}</p>
             </div>
+
+            {(isMinor || errors.guardianName || errors.guardianRelationship) && <>
+              <div>
+                <label htmlFor="reg-guardian-name" className="form-label">Guardian name *</label>
+                <input id="reg-guardian-name" className="form-input" {...register('guardianName')} maxLength={100} aria-invalid={!!errors.guardianName} aria-describedby="reg-guardian-name-error" />
+                <p id="reg-guardian-name-error" className="form-error">{errors.guardianName?.message}</p>
+              </div>
+              <div>
+                <label htmlFor="reg-guardian-relationship" className="form-label">Guardian relationship *</label>
+                <input id="reg-guardian-relationship" className="form-input" {...register('guardianRelationship')} maxLength={50} aria-invalid={!!errors.guardianRelationship} aria-describedby="reg-guardian-relationship-error" placeholder="e.g. Parent or legal guardian" />
+                <p id="reg-guardian-relationship-error" className="form-error">{errors.guardianRelationship?.message}</p>
+              </div>
+            </>}
 
             {/* Address */}
             <div style={{ gridColumn: '1 / -1' }}>
               <label htmlFor="reg-address" className="form-label">Residential Address</label>
-              <textarea id="reg-address" className="form-textarea" {...register('address')} rows={2} placeholder="House / Flat No, Street, City, Pincode" style={{ minHeight: 64 }} />
+              <textarea id="reg-address" className="form-textarea" {...register('address')} rows={2} maxLength={500} aria-invalid={!!errors.address} aria-describedby={errors.address ? 'reg-address-error' : undefined} placeholder="House / Flat No, Street, City, Pincode" style={{ minHeight: 64 }} />
+              {errors.address && <p id="reg-address-error" className="form-error">{errors.address.message}</p>}
             </div>
 
             {/* Consent */}
@@ -659,15 +791,18 @@ export default function Patients() {
                   id="reg-consent"
                   type="checkbox"
                   {...register('consent.accepted')}
+                  aria-invalid={!!errors.consent?.accepted}
+                  aria-describedby="reg-consent-notice reg-consent-error"
                   style={{ marginTop: 3, accentColor: 'var(--brand-primary)', width: 15, height: 15, flexShrink: 0 }}
                 />
                 <span style={{ fontSize: '12.5px', color: 'var(--color-text-secondary)', lineHeight: 1.5 }}>
-                  <strong>Digital Personal Data Protection (DPDP) Treatment Consent (Mandatory):</strong> Patient or legal guardian has provided explicit authorization to collect, store, and process medical data strictly for <strong>direct clinical care delivery</strong>.
+                  <strong>Digital Personal Data Protection (DPDP) Treatment Consent (Mandatory):</strong> Patient or legal guardian has provided explicit authorization to collect, store, and process medical data for <strong>care delivery and appointment/billing records</strong>.
                 </span>
               </label>
               {errors.consent?.accepted && (
-                <p className="form-error" style={{ marginTop: 6 }}>{errors.consent.accepted.message}</p>
+                <p id="reg-consent-error" className="form-error" style={{ marginTop: 6 }}>{errors.consent.accepted.message}</p>
               )}
+              <p id="reg-consent-notice" className="mt-2 text-xs text-[var(--color-text-muted)]">Notice v1.0 · English · Staff-assisted capture. WhatsApp consent is recorded separately.</p>
             </div>
 
             {/* Separate WhatsApp Opt-In Consent Record */}
@@ -684,25 +819,25 @@ export default function Patients() {
                 </span>
               </label>
             </div>
-          </div>
+          </fieldset>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 24, paddingTop: 16, borderTop: '1px solid var(--color-border)' }}>
             <button
               type="button"
               className="btn btn-secondary"
-              onClick={() => { setShowRegister(false); reset({ consent: { accepted: false, purpose: 'care_delivery' } }) }}
-              disabled={isSubmitting}
+              onClick={closeRegistration}
+              disabled={isSubmitting || registrationSaving}
             >
-              Cancel
+              {registrationUncertain ? 'Close and resume later' : 'Cancel'}
             </button>
             <button
               id="submit-patient-btn"
               type="submit"
               className="btn btn-primary"
-              disabled={isSubmitting}
+              disabled={isSubmitting || registrationSaving}
             >
-              {isSubmitting && <span className="spinner spinner-sm" />}
-              {isSubmitting ? 'Registering Patient…' : 'Complete Registration'}
+              {(isSubmitting || registrationSaving) && <span className="spinner spinner-sm" />}
+              {isSubmitting || registrationSaving ? 'Registering Patient…' : registrationUncertain ? 'Retry registration' : 'Complete Registration'}
             </button>
           </div>
         </form>
@@ -711,7 +846,7 @@ export default function Patients() {
       {/* ── Duplicate Resolution Modal (FR-06 Disambiguation Gate) ── */}
       <Modal
         open={showDuplicateModal}
-        onClose={() => setShowDuplicateModal(false)}
+        onClose={() => { if (!isCreatingDuplicate) setShowDuplicateModal(false) }}
         title="Potential Duplicate Patient Detected"
         description="A patient with matching details already exists in the electronic registry. Please review below."
       >
@@ -732,6 +867,10 @@ export default function Patients() {
             <Alert variant="error" onDismiss={() => setSubmitError('')}>{submitError}</Alert>
           )}
 
+          {registrationUncertain && <p role="status" className="text-sm text-[var(--color-text-secondary)]">
+            Registration queued on this device; saved registration is not yet confirmed. Retry unchanged or recover from Offline work on the Dashboard.
+          </p>}
+
           <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
             {duplicateMatches.map(match => (
               <div
@@ -739,14 +878,14 @@ export default function Patients() {
                 className="card p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="avatar avatar-md flex-shrink-0 bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold">
+                  <div className="avatar avatar-md flex-shrink-0 bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs font-bold">
                     {getInitials(match.name)}
                   </div>
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-sm truncate text-[var(--color-text)]">{match.name}</span>
                       <span className="mono text-[10px] font-bold text-teal-700 bg-teal-50 px-1.5 py-0.5 rounded border border-teal-200/60">
-                        UHID-{match.id.slice(0, 8).toUpperCase()}
+                        {match.uhid || 'UHID not recorded'}
                       </span>
                     </div>
                     <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-[var(--color-text-muted)] mt-1">
@@ -759,6 +898,7 @@ export default function Patients() {
 
                 <button
                   type="button"
+                  disabled={isCreatingDuplicate || registrationUncertain}
                   onClick={() => {
                     setShowDuplicateModal(false)
                     setShowRegister(false)
@@ -777,6 +917,7 @@ export default function Patients() {
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              disabled={isCreatingDuplicate || registrationUncertain}
               onClick={() => setShowDuplicateModal(false)}
             >
               Cancel & Edit Info
@@ -792,7 +933,7 @@ export default function Patients() {
                 }
               }}
             >
-              {isCreatingDuplicate ? 'Creating…' : 'Proceed as New Patient (Family Member)'}
+              {isCreatingDuplicate ? 'Creating…' : registrationUncertain ? 'Retry registration' : 'Proceed as New Patient (Family Member)'}
             </button>
           </div>
         </div>
@@ -853,7 +994,7 @@ export default function Patients() {
         open={!!viewingPatient}
         onClose={() => setViewingPatient(null)}
         title="Electronic Health Record"
-        description={viewingPatient ? `Patient Chart · UHID-${viewingPatient.id.slice(0, 8).toUpperCase()}` : ''}
+        description={viewingPatient ? `Patient Chart · ${viewingPatient.uhid || 'UHID not recorded'}` : ''}
       >
         {viewingPatient && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -861,7 +1002,7 @@ export default function Patients() {
             <div className="flex items-center justify-between p-4 rounded-lg" style={{ background: 'var(--color-surface-raised)', border: '1px solid var(--color-border)' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
                 <div
-                  className="avatar avatar-lg bg-[#1E3A2E] text-teal-200 border border-teal-600/30 font-bold shadow-xs"
+                  className="avatar avatar-lg bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs font-bold shadow-xs"
                 >
                   {getInitials(viewingPatient.name)}
                 </div>
@@ -871,19 +1012,19 @@ export default function Patients() {
                   </div>
                   <div className="flex items-center gap-2 mt-0.5">
                     <span className="mono text-xs font-semibold text-teal-700 bg-teal-50 px-2 py-0.5 rounded border border-teal-200/60">
-                      UHID-{viewingPatient.id.slice(0, 8).toUpperCase()}
+                      {viewingPatient.uhid || 'UHID not recorded'}
                     </span>
                     <span className="text-xs text-[var(--color-text-muted)]">•</span>
                     <span className="text-xs font-medium text-[var(--color-text-secondary)]">
-                      {viewingPatient.approxAge ? `${viewingPatient.approxAge} yrs` : 'Age N/A'} · {viewingPatient.gender}
+                      {viewingPatient.approxAge != null ? `${viewingPatient.approxAge} yrs` : 'Age N/A'} · {viewingPatient.gender}
                     </span>
                   </div>
                 </div>
               </div>
               <div className="hidden sm:flex flex-col items-end">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-text-muted)]">Consent Status</span>
-                <span className="text-xs font-semibold text-emerald-600 flex items-center gap-1 mt-0.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> Active Care Delivery
+                <span className="text-xs font-semibold text-[var(--color-text-secondary)] mt-0.5">
+                  {consentStatus(viewingPatient)}
                 </span>
               </div>
             </div>
@@ -893,10 +1034,10 @@ export default function Patients() {
               {[
                 { label: 'Primary Contact', value: viewingPatient.phone, mono: true },
                 { label: 'Gender Identity', value: viewingPatient.gender },
-                { label: 'Age / Demographic', value: viewingPatient.approxAge ? `${viewingPatient.approxAge} years` : 'Not recorded' },
+                { label: 'Age / Demographic', value: viewingPatient.approxAge != null ? `${viewingPatient.approxAge} years` : 'Not recorded' },
                 { label: 'Date of Birth', value: viewingPatient.dob ? formatDate(viewingPatient.dob) : 'Not specified' },
                 { label: 'First Registered', value: formatDate(viewingPatient.createdAt) },
-                { label: 'Residential City', value: viewingPatient.address || 'Standard local residency' },
+                { label: 'Residential City', value: viewingPatient.address || 'Not recorded' },
               ].map(f => (
                 <div key={f.label} className="p-2.5 rounded-xl" style={{ background: 'var(--color-surface-raised)', border: '1px solid var(--color-border-subtle)' }}>
                   <div style={{ fontSize: '10.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-muted)' }}>

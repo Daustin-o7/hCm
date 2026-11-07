@@ -1,10 +1,12 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
 namespace Hospital_CRM.Api.Services;
 
-public sealed record PaymentEvent(string EventId, decimal? Amount, string? Utr, string? Reference);
+public sealed record PaymentEvent(string EventId, decimal? Amount, string? Utr, string? Reference,
+    string? ProviderPaymentId = null, string? ProviderOrderId = null);
 
 /// <summary>
 /// B2 webhook verification + payload normalisation, extracted from the controller so the
@@ -53,6 +55,30 @@ public static class PaymentWebhookCodec
     {
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
+        if (root.ValueKind != JsonValueKind.Object) return null;
+
+        if (provider == "razorpay")
+        {
+            if (ReadString(root, "event") is not ("payment.captured" or "order.paid")
+                || !root.TryGetProperty("payload", out var payload) || payload.ValueKind != JsonValueKind.Object
+                || !payload.TryGetProperty("payment", out var payment) || payment.ValueKind != JsonValueKind.Object
+                || !payment.TryGetProperty("entity", out var entity) || entity.ValueKind != JsonValueKind.Object
+                || ReadString(entity, "status") != "captured" || ReadString(entity, "currency") != "INR")
+                return null;
+
+            // Notes are caller-controlled metadata, never evidence of capture, currency, amount or payment identity.
+            var paymentId = ReadString(entity, "id");
+            var minorAmount = entity.TryGetProperty("amount", out var amountValue) ? ToDecimal(amountValue) : null;
+            if (string.IsNullOrWhiteSpace(paymentId) || paymentId.Length > 64
+                || minorAmount is null or <= 0 || decimal.Truncate(minorAmount.Value) != minorAmount)
+                return null;
+            var razorpayReference = ReadString(entity, "receipt") ?? ReadString(entity, "reference");
+            if (razorpayReference is null && entity.TryGetProperty("notes", out var notes))
+                razorpayReference = ReadString(notes, "receipt") ?? ReadString(notes, "reference");
+            return new PaymentEvent(paymentId, minorAmount / 100m,
+                ReadString(entity, "utr") ?? ReadString(entity, "bank_transaction_id"),
+                razorpayReference, paymentId, ReadString(entity, "order_id"));
+        }
 
         var status = FindString(root, "status", "state", "paymentStatus", "txnStatus");
         if (!string.IsNullOrWhiteSpace(status) &&
@@ -75,6 +101,10 @@ public static class PaymentWebhookCodec
         CryptographicOperations.FixedTimeEquals(
             Encoding.UTF8.GetBytes(expected),
             Encoding.UTF8.GetBytes(provided.Trim().ToLowerInvariant()));
+
+    private static string? ReadString(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
     private static string? FindString(JsonElement element, params string[] names)
     {
@@ -162,7 +192,7 @@ public static class PaymentWebhookCodec
     private static decimal? ToDecimal(JsonElement element) => element.ValueKind switch
     {
         JsonValueKind.Number when element.TryGetDecimal(out var d) => d,
-        JsonValueKind.String when decimal.TryParse(element.GetString(), out var d) => d,
+        JsonValueKind.String when decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out var d) => d,
         _ => null
     };
 }

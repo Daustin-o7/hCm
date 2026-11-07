@@ -95,7 +95,7 @@ export default function ClinicalSoapEditor({
                 key={i}
                 type="button"
                 onClick={() => appendText('complaint', c)}
-                className="text-[11px] px-2.5 py-0.5 rounded-full bg-slate-100 hover:bg-teal-50 hover:text-teal-800 hover:border-teal-300 border border-slate-200 transition-colors text-slate-700 text-left"
+                className="text-[11px] px-2.5 py-0.5 rounded-full bg-[var(--color-surface-raised)] hover:bg-[var(--brand-primary-10)] hover:text-[var(--brand-primary)] hover:border-[var(--brand-primary)] border border-[var(--color-border)] transition-colors text-slate-700 text-left"
               >
                 + {c}
               </button>
@@ -135,7 +135,7 @@ export default function ClinicalSoapEditor({
                 key={i}
                 type="button"
                 onClick={() => appendText('observations', obs)}
-                className="text-[11px] px-2.5 py-0.5 rounded-full bg-slate-100 hover:bg-teal-50 hover:text-teal-800 hover:border-teal-300 border border-slate-200 transition-colors text-slate-700 text-left"
+                className="text-[11px] px-2.5 py-0.5 rounded-full bg-[var(--color-surface-raised)] hover:bg-[var(--brand-primary-10)] hover:text-[var(--brand-primary)] hover:border-[var(--brand-primary)] border border-[var(--color-border)] transition-colors text-slate-700 text-left"
               >
                 + {obs}
               </button>
@@ -172,7 +172,7 @@ export default function ClinicalSoapEditor({
                 key={i}
                 type="button"
                 onClick={() => appendText('diagnosis', d)}
-                className="text-[11px] px-2.5 py-0.5 rounded-full bg-slate-100 hover:bg-teal-50 hover:text-teal-800 hover:border-teal-300 border border-slate-200 transition-colors text-slate-700 text-left"
+                className="text-[11px] px-2.5 py-0.5 rounded-full bg-[var(--color-surface-raised)] hover:bg-[var(--brand-primary-10)] hover:text-[var(--brand-primary)] hover:border-[var(--brand-primary)] border border-[var(--color-border)] transition-colors text-slate-700 text-left"
               >
                 + {d}
               </button>
@@ -252,7 +252,7 @@ export default function ClinicalSoapEditor({
         </div>
 
         {/* Specialty Tool Launcher */}
-        <div className="card p-4 bg-slate-50/70 border-slate-200">
+        <div className="card p-4 bg-[var(--color-surface-raised)] border-[var(--color-border)]">
           <div className="flex items-center gap-2 mb-2">
             <span className="text-xl">{currentSpecialtyConfig.icon}</span>
             <div>

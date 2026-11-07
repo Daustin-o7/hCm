@@ -95,7 +95,7 @@ export default function PatientCommandRibbon({
         {/* Patient Identity & Demographics */}
         <div className="flex items-center gap-3">
           <div
-            className="w-11 h-11 rounded-md text-teal-200 bg-[#1E3A2E] border border-teal-600/30 flex items-center justify-center font-bold text-base shadow-xs shrink-0"
+            className="w-11 h-11 rounded-md text-teal-200 bg-[var(--brand-primary)] border border-teal-600/30 flex items-center justify-center font-bold text-base shadow-xs shrink-0"
             style={{
               fontFamily: 'var(--font-heading)'
             }}
@@ -234,12 +234,12 @@ export default function PatientCommandRibbon({
           )}
 
           {/* Queue Prev/Next & Dropdown */}
-          <div className="flex items-center border border-slate-200 rounded-lg bg-white overflow-hidden shadow-xs">
+          <div className="flex items-center border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] overflow-hidden shadow-xs">
             <button
               type="button"
               onClick={onPrevPatient}
               disabled={currentQueueIndex <= 0}
-              className="px-2 py-1 text-slate-600 hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed border-r border-slate-200 transition-colors"
+              className="px-2 py-1 text-slate-600 hover:bg-[var(--color-surface-hover)] disabled:opacity-30 disabled:cursor-not-allowed border-r border-[var(--color-border)] transition-colors"
               title="Previous patient in queue"
               aria-label="Previous patient"
             >
@@ -249,7 +249,7 @@ export default function PatientCommandRibbon({
               type="button"
               onClick={onNextPatient}
               disabled={currentQueueIndex >= appointments.length - 1}
-              className="px-2 py-1 text-slate-600 hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+              className="px-2 py-1 text-slate-600 hover:bg-[var(--color-surface-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               title="Next patient in queue"
               aria-label="Next patient"
             >

@@ -1,4 +1,3 @@
-using System.Security.Claims;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Domain.Services;
 using Microsoft.AspNetCore.Http;
@@ -9,6 +8,7 @@ public class TenantContext : ITenantContext
 {
     private readonly IHttpContextAccessor? _httpContextAccessor;
     private readonly AsyncLocal<Guid?> _explicitTenantId = new();
+    private readonly AsyncLocal<bool> _maintenance = new();
 
     public TenantContext(IHttpContextAccessor? httpContextAccessor = null)
     {
@@ -23,7 +23,8 @@ public class TenantContext : ITenantContext
                 return _explicitTenantId.Value;
 
             var user = _httpContextAccessor?.HttpContext?.User;
-            return user?.GetTenantId();
+            var tenantId = user?.Identity?.IsAuthenticated == true ? user.GetTenantId() : null;
+            return tenantId == Guid.Empty ? null : tenantId;
         }
     }
 
@@ -31,17 +32,17 @@ public class TenantContext : ITenantContext
     {
         get
         {
+            // A routed public link or tenant job must never inherit platform authority.
+            if (_explicitTenantId.Value.HasValue)
+                return false;
             var httpContext = _httpContextAccessor?.HttpContext;
             if (httpContext == null)
-            {
-                // When running outside an HTTP request (e.g. startup migration, development seeding, CLI),
-                // bypass tenant filtering unless an explicit tenant was pushed.
-                return !_explicitTenantId.Value.HasValue;
-            }
+                return _maintenance.Value;
 
             var user = httpContext.User;
             var role = user?.GetUserRole();
-            return string.Equals(role, "PlatformAdmin", StringComparison.OrdinalIgnoreCase);
+            return user?.Identity?.IsAuthenticated == true &&
+                string.Equals(role, "PlatformAdmin", StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -51,9 +52,20 @@ public class TenantContext : ITenantContext
     /// </summary>
     public IDisposable PushTenant(Guid tenantId)
     {
+        if (tenantId == Guid.Empty)
+            throw new ArgumentException("A tenant scope requires a non-empty tenant ID.", nameof(tenantId));
         var prior = _explicitTenantId.Value;
         _explicitTenantId.Value = tenantId;
         return new ActionDisposable(() => _explicitTenantId.Value = prior);
+    }
+
+    public IDisposable PushMaintenance()
+    {
+        if (_httpContextAccessor?.HttpContext != null || _explicitTenantId.Value.HasValue)
+            throw new InvalidOperationException("Maintenance scope is restricted to unscoped, non-HTTP operations.");
+        var prior = _maintenance.Value;
+        _maintenance.Value = true;
+        return new ActionDisposable(() => _maintenance.Value = prior);
     }
 
     private sealed class ActionDisposable : IDisposable

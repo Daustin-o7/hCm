@@ -1,0 +1,70 @@
+# Disposable GitHub-hosted test stack only. No live secret file, bind-mounted data or external network.
+name: ${COMPOSE_PROJECT_NAME:?Set the run-owned CI project name}
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${E2E_DATABASE:?Set a run-owned database}
+      POSTGRES_USER: ci_owner
+      POSTGRES_PASSWORD: ci-disposable-only
+    volumes:
+      - ci_database:/var/lib/postgresql/data
+    networks: [isolated]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U ci_owner -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  api:
+    build:
+      context: ./backend
+      dockerfile: Hospital_CRM.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__DefaultConnection: Host=postgres;Database=${E2E_DATABASE};Username=ci_owner;Password=ci-disposable-only
+      ConnectionStrings__MigrationsConnection: Host=postgres;Database=${E2E_DATABASE};Username=ci_owner;Password=ci-disposable-only
+      Hangfire__PostgreSql__Connection: Host=postgres;Database=${E2E_DATABASE};Username=ci_owner;Password=ci-disposable-only
+      Database__AutoMigrate: 'true'
+      Database__EraseOnStartup: 'false'
+      DataProtection__KeysPath: /app/keys/dp
+      Lab__UploadDir: /app/lab-uploads
+      Jwt__KeySource: PemFile
+      Jwt__PemFilePath: /app/keys/jwt-private.pem
+      Jwt__Issuer: Hospital_CRM
+      Jwt__Audience: Hospital_CRM
+      Smtp__Host: ''
+      Razorpay__KeyId: ''
+      Razorpay__KeySecret: ''
+      Razorpay__WebhookSecret: ''
+      Razorpay__ReconciliationEnabled: 'false'
+      WhatsApp__AccessToken: ''
+      WhatsApp__ApiUrl: ''
+      Typesense__Host: http://unavailable.invalid
+      Typesense__ApiKey: ''
+    volumes:
+      - ci_keys:/app/keys
+      - ci_uploads:/app/lab-uploads
+    ports:
+      - 127.0.0.1:8080:8080
+    networks: [isolated]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    environment:
+      VITE_API_BASE_URL: http://localhost:8080/api/v1
+      VITE_PROXY_TARGET: http://api:8080
+    ports: [127.0.0.1:5173:5173]
+    networks: [isolated]
+    depends_on: [api]
+networks:
+  isolated:
+    internal: true
+volumes:
+  ci_database:
+  ci_keys:
+  ci_uploads:

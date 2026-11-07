@@ -1,4 +1,5 @@
 ﻿using System.ComponentModel.DataAnnotations;
+using System.Security.Cryptography;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Api.Services;
@@ -21,12 +22,17 @@ public class StaffController : ControllerBase
     private readonly HospitalCrmDbContext _db;
     private readonly ITenantContext _tenantContext;
     private readonly ILogger<StaffController> _logger;
+    private readonly IEmailSender? _email;
+    private readonly IConfiguration? _config;
 
-    public StaffController(HospitalCrmDbContext db, ITenantContext tenantContext, ILogger<StaffController> logger)
+    public StaffController(HospitalCrmDbContext db, ITenantContext tenantContext, ILogger<StaffController> logger,
+        IEmailSender? email = null, IConfiguration? config = null)
     {
         _db = db;
         _tenantContext = tenantContext;
         _logger = logger;
+        _email = email;
+        _config = config;
     }
 
     [HttpPost("invite")]
@@ -37,8 +43,8 @@ public class StaffController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var membership = await SelectedAdminMembershipAsync(ct);
+        if (membership is null)
             return Forbid();
 
         if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Email))
@@ -47,31 +53,29 @@ public class StaffController : ControllerBase
         if (!StaffRolePolicy.TryParseInvitableRole(request.Role, allowClinicAdmin: false, out var role))
             return BadRequest(new { error = "invalid_role" });
 
-        // F1: a user whose TenantId stays null has no tenant claim and is therefore
-        // invisible to both the EF query filter and RLS. Resolve it from the clinic if
-        // the admin row predates the tenant backfill.
-        var tenantId = adminUser.TenantId
-            ?? await _db.Clinics.IgnoreQueryFilters()
-                .Where(c => c.Id == adminUser.ClinicId.Value)
-                .Select(c => (Guid?)c.TenantId)
-                .FirstOrDefaultAsync(ct);
-        if (tenantId is null || tenantId == Guid.Empty)
-            return Forbid();
+        if (!new EmailAddressAttribute().IsValid(request.Email) || request.Email.Length > 254)
+            return BadRequest(new { error = "invalid_email" });
 
-        var existingUser = await _db.Users.AnyAsync(u => u.Email == request.Email, ct);
+        var email = request.Email.Trim();
+        var existingUser = await _db.Users.AnyAsync(u => u.Email == email, ct);
         if (existingUser)
             return Conflict(new { error = "email_already_registered" });
 
-        var rawToken = Guid.NewGuid().ToString("N");
+        if (await _db.StaffInvites.AnyAsync(i => i.TenantId == membership.TenantId
+            && i.ClinicId == membership.ClinicId && i.Email == email
+            && i.AcceptedAt == null && i.ExpiresAt > DateTimeOffset.UtcNow, ct))
+            return Conflict(new { error = "invite_already_pending", message = "Cancel the pending invitation before issuing a fresh link." });
+
+        var rawToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
         var tokenHash = rawToken.HashToken();
 
         var invite = new StaffInvite
         {
             Id = Guid.NewGuid(),
-            TenantId = tenantId.Value,
-            ClinicId = adminUser.ClinicId.Value,
-            Name = request.Name,
-            Email = request.Email,
+            TenantId = membership.TenantId,
+            ClinicId = membership.ClinicId!.Value,
+            Name = request.Name.Trim(),
+            Email = email,
             Role = role,
             TokenHash = tokenHash,
             ExpiresAt = DateTimeOffset.UtcNow.AddHours(72) // FR-04
@@ -110,13 +114,16 @@ public class StaffController : ControllerBase
         _db.StaffInvites.Add(invite);
         await _db.SaveChangesAsync(ct);
 
-        _logger.LogInformation("Invite link generated for {Email}", request.Email);
+        var emailStatus = await IdentityEmail.InviteAsync(_email, _config, invite.Email, rawToken, invite.ExpiresAt, ct);
+        _logger.LogInformation("Invitation {InviteId} email transport outcome: {Outcome}", invite.Id, emailStatus);
 
         return Ok(new
         {
             inviteId = invite.Id,
             inviteToken = rawToken,
-            expiresAt = invite.ExpiresAt
+            expiresAt = invite.ExpiresAt,
+            emailStatus,
+            emailRetry = emailStatus == "handoff" ? null : "Share the generated link, or cancel this invite and issue a fresh invitation."
         });
     }
 
@@ -125,6 +132,11 @@ public class StaffController : ControllerBase
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> AcceptInvite([FromBody] AcceptInviteRequest request, CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(request.InviteToken) || request.InviteToken.Length > 512)
+            return Unauthorized(new { error = "invalid_or_expired_invite" });
+        if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length < 8 || request.Password.Length > 72)
+            return BadRequest(new { error = "invalid_password_length" });
+
         // Digest lookup: one indexed read, and a stolen database row cannot be replayed.
         var tokenHash = request.InviteToken.HashToken();
         var invite = await _db.StaffInvites
@@ -133,7 +145,24 @@ public class StaffController : ControllerBase
                                       && i.ExpiresAt > DateTimeOffset.UtcNow
                                       && i.AcceptedAt == null, ct);
 
-        if (invite is null)
+        if (invite is null || invite.TenantId == Guid.Empty || invite.ClinicId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_or_expired_invite" });
+
+        using var tenantScope = _tenantContext.PushTenant(invite.TenantId);
+        await using var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(ct) : null;
+        if (_db.Database.IsRelational())
+            await _db.Database.ExecuteSqlInterpolatedAsync(
+                $"SELECT set_config('app.current_tenant_id', {invite.TenantId.ToString()}, true), set_config('app.is_platform_admin', 'false', true)", ct);
+
+        if (!StaffRolePolicy.TryParseInvitableRole(invite.Role.ToString(), allowClinicAdmin: true, out _)
+            || !await _db.Clinics.AnyAsync(c => c.Id == invite.ClinicId && c.TenantId == invite.TenantId, ct))
+            return Unauthorized(new { error = "invalid_or_expired_invite" });
+
+        var acceptedAt = DateTimeOffset.UtcNow;
+        if (_db.Database.IsRelational() && await _db.StaffInvites
+            .Where(i => i.Id == invite.Id && i.TokenHash == tokenHash && i.AcceptedAt == null && i.ExpiresAt > acceptedAt)
+            .ExecuteUpdateAsync(s => s.SetProperty(i => i.AcceptedAt, acceptedAt), ct) != 1)
             return Unauthorized(new { error = "invalid_or_expired_invite" });
 
         var existingUser = await _db.Users.AnyAsync(u => u.Email == invite.Email, ct);
@@ -164,6 +193,7 @@ public class StaffController : ControllerBase
             TenantId = invite.TenantId,
             ClinicId = invite.ClinicId,
             Role = invite.Role,
+            Specialty = user.Specialty,
             IsDefault = true,
             Status = "active",
             CreatedAt = DateTimeOffset.UtcNow,
@@ -208,18 +238,16 @@ public class StaffController : ControllerBase
             invite.NurseProfileId = nurseProfile.Id;
         }
 
-        invite.AcceptedAt = DateTimeOffset.UtcNow;
-
-        // Anonymous accept: StaffInvites' WITH CHECK requires a tenant, so scope the
-        // transaction to the invite's tenant before the update. set_config(..., true)
-        // is transaction-local and cannot leak to a pooled connection.
-        await using var transaction = await _db.Database.BeginTransactionAsync(ct);
-        await _db.Database.ExecuteSqlInterpolatedAsync(
-            $"SELECT set_config('app.current_tenant_id', {invite.TenantId.ToString()}, true)", ct);
-        using var tenantScope = _tenantContext.PushTenant(invite.TenantId);
-
-        await _db.SaveChangesAsync(ct);
-        await transaction.CommitAsync(ct);
+        invite.AcceptedAt = acceptedAt;
+        try
+        {
+            await _db.SaveChangesAsync(ct);
+            if (transaction is not null) await transaction.CommitAsync(ct);
+        }
+        catch (DbUpdateException)
+        {
+            return Conflict(new { error = "invite_acceptance_conflict" });
+        }
 
         await AuthAudit.LogAsync(_db, HttpContext, AuthEvent.RoleGranted, "success",
             user.Id, invite.TenantId, user.Email, $"role={invite.Role}", ct);
@@ -235,12 +263,12 @@ public class StaffController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var membership = await SelectedAdminMembershipAsync(ct);
+        if (membership is null)
             return Forbid();
 
         var invites = await _db.StaffInvites
-            .Where(i => i.ClinicId == adminUser.ClinicId.Value && i.AcceptedAt == null && i.ExpiresAt > DateTimeOffset.UtcNow)
+            .Where(i => i.TenantId == membership.TenantId && i.ClinicId == membership.ClinicId && i.AcceptedAt == null && i.ExpiresAt > DateTimeOffset.UtcNow)
             .OrderByDescending(i => i.ExpiresAt)
             .Select(i => new
             {
@@ -263,18 +291,25 @@ public class StaffController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var membership = await SelectedAdminMembershipAsync(ct);
+        if (membership is null)
             return Forbid();
 
-        var invite = await _db.StaffInvites
-            .FirstOrDefaultAsync(i => i.Id == id && i.ClinicId == adminUser.ClinicId.Value && i.AcceptedAt == null, ct);
-
-        if (invite is null)
-            return NotFound(new { error = "invite_not_found" });
-
-        _db.StaffInvites.Remove(invite);
-        await _db.SaveChangesAsync(ct);
+        var pending = _db.StaffInvites.Where(i => i.Id == id && i.TenantId == membership.TenantId
+            && i.ClinicId == membership.ClinicId && i.AcceptedAt == null);
+        if (_db.Database.IsRelational())
+        {
+            // Acceptance and cancellation contend on the same pending row; accepted history cannot be deleted.
+            if (await pending.ExecuteDeleteAsync(ct) != 1)
+                return NotFound(new { error = "invite_not_found" });
+        }
+        else
+        {
+            var invite = await pending.SingleOrDefaultAsync(ct);
+            if (invite is null) return NotFound(new { error = "invite_not_found" });
+            _db.StaffInvites.Remove(invite);
+            await _db.SaveChangesAsync(ct);
+        }
 
         return Ok(new { message = "invite_cancelled" });
     }
@@ -287,26 +322,38 @@ public class StaffController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var membership = await SelectedAdminMembershipAsync(ct);
+        if (membership is null)
             return Forbid();
 
-        var staff = await _db.Users
-            .Where(u => u.ClinicId == adminUser.ClinicId.Value && u.Role != UserRole.PlatformAdmin)
-            .OrderBy(u => u.Name)
-            .Select(u => new
+        var staff = await _db.TenantMemberships
+            .Where(m => m.TenantId == membership.TenantId && m.ClinicId == membership.ClinicId && m.Role != UserRole.PlatformAdmin)
+            .OrderBy(m => m.User.Name)
+            .Select(m => new
             {
-                id = u.Id,
-                name = u.Name,
-                email = u.Email,
-                role = u.Role.ToString().ToLower(),
-                specialty = u.Specialty,
-                status = "Active",
-                joinedAt = u.CreatedAt
+                id = m.UserId,
+                name = m.User.Name,
+                email = m.User.Email,
+                role = m.Role.ToString().ToLower(),
+                specialty = m.Specialty,
+                status = m.Status,
+                joinedAt = m.CreatedAt
             })
             .ToListAsync(ct);
 
         return Ok(staff);
+    }
+
+    private Task<TenantMembership?> SelectedAdminMembershipAsync(CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        if (userId is null || tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty)
+            return Task.FromResult<TenantMembership?>(null);
+        return _db.TenantMemberships.AsNoTracking().SingleOrDefaultAsync(m =>
+            m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active"
+            && m.Role == UserRole.ClinicAdmin && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
     }
 }
 
@@ -350,5 +397,5 @@ public record AcceptInviteRequest(
     [Required(ErrorMessage = "InviteToken is required")]
     string InviteToken,
 
-    [Required(ErrorMessage = "Password is required"), MinLength(8, ErrorMessage = "Password must be at least 8 characters")]
+    [Required(ErrorMessage = "Password is required"), MinLength(8, ErrorMessage = "Password must be at least 8 characters"), MaxLength(72)]
     string Password);

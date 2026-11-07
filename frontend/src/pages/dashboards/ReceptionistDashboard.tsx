@@ -220,7 +220,7 @@ export default function ReceptionistDashboard() {
 
       {/* ── Calling Banner ── */}
       {callingToken && (
-        <div className="p-3.5 rounded-lg bg-[var(--palette-forest-900,#1E3A2E)] text-white font-medium flex items-center justify-between border border-[var(--palette-forest-800,#3E5A3F)] shadow-xs">
+        <div className="p-3.5 rounded-lg bg-[var(--brand-primary)] text-white font-medium flex items-center justify-between border border-[var(--brand-primary-hover)] shadow-xs">
           <div className="flex items-center gap-3">
             <span className="text-2xl">📢</span>
             <div>

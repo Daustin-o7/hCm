@@ -2,7 +2,8 @@
 import { useForm, useFieldArray } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import api from '../services/api'
+import api, { getSessionGeneration } from '../services/api'
+import { captureOutboxSession, enqueueOutbox, flushOutbox, readOutbox, retryOutboxItem, type OutboxItem, type OutboxSession } from '../services/offlineOutbox'
 import { useAuth } from '../context/AuthContext'
 import { Alert, friendlyError } from '../components/ui/Alert'
 import { EmptyState } from '../components/ui/EmptyState'
@@ -10,22 +11,27 @@ import { Modal } from '../components/ui/Modal'
 import { fmtDate } from '../utils/format'
 
 const invoiceLineItemSchema = z.object({
-  description: z.string().min(1, 'Description required'),
-  quantity: z.number().min(1),
-  unitPrice: z.number().min(0.01, 'Unit price required'),
+  description: z.string().trim().min(2, 'Enter a service description').max(150),
+  quantity: z.number().int().min(1).max(1000000),
+  unitPrice: z.number().min(0.01, 'Unit price required').max(1000000).multipleOf(0.01, 'Use at most two decimal places'),
   taxCategory: z.enum(['Exempt', 'Nil', 'Taxable']),
   hsnSacCode: z.string(),
-  gstRate: z.number().min(0),
+  gstRate: z.number().min(0).max(100).multipleOf(0.01),
 })
 
 const invoiceSchema = z.object({
   patientId: z.string().min(1, 'Select a patient'),
   appointmentId: z.string().min(1, 'Select the appointment this invoice belongs to'),
-  discountAmount: z.number().min(0),
+  discountAmount: z.number().min(0).multipleOf(0.01, 'Use at most two decimal places'),
   discountReason: z.string().optional(),
   autoFinalize: z.boolean(),
-  lineItems: z.array(invoiceLineItemSchema).min(1, 'At least one line item is required'),
+  lineItems: z.array(invoiceLineItemSchema).min(1, 'At least one line item is required').max(50),
 }).superRefine((data, ctx) => {
+  data.lineItems.forEach((item, index) => {
+    if (item.taxCategory === 'Taxable' && item.gstRate <= 0) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['lineItems', index, 'gstRate'], message: 'Taxable lines need a positive GST rate' })
+    }
+  })
   if ((data.discountAmount ?? 0) > 0 && !data.discountReason?.trim()) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -114,6 +120,17 @@ interface LedgerPayment {
   status: string
   verificationStatus: string
   paidAt?: string
+  idempotencyKey?: string
+  payeeAccountId?: string
+  razorpayPaymentId?: string
+  refundableAmount: number
+  refundStatus?: 'pending_approval' | 'processing' | 'refunded' | 'failed'
+  refundReason?: string
+  refundReference?: string
+  refundSourcePaymentId?: string
+  confirmedByUserId?: string
+  secondApprovedByUserId?: string
+  isPharmacyReturn?: boolean
 }
 
 interface InvoiceDetail {
@@ -122,8 +139,54 @@ interface InvoiceDetail {
   patient?: { name: string }
   paidAmount: number
   balanceDue: number
+  refundableAmount: number
   payments: LedgerPayment[]
 }
+
+const moneySchema = z.number().finite().nonnegative().max(10000000).multipleOf(0.01)
+const savedTimeSchema = z.string().datetime({ offset: true })
+const receiptOutcomeSchema = z.object({
+  paymentId: z.string().uuid(), invoiceId: z.string().uuid(), amount: moneySchema.positive(), method: z.string(),
+  paymentStatus: z.enum(['pending', 'completed']), verificationStatus: z.enum(['reported', 'confirmed']),
+  idempotencyKey: z.string().min(1).max(128), utr: z.string().nullable().optional(),
+  payeeAccountId: z.string().uuid().nullable().optional(),
+  reportedAt: savedTimeSchema.nullable().optional(), confirmedAt: savedTimeSchema.nullable().optional(),
+  paidAmount: moneySchema.optional(), balanceDue: moneySchema.optional(), alreadyConfirmed: z.boolean().optional(),
+})
+const refundOutcomeSchema = z.object({
+  refundId: z.string().uuid(), invoiceId: z.string().uuid(), amount: moneySchema.positive(), method: z.string(),
+  status: z.enum(['pending_approval', 'processing', 'refunded', 'failed']),
+  verificationStatus: z.enum(['pending', 'confirmed', 'rejected']), idempotencyKey: z.string().min(1).max(128),
+  refundReference: z.string().nullable(), refundReason: z.string().min(3), refundSourcePaymentId: z.string().uuid().nullable(),
+  refundedAt: savedTimeSchema.nullable(), isPharmacyReturn: z.boolean(), stockRestored: z.boolean(),
+}).refine(result => result.status === 'refunded'
+  ? result.verificationStatus === 'confirmed' && Boolean(result.refundReference?.trim()) && Boolean(result.refundedAt)
+    && result.stockRestored === result.isPharmacyReturn
+  : result.verificationStatus === (result.status === 'failed' ? 'rejected' : 'pending') && !result.refundedAt && !result.stockRestored)
+type RefundOutcome = z.infer<typeof refundOutcomeSchema>
+
+function savedRefund(data: unknown, expected: { invoiceId: string; amount: number; method: string; idempotencyKey?: string; sourcePaymentId?: string; refundId?: string }): RefundOutcome | null {
+  const parsed = refundOutcomeSchema.safeParse(data)
+  if (!parsed.success) return null
+  const result = parsed.data
+  return result.invoiceId === expected.invoiceId && result.amount === expected.amount
+    && result.method.toLowerCase() === expected.method.toLowerCase()
+    && (!expected.idempotencyKey || result.idempotencyKey === expected.idempotencyKey)
+    && (!expected.sourcePaymentId || result.refundSourcePaymentId === expected.sourcePaymentId)
+    && (!expected.refundId || result.refundId === expected.refundId) ? result : null
+}
+
+const depositOutcomeSchema = z.object({
+  depositId: z.string().uuid(), patientId: z.string().uuid(), receiptNumber: z.string().min(1),
+  amount: moneySchema.positive(), method: z.string(), referenceNumber: z.string().nullable(),
+  idempotencyKey: z.string().min(1).max(128), status: z.enum(['active', 'fullyallocated', 'refunded']), createdAt: savedTimeSchema,
+})
+const advanceOutcomeSchema = receiptOutcomeSchema.extend({
+  allocatedAdvanceAmount: moneySchema.positive(), paidAmount: moneySchema, balanceDue: moneySchema,
+  allocations: z.array(z.object({ allocationId: z.string().uuid(), depositId: z.string().uuid(), amount: moneySchema.positive() })).min(1),
+})
+
+const canCollect = (invoice: Invoice) => ['issued', 'finalized', 'partiallypaid'].includes(invoice.status) && invoice.balanceDue > 0
 
 interface PatientDeposits {
   patientId: string
@@ -243,6 +306,14 @@ export default function Billing() {
   const [loading, setLoading] = useState(true)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
   const [toast, setToast] = useState<{ msg: string; type?: 'success' | 'err' } | null>(null)
+  // shortcut: payment/refund/deposit keys live while this page is open; only invoice creation uses the FR-22 outbox.
+  const mutationKeys = useRef<Record<string, string>>({})
+  const invoiceAttempt = useRef<{ item: OutboxItem; session: OutboxSession } | null>(null)
+  const invoiceBusy = useRef(false)
+  const [invoicePending, setInvoicePending] = useState(false)
+  const [createError, setCreateError] = useState('')
+  const active = useRef(true)
+  useEffect(() => { active.current = true; return () => { active.current = false } }, [])
 
   // Modals
   const [createModalOpen, setCreateModalOpen] = useState(false)
@@ -256,6 +327,8 @@ export default function Billing() {
   const [confirmMethod, setConfirmMethod] = useState<'cash' | 'upi' | 'card' | 'netbanking'>('upi')
   const [confirmAmount, setConfirmAmount] = useState<number>(0)
   const [confirmUtr, setConfirmUtr] = useState('')
+  const [confirmDetail, setConfirmDetail] = useState<InvoiceDetail | null>(null)
+  const [confirmPaymentId, setConfirmPaymentId] = useState('')
 
   const [creditNoteModalOpen, setCreditNoteModalOpen] = useState(false)
   const [creditNoteInvoice, setCreditNoteInvoice] = useState<Invoice | null>(null)
@@ -270,7 +343,8 @@ export default function Billing() {
   const [refundInvoice, setRefundInvoice] = useState<Invoice | null>(null)
   const [refundDetail, setRefundDetail] = useState<InvoiceDetail | null>(null)
   const [refundAmount, setRefundAmount] = useState<number>(0)
-  const [refundMethod, setRefundMethod] = useState<'cash' | 'upi' | 'card' | 'netbanking'>('upi')
+  const [refundMethod, setRefundMethod] = useState<'cash' | 'upi' | 'card' | 'netbanking' | 'razorpay'>('upi')
+  const [refundSourceId, setRefundSourceId] = useState('')
   const [refundReference, setRefundReference] = useState('')
   const [refundReason, setRefundReason] = useState('')
 
@@ -327,17 +401,18 @@ export default function Billing() {
   const watchedDiscount = watch('discountAmount') || 0
   const selectedPatientId = watch('patientId')
 
-  const calculatedSubtotal = watchedLineItems.reduce((acc, item) => acc + ((item.quantity || 1) * (item.unitPrice || 0)), 0)
-  const calculatedTax = watchedLineItems.reduce((acc, item) => {
-    if (item.taxCategory === 'Taxable' && item.gstRate > 0) {
-      const lineBase = (item.quantity || 1) * (item.unitPrice || 0)
-      return acc + (lineBase * (item.gstRate / 100))
-    }
-    return acc
-  }, 0)
-  const calculatedGrandTotal = Math.max(0, calculatedSubtotal + calculatedTax - watchedDiscount)
+  const previewLines = watchedLineItems.map(item => {
+    const base = Math.max(0, item.quantity || 0) * Math.round(Math.max(0, item.unitPrice || 0) * 100)
+    // Integer cents and basis points match the server's per-line AwayFromZero tax rounding.
+    const tax = item.taxCategory === 'Taxable' ? Math.floor((base * Math.round(Math.max(0, item.gstRate || 0) * 100) + 5000) / 10000) : 0
+    return { base, tax }
+  })
+  const calculatedSubtotal = previewLines.reduce((sum, line) => sum + line.base, 0) / 100
+  const calculatedTax = previewLines.reduce((sum, line) => sum + line.tax, 0) / 100
+  const calculatedGrandTotal = Math.max(0, Math.round((calculatedSubtotal + calculatedTax) * 100) - Math.round(watchedDiscount * 100)) / 100
 
   const fetchData = useCallback(async () => {
+    const generation = getSessionGeneration()
     setLoading(true)
     try {
       const [invRes, taxRes, dailyRes, duesRes, patientRes] = await Promise.allSettled([
@@ -348,15 +423,16 @@ export default function Billing() {
         api.get('/patients'),
       ])
 
+      if (!active.current || generation !== getSessionGeneration()) return
       if (invRes.status === 'fulfilled') setInvoices(invRes.value.data)
       if (patientRes.status === 'fulfilled') setPatients(patientRes.value.data)
       if (taxRes.status === 'fulfilled') setTaxProfile(taxRes.value.data)
       if (dailyRes.status === 'fulfilled') setDailyCollection(dailyRes.value.data)
       if (duesRes.status === 'fulfilled') setOutstandingDues(duesRes.value.data)
     } catch {
-      showToast('Error loading financial records.', 'err')
+      if (active.current && generation === getSessionGeneration()) showToast('Error loading financial records.', 'err')
     } finally {
-      setLoading(false)
+      if (active.current && generation === getSessionGeneration()) setLoading(false)
     }
   }, [])
 
@@ -364,11 +440,37 @@ export default function Billing() {
     fetchData()
   }, [fetchData])
 
+  useEffect(() => {
+    let mounted = true
+    const generation = getSessionGeneration()
+    let previous: string[] = []
+    let snapshots = Promise.resolve()
+    const changed = () => {
+      if (!mounted || generation !== getSessionGeneration()) return
+      const current = Promise.resolve().then(() => readOutbox())
+        .then(entries => entries.map(entry => entry.id), () => null)
+      // Verified recovery can add invoices or patient options without resetting the open bill.
+      snapshots = snapshots.then(async () => {
+        const after = await current
+        if (!mounted || generation !== getSessionGeneration() || !after) return
+        const acknowledged = previous.some(id => !after.includes(id))
+        previous = after
+        if (acknowledged) void fetchData()
+      })
+    }
+    changed()
+    window.addEventListener('samstack:outbox-changed', changed)
+    return () => { mounted = false; window.removeEventListener('samstack:outbox-changed', changed) }
+  }, [fetchData])
+
   const closeCreateModal = () => {
-    appointmentRequest.current += 1
+    if (invoiceBusy.current) return
     setCreateModalOpen(false)
+    if (invoiceAttempt.current) return
+    appointmentRequest.current += 1
     setPatientAppointments([])
     setAppointmentsLoading(false)
+    setCreateError('')
     reset()
   }
 
@@ -399,34 +501,55 @@ export default function Billing() {
   }
 
   // Create Invoice Handler
-  const handleCreateInvoice = async (data: InvoiceForm) => {
+  const handleCreateInvoice = async (data?: InvoiceForm) => {
+    if (invoiceBusy.current) return
+    const generation = getSessionGeneration()
+    if (invoiceAttempt.current && invoiceAttempt.current.session.generation !== generation) {
+      setCreateError('The clinic session changed. Return to the original session to reconcile this invoice before creating another.')
+      return
+    }
+    invoiceBusy.current = true
+    setActionLoading('create-invoice')
+    setCreateError('')
     try {
-      setActionLoading('create-invoice')
-      const payload = {
-        appointmentId: data.appointmentId,
-        discountAmount: data.discountAmount,
-        discountReason: data.discountReason,
-        autoFinalize: data.autoFinalize,
-        lineItems: data.lineItems.map(item => ({
-          description: item.description,
-          quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          amount: item.quantity * item.unitPrice,
-          taxCategory: item.taxCategory,
-          hsnSacCode: item.hsnSacCode,
-          gstRate: item.gstRate,
-        })),
+      let attempt = invoiceAttempt.current
+      if (!attempt) {
+        if (!data) return
+        const session = captureOutboxSession()
+        const idempotencyKey = `IDEMP-INV-${crypto.randomUUID()}`
+        const item: OutboxItem = { version: 1, id: crypto.randomUUID(), type: 2, idempotencyKey, createdAt: new Date().toISOString(),
+          payloadJson: JSON.stringify({ idempotencyKey, patientId: data.patientId, appointmentId: data.appointmentId,
+            discountAmount: data.discountAmount, discountReason: data.discountReason,
+            status: data.autoFinalize ? 'unpaid' : 'draft', lineItems: data.lineItems }) }
+        await enqueueOutbox(item, session)
+        if (!active.current || generation !== getSessionGeneration()) return
+        attempt = { item, session }
+        invoiceAttempt.current = attempt
+        setInvoicePending(true)
+      } else {
+        const id = attempt.item.id
+        const entry = (await readOutbox(attempt.session)).find(entry => entry.id === id)
+        if (entry && ['unknown', 'rejected'].includes(entry.status)) await retryOutboxItem(entry.id, attempt.session)
       }
-
-      await api.post('/invoices', payload)
-      const patientName = patients.find(p => p.id === data.patientId)?.name ?? 'the selected patient'
-      showToast(`Invoice generated for ${patientName}.`)
+      await flushOutbox(attempt.session)
+      const retained = (await readOutbox(attempt.session)).find(entry => entry.id === attempt.item.id)
+      if (!active.current || generation !== getSessionGeneration()) return
+      if (retained) { setCreateError(retained.message); return }
+      // Removal proves the exact Sync result and authoritative invoice readback were acknowledged.
+      invoiceAttempt.current = null
+      setInvoicePending(false)
+      showToast('Invoice saved and verified.')
+      invoiceBusy.current = false
       closeCreateModal()
       await fetchData()
     } catch (err: any) {
-      showToast(friendlyError(err), 'err')
+      if (active.current && generation === getSessionGeneration()) setCreateError(friendlyError(err))
     } finally {
-      setActionLoading(null)
+      invoiceBusy.current = false
+      if (active.current && generation === getSessionGeneration()) {
+        setActionLoading(null)
+        window.dispatchEvent(new Event('samstack:outbox-changed'))
+      }
     }
   }
 
@@ -446,6 +569,7 @@ export default function Billing() {
 
   // Open Dynamic UPI QR Modal
   const handleOpenDynamicQr = async (invoice: Invoice, useBackup: boolean = false) => {
+    if (!canRecordPayments || !canCollect(invoice)) return
     setSelectedInvoiceForQr(invoice)
     setIsUsingBackupAccount(useBackup)
     try {
@@ -470,14 +594,28 @@ export default function Billing() {
 
   // Patient Reports Payment (Hint only)
   const handlePatientReportedPayment = async () => {
-    if (!selectedInvoiceForQr) return
+    if (!selectedInvoiceForQr || !qrData) return
+    const scope = `report-${selectedInvoiceForQr.invoiceId}`
+    const key = mutationKeys.current[scope] ??= `IDEMP-PAY-${crypto.randomUUID()}`
     try {
       setActionLoading('report-payment')
-      await api.post(`/invoices/${selectedInvoiceForQr.invoiceId}/payments/report`, {
+      const res = await api.post(`/invoices/${selectedInvoiceForQr.invoiceId}/payments/report`, {
         method: 'upi',
-        amount: selectedInvoiceForQr.balanceDue || selectedInvoiceForQr.total
+        amount: qrData.amount,
+        payeeAccountId: qrData.account.id,
+        idempotencyKey: key,
       })
-      showToast('Payment marked as Reported. Staff must verify credit in bank app/soundbox before confirming.', 'success')
+      const parsed = receiptOutcomeSchema.safeParse(res.data)
+      if (!parsed.success || parsed.data.invoiceId !== selectedInvoiceForQr.invoiceId || parsed.data.amount !== qrData.amount
+        || parsed.data.method.toLowerCase() !== 'upi' || parsed.data.idempotencyKey !== key || parsed.data.payeeAccountId !== qrData.account.id
+        || !(parsed.data.paymentStatus === 'pending' && parsed.data.verificationStatus === 'reported' && parsed.data.reportedAt
+          || parsed.data.paymentStatus === 'completed' && parsed.data.verificationStatus === 'confirmed' && parsed.data.confirmedAt))
+        throw new Error('Payment report response does not identify the saved receipt. Retry the same report.')
+      const result = parsed.data
+      delete mutationKeys.current[scope]
+      showToast(result.verificationStatus === 'confirmed'
+        ? `Existing receipt of ₹${result.amount.toLocaleString('en-IN')} is confirmed. No second receipt was recorded.`
+        : `₹${result.amount.toLocaleString('en-IN')} payment reported. A reported payment is not a confirmed bank credit.`)
       setQrModalOpen(false)
       await fetchData()
     } catch (err: any) {
@@ -488,18 +626,36 @@ export default function Billing() {
   }
 
   // Open Confirm Payment Modal
-  const handleOpenConfirmPayment = (invoice: Invoice) => {
+  const selectReportedPayment = (paymentId: string, detail: InvoiceDetail | null = confirmDetail) => {
+    const payment = detail?.payments.find(p => p.id === paymentId)
+    setConfirmPaymentId(paymentId)
+    setConfirmAmount(payment?.amount ?? Number(detail?.balanceDue ?? confirmInvoice?.balanceDue ?? 0))
+    setConfirmMethod((payment?.method.toLowerCase() as typeof confirmMethod) ?? 'upi')
+    setConfirmUtr(payment?.utr ?? '')
+  }
+
+  const handleOpenConfirmPayment = async (invoice: Invoice) => {
+    if (!canRecordPayments || !canCollect(invoice)) return
     setConfirmInvoice(invoice)
-    setConfirmAmount(invoice.balanceDue > 0 ? invoice.balanceDue : invoice.total)
-    setConfirmMethod('upi')
-    setConfirmUtr('')
-    setConfirmModalOpen(true)
+    setConfirmDetail(null)
+    try {
+      setActionLoading(`confirm-read-${invoice.invoiceId}`)
+      const res = await api.get<InvoiceDetail>(`/invoices/${invoice.invoiceId}`)
+      setConfirmDetail(res.data)
+      const reported = res.data.payments.find(p => p.amount > 0 && p.status.toLowerCase() === 'pending' && p.verificationStatus.toLowerCase() === 'reported')
+      selectReportedPayment(reported?.id ?? '', res.data)
+      setConfirmModalOpen(true)
+    } catch (err: any) {
+      showToast(friendlyError(err), 'err')
+    } finally {
+      setActionLoading(null)
+    }
   }
 
   // Submit Payment Confirmation
   const handleSubmitConfirmPayment = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!confirmInvoice) return
+    if (!confirmInvoice || !canRecordPayments) return
 
     const threshold = taxProfile?.thresholdHighValueUtr || 2000
     if (confirmMethod !== 'cash' && confirmAmount >= threshold && !confirmUtr.trim()) {
@@ -507,15 +663,30 @@ export default function Billing() {
       return
     }
 
+    const payment = confirmDetail?.payments.find(p => p.id === confirmPaymentId)
+    const scope = `confirm-${confirmInvoice.invoiceId}-${confirmPaymentId}`
+    const key = payment?.idempotencyKey ?? (mutationKeys.current[scope] ??= `IDEMP-PAY-${crypto.randomUUID()}`)
     try {
       setActionLoading('confirm-payment')
       const res = await api.post(`/invoices/${confirmInvoice.invoiceId}/payments/confirm`, {
         method: confirmMethod,
         amount: Number(confirmAmount),
-        utr: confirmUtr.trim() || undefined
+        utr: confirmUtr.trim() || undefined,
+        paymentId: payment?.id,
+        payeeAccountId: payment?.payeeAccountId,
+        idempotencyKey: key,
       })
 
-      showToast(`Payment of ₹${confirmAmount.toLocaleString('en-IN')} confirmed. Invoice status: ${res.data.status.toUpperCase()}.`)
+      const parsed = receiptOutcomeSchema.safeParse(res.data)
+      if (!parsed.success || parsed.data.invoiceId !== confirmInvoice.invoiceId || parsed.data.amount !== confirmAmount
+        || parsed.data.idempotencyKey !== key || parsed.data.method.toLowerCase() !== confirmMethod
+        || payment && parsed.data.paymentId !== payment.id || confirmUtr.trim() && parsed.data.utr !== confirmUtr.trim()
+        || parsed.data.paymentStatus !== 'completed' || parsed.data.verificationStatus !== 'confirmed' || !parsed.data.confirmedAt
+        || parsed.data.balanceDue === undefined || parsed.data.paidAmount === undefined)
+        throw new Error('The response does not prove a confirmed receipt. Reload and retry the same receipt.')
+      const result = parsed.data
+      delete mutationKeys.current[scope]
+      showToast(`${result.alreadyConfirmed ? 'Existing receipt' : 'Receipt'} of ₹${result.amount.toLocaleString('en-IN')} confirmed. Balance due: ₹${result.balanceDue!.toLocaleString('en-IN')}.`)
       setConfirmModalOpen(false)
       await fetchData()
     } catch (err: any) {
@@ -582,11 +753,27 @@ export default function Billing() {
   // ── Refunds ──
 
   const refundableOn = (detail: InvoiceDetail | null) => {
-    if (!detail) return 0
-    const paid = detail.payments.filter(p => p.amount > 0 && p.status === 'Completed').reduce((s, p) => s + p.amount, 0)
-    const refunded = detail.payments.filter(p => p.amount < 0 && p.status === 'Refunded').reduce((s, p) => s + Math.abs(p.amount), 0)
-    const pending = detail.payments.filter(p => p.amount < 0 && p.status === 'Pending').reduce((s, p) => s + Math.abs(p.amount), 0)
-    return Math.max(0, paid - refunded - pending)
+    return Number(detail?.refundableAmount ?? 0)
+  }
+
+  const refundableSources = refundDetail?.payments.filter(p => p.amount > 0 && p.refundableAmount > 0) ?? []
+  const selectedRefundSource = refundableSources.find(p => p.id === refundSourceId)
+  const refundLimit = Math.min(refundableOn(refundDetail), Number(selectedRefundSource?.refundableAmount ?? 0))
+
+  const selectRefundSource = (paymentId: string, detail: InvoiceDetail | null = refundDetail) => {
+    const source = detail?.payments.find(p => p.id === paymentId)
+    setRefundSourceId(paymentId)
+    setRefundMethod((source?.method.toLowerCase() as typeof refundMethod) ?? 'upi')
+    setRefundAmount(Math.min(refundableOn(detail), Number(source?.refundableAmount ?? 0)))
+    setRefundReference('')
+  }
+
+  const showRefundOutcome = (result: RefundOutcome) => {
+    const amount = Number(result.amount).toLocaleString('en-IN')
+    if (result.status === 'refunded') showToast(`Refund of ₹${amount} completed. Reference: ${result.refundReference ?? '—'}.`)
+    else if (result.status === 'pending_approval') showToast(`Refund of ₹${amount} awaits a second approver. No payout is confirmed.`)
+    else if (result.status === 'failed') showToast(`Refund of ₹${amount} failed. Reconcile the provider result before requesting another payout.`, 'err')
+    else if (result.status === 'processing') showToast(`Refund of ₹${amount} is processing. No completed payout is confirmed; check this same refund again.`)
   }
 
   const loadRefundDetail = async (invoiceId: string) => {
@@ -606,55 +793,103 @@ export default function Billing() {
     setRefundReference('')
     setRefundReason('')
     setRefundDetail(null)
+    setRefundSourceId('')
     setRefundModalOpen(true)
     const detail = await loadRefundDetail(invoice.invoiceId)
-    setRefundAmount(refundableOn(detail))
+    selectRefundSource(detail?.payments.find(p => p.amount > 0 && p.refundableAmount > 0)?.id ?? '', detail)
   }
 
   const handleSubmitRefund = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!refundInvoice) return
-    if (!refundReference.trim()) {
-      showToast('Refund reference (UTR / gateway refund ID / voucher) is mandatory.', 'err')
+    if (!selectedRefundSource || refundAmount <= 0 || refundAmount > refundLimit) {
+      showToast('Select a confirmed source receipt and an amount within its refundable balance.', 'err')
+      return
+    }
+    if (refundMethod !== 'razorpay' && !refundReference.trim()) {
+      showToast('Record the actual payout UTR or cash voucher before confirming a manual refund.', 'err')
       return
     }
     if (!refundReason.trim()) {
       showToast('Reason for the refund is mandatory.', 'err')
       return
     }
+    const scope = `refund-${refundInvoice.invoiceId}`
+    const expected = { invoiceId: refundInvoice.invoiceId, amount: refundAmount, method: refundMethod, sourcePaymentId: refundSourceId,
+      idempotencyKey: mutationKeys.current[scope] ??= `IDEMP-REF-${crypto.randomUUID()}` }
     try {
       setActionLoading('refund')
-      const res = await api.post(`/invoices/${refundInvoice.invoiceId}/refund`, {
+      const res = await api.post<RefundOutcome>(`/invoices/${refundInvoice.invoiceId}/refund`, {
         amount: Number(refundAmount),
         method: refundMethod,
-        refundReference: refundReference.trim(),
+        refundReference: refundMethod === 'razorpay' ? undefined : refundReference.trim(),
         reason: refundReason.trim(),
-        idempotencyKey: crypto.randomUUID(),
+        sourcePaymentId: refundSourceId,
+        idempotencyKey: expected.idempotencyKey,
       })
-      showToast(res.data.message ?? `Refund of ₹${Number(refundAmount).toLocaleString('en-IN')} processed.`)
-      await loadRefundDetail(refundInvoice.invoiceId)
+      const result = savedRefund(res.data, expected)
+      if (!result) throw new Error('The response does not identify a saved refund. Keep this same refund key and reconcile before retrying.')
+      showRefundOutcome(result)
+      delete mutationKeys.current[scope]
       setRefundReference('')
       setRefundReason('')
       setRefundAmount(0)
-      await fetchData()
     } catch (err: any) {
-      showToast(friendlyError(err), 'err')
+      const result = savedRefund(err.response?.data, expected)
+      if (result) showRefundOutcome(result)
+      else showToast(friendlyError(err), 'err')
     } finally {
+      await loadRefundDetail(refundInvoice.invoiceId)
+      await fetchData()
       setActionLoading(null)
     }
   }
 
   const handleApproveRefund = async (refundId: string) => {
     if (!refundInvoice) return
+    const refund = refundDetail?.payments.find(p => p.id === refundId)
+    if (!refund) return
+    const expected = { invoiceId: refundInvoice.invoiceId, refundId, amount: Math.abs(refund.amount), method: refund.method,
+      sourcePaymentId: refund.refundSourcePaymentId, idempotencyKey: refund.idempotencyKey }
     try {
       setActionLoading(`approve-${refundId}`)
-      await api.post(`/invoices/${refundInvoice.invoiceId}/refunds/${refundId}/approve`, {})
-      showToast('Refund approved and disbursed.')
+      const res = await api.post<RefundOutcome>(`/invoices/${refundInvoice.invoiceId}/refunds/${refundId}/approve`, {})
+      const result = savedRefund(res.data, expected)
+      if (!result) throw new Error('Approval response does not identify the saved refund. Reload its history; approval alone does not prove payout.')
+      showRefundOutcome(result)
+    } catch (err: any) {
+      const result = savedRefund(err.response?.data, expected)
+      if (result) showRefundOutcome(result)
+      else showToast(friendlyError(err), 'err')
+    } finally {
       await loadRefundDetail(refundInvoice.invoiceId)
       await fetchData()
+      setActionLoading(null)
+    }
+  }
+
+  const handleCheckRefund = async (payment: LedgerPayment) => {
+    if (!refundInvoice || !payment.idempotencyKey || !payment.refundReason) return
+    const expected = { invoiceId: refundInvoice.invoiceId, refundId: payment.id, amount: Math.abs(payment.amount), method: payment.method,
+      sourcePaymentId: payment.refundSourcePaymentId, idempotencyKey: payment.idempotencyKey }
+    try {
+      setActionLoading(`refund-check-${payment.id}`)
+      const path = payment.isPharmacyReturn ? `/pharmacy/returns/${refundInvoice.invoiceId}` : `/invoices/${refundInvoice.invoiceId}/refund`
+      const res = await api.post<RefundOutcome>(path, {
+        amount: Math.abs(payment.amount), method: payment.method,
+        refundReference: payment.method.toLowerCase() === 'razorpay' ? undefined : payment.refundReference,
+        reason: payment.refundReason, sourcePaymentId: payment.refundSourcePaymentId, idempotencyKey: payment.idempotencyKey,
+      })
+      const result = savedRefund(res.data, expected)
+      if (!result) throw new Error('Status response does not identify this saved refund. No completed payout is confirmed.')
+      showRefundOutcome(result)
     } catch (err: any) {
-      showToast(friendlyError(err), 'err')
+      const result = savedRefund(err.response?.data, expected)
+      if (result) showRefundOutcome(result)
+      else showToast(friendlyError(err), 'err')
     } finally {
+      await loadRefundDetail(refundInvoice.invoiceId)
+      await fetchData()
       setActionLoading(null)
     }
   }
@@ -679,15 +914,27 @@ export default function Billing() {
   const handleCollectDeposit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!depositPatientId) return
+    if (depositMethod !== 'cash' && !depositReference.trim()) {
+      showToast('Record the actual bank or card receipt reference before collecting an electronic advance.', 'err')
+      return
+    }
+    const scope = `deposit-${depositPatientId}`
+    const key = mutationKeys.current[scope] ??= `IDEMP-DEP-${crypto.randomUUID()}`
     try {
       setActionLoading('deposit')
       const res = await api.post(`/patients/${depositPatientId}/deposits`, {
         amount: Number(depositAmount),
         method: depositMethod,
         referenceNumber: depositReference.trim() || undefined,
-        idempotencyKey: crypto.randomUUID(),
+        idempotencyKey: key,
       })
-      showToast(`Advance ${res.data.receiptNumber} collected: ₹${Number(depositAmount).toLocaleString('en-IN')}.`)
+      const parsed = depositOutcomeSchema.safeParse(res.data)
+      if (!parsed.success || parsed.data.patientId !== depositPatientId || parsed.data.amount !== depositAmount
+        || parsed.data.method.toLowerCase() !== depositMethod || parsed.data.idempotencyKey !== key
+        || parsed.data.referenceNumber !== (depositReference.trim() || null))
+        throw new Error('Advance response does not identify the saved deposit. Retry the same deposit.')
+      delete mutationKeys.current[scope]
+      showToast(`Advance ${parsed.data.receiptNumber} collected: ₹${parsed.data.amount.toLocaleString('en-IN')}.`)
       setDepositAmount(0)
       setDepositReference('')
       await loadDeposits(depositPatientId)
@@ -733,18 +980,30 @@ export default function Billing() {
   }
 
   const handleApplyAdvance = async (invoice: Invoice) => {
+    if (!canRecordPayments || !canCollect(invoice)) return
     if (!invoice.patientId) {
       showToast('This invoice is not linked to a patient profile, so no advance can be applied.', 'err')
       return
     }
-    const amount = invoice.balanceDue > 0 ? invoice.balanceDue : invoice.total
+    const amount = invoice.balanceDue
+    if (amount <= 0) return
     if (!window.confirm(`Apply ₹${amount.toLocaleString('en-IN')} from the patient's advance deposit to ${invoice.invoiceNumber}?`)) return
+    const scope = `advance-${invoice.invoiceId}`
+    const key = mutationKeys.current[scope] ??= `IDEMP-ADV-${crypto.randomUUID()}`
     try {
       setActionLoading(`advance-${invoice.invoiceId}`)
       const res = await api.post(`/invoices/${invoice.invoiceId}/apply-advance`, {
-        amount: invoice.balanceDue > 0 ? invoice.balanceDue : invoice.total,
+        amount,
+        idempotencyKey: key,
       })
-      showToast(`Advance of ₹${Number(res.data.allocatedAdvanceAmount).toLocaleString('en-IN')} applied. Balance due: ₹${Number(res.data.balanceDue).toLocaleString('en-IN')}.`)
+      const parsed = advanceOutcomeSchema.safeParse(res.data)
+      if (!parsed.success || parsed.data.invoiceId !== invoice.invoiceId || parsed.data.amount !== amount || parsed.data.allocatedAdvanceAmount !== amount
+        || parsed.data.idempotencyKey !== key || parsed.data.method.toLowerCase() !== 'advancedeposit'
+        || parsed.data.paymentStatus !== 'completed' || parsed.data.verificationStatus !== 'confirmed' || !parsed.data.confirmedAt
+        || Math.round(parsed.data.allocations.reduce((sum, allocation) => sum + allocation.amount, 0) * 100) !== Math.round(amount * 100))
+        throw new Error('Advance application response does not prove the saved allocation. Retry the same application.')
+      delete mutationKeys.current[scope]
+      showToast(`Advance of ₹${parsed.data.allocatedAdvanceAmount.toLocaleString('en-IN')} applied. Balance due: ₹${parsed.data.balanceDue.toLocaleString('en-IN')}.`)
       await fetchData()
     } catch (err: any) {
       showToast(friendlyError(err), 'err')
@@ -969,6 +1228,10 @@ export default function Billing() {
                           <span className="badge badge-warning">Partial</span>
                         ) : inv.status === 'draft' ? (
                           <span className="badge badge-secondary">Draft</span>
+                        ) : inv.status === 'cancelled' ? (
+                          <span className="badge badge-error">Cancelled</span>
+                        ) : inv.status === 'refunded' ? (
+                          <span className="badge badge-secondary">Refunded</span>
                         ) : (
                           <span className="badge badge-warning">Finalized</span>
                         )}
@@ -985,7 +1248,7 @@ export default function Billing() {
                           </button>
                         )}
 
-                        {inv.status !== 'paid' && (
+                        {canRecordPayments && canCollect(inv) && (
                           <>
                             <button
                               onClick={() => handleOpenDynamicQr(inv)}
@@ -997,6 +1260,7 @@ export default function Billing() {
                             </button>
                             <button
                               onClick={() => handleOpenConfirmPayment(inv)}
+                              disabled={actionLoading === `confirm-read-${inv.invoiceId}`}
                               className="btn btn-secondary btn-sm text-xs"
                               title="Staff confirm cash, card slip, or bank credit"
                             >
@@ -1034,7 +1298,7 @@ export default function Billing() {
                           </button>
                         )}
 
-                        {canRecordPayments && (inv.balanceDue ?? 0) > 0 && inv.status !== 'draft' && (
+                        {canRecordPayments && canCollect(inv) && inv.patientId && (
                           <button
                             onClick={() => handleApplyAdvance(inv)}
                             disabled={actionLoading === `advance-${inv.invoiceId}`}
@@ -1097,8 +1361,9 @@ export default function Billing() {
           </div>
 
           <div className="form-group max-w-md">
-            <label className="form-label">Patient</label>
+            <label htmlFor="deposit-patient" className="form-label">Patient</label>
             <select
+              id="deposit-patient"
               className="form-select"
               value={depositPatientId}
               onChange={e => loadDeposits(e.target.value)}
@@ -1138,8 +1403,9 @@ export default function Billing() {
               {canRecordPayments && (
                 <form onSubmit={handleCollectDeposit} className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
                   <div>
-                    <label className="form-label text-xs">Amount (₹)</label>
+                    <label htmlFor="deposit-amount" className="form-label text-xs">Amount (₹)</label>
                     <input
+                      id="deposit-amount"
                       type="number"
                       min="0.01"
                       step="0.01"
@@ -1150,8 +1416,9 @@ export default function Billing() {
                     />
                   </div>
                   <div>
-                    <label className="form-label text-xs">Method</label>
+                    <label htmlFor="deposit-method" className="form-label text-xs">Method</label>
                     <select
+                      id="deposit-method"
                       className="form-select text-xs"
                       value={depositMethod}
                       onChange={e => setDepositMethod(e.target.value as typeof depositMethod)}
@@ -1163,9 +1430,12 @@ export default function Billing() {
                     </select>
                   </div>
                   <div>
-                    <label className="form-label text-xs">Reference (optional)</label>
+                    <label htmlFor="deposit-reference" className="form-label text-xs">{depositMethod === 'cash' ? 'Cash receipt reference (optional)' : 'Bank / card receipt reference (required)'}</label>
                     <input
+                      id="deposit-reference"
                       type="text"
+                      required={depositMethod !== 'cash'}
+                      maxLength={100}
                       className="form-input text-xs"
                       value={depositReference}
                       onChange={e => setDepositReference(e.target.value)}
@@ -1572,9 +1842,21 @@ export default function Billing() {
       >
         <form onSubmit={handleSubmitConfirmPayment} className="space-y-4">
           <div className="form-group">
-            <label className="form-label">Payment Method</label>
+            <label htmlFor="confirm-receipt" className="form-label">Source receipt</label>
+            <select id="confirm-receipt" value={confirmPaymentId} onChange={e => selectReportedPayment(e.target.value)} className="form-select">
+              <option value="">New verified receipt</option>
+              {confirmDetail?.payments.filter(p => p.amount > 0 && p.status.toLowerCase() === 'pending' && p.verificationStatus.toLowerCase() === 'reported').map(p => (
+                <option key={p.id} value={p.id}>Reported {p.method} · ₹{p.amount.toLocaleString('en-IN')} · {p.utr ?? 'No reference yet'}</option>
+              ))}
+            </select>
+            {confirmPaymentId && <p className="text-xs text-[var(--color-text-muted)]">Confirm this reported receipt, not a second payment. Its amount, method and existing reference are preserved.</p>}
+          </div>
+          <div className="form-group">
+            <label htmlFor="confirm-method" className="form-label">Payment method</label>
             <select
+              id="confirm-method"
               value={confirmMethod}
+              disabled={Boolean(confirmPaymentId)}
               onChange={(e: any) => setConfirmMethod(e.target.value)}
               className="form-select"
             >
@@ -1586,30 +1868,38 @@ export default function Billing() {
           </div>
 
           <div className="form-group">
-            <label className="form-label">Amount Confirmed (₹)</label>
+            <label htmlFor="confirm-amount" className="form-label">Amount confirmed (₹)</label>
             <input
+              id="confirm-amount"
               type="number"
               value={confirmAmount}
               onChange={(e) => setConfirmAmount(Number(e.target.value))}
               className="form-input font-mono"
-              min="1"
+              min="0.01"
+              step="0.01"
+              max={confirmDetail?.balanceDue}
+              readOnly={Boolean(confirmPaymentId)}
               required
             />
           </div>
 
           <div className="form-group">
-            <label className="form-label">
+            <label htmlFor="confirm-reference" className="form-label">
               Bank UTR / Transaction Ref
               {confirmMethod !== 'cash' && confirmAmount >= (taxProfile?.thresholdHighValueUtr || 2000) && (
                 <span className="text-rose-500 font-bold ml-1">* Mandatory for ₹{(taxProfile?.thresholdHighValueUtr || 2000).toLocaleString('en-IN')}+</span>
               )}
             </label>
             <input
+              id="confirm-reference"
               type="text"
               value={confirmUtr}
               onChange={(e) => setConfirmUtr(e.target.value)}
               placeholder="e.g. UTR-HDFC-9928374625"
               className="form-input font-mono"
+              maxLength={64}
+              readOnly={Boolean(confirmDetail?.payments.find(p => p.id === confirmPaymentId)?.utr)}
+              required={confirmMethod !== 'cash' && confirmAmount >= (taxProfile?.thresholdHighValueUtr ?? 2000)}
             />
           </div>
 
@@ -1705,9 +1995,11 @@ export default function Billing() {
                 <div key={p.id} className="flex items-center justify-between gap-2 p-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-raised)] text-xs">
                   <div>
                     <span className="font-mono font-bold">₹{Math.abs(p.amount).toLocaleString('en-IN')}</span>
-                    <span className="text-[var(--color-text-muted)]"> · {p.method} · {p.status}</span>
+                    <span className="text-[var(--color-text-muted)]"> · {p.method} · {p.refundStatus ?? p.status}</span>
+                    <p className="text-[var(--color-text-muted)]">{p.refundReason} · Reference: {p.refundReference ?? 'Not confirmed'}</p>
+                    {p.refundSourcePaymentId && <p className="font-mono text-[var(--color-text-muted)]">Source receipt: {p.refundSourcePaymentId}</p>}
                   </div>
-                  {isClinicAdmin && p.status === 'Pending' && (
+                  {isClinicAdmin && p.refundStatus === 'pending_approval' && p.confirmedByUserId !== user?.id && (
                     <button
                       type="button"
                       onClick={() => handleApproveRefund(p.id)}
@@ -1717,20 +2009,33 @@ export default function Billing() {
                       {actionLoading === `approve-${p.id}` ? 'Approving…' : 'Approve'}
                     </button>
                   )}
+                  {p.refundStatus === 'processing' && p.idempotencyKey && (
+                    <button type="button" onClick={() => handleCheckRefund(p)} disabled={actionLoading === `refund-check-${p.id}`} className="btn btn-secondary btn-sm">
+                      {actionLoading === `refund-check-${p.id}` ? 'Checking…' : 'Check refund status'}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
           )}
 
           <form onSubmit={handleSubmitRefund} className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
+            <div className="form-group">
+              <label htmlFor="refund-source" className="form-label">Confirmed source receipt</label>
+              <select id="refund-source" className="form-select" value={refundSourceId} onChange={e => selectRefundSource(e.target.value)} required>
+                <option value="">Select a refundable receipt</option>
+                {refundableSources.map(p => <option key={p.id} value={p.id}>{p.method} · ₹{p.amount.toLocaleString('en-IN')} · Available ₹{p.refundableAmount.toLocaleString('en-IN')} · {p.razorpayPaymentId ?? p.utr ?? p.id}</option>)}
+              </select>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="form-group">
-                <label className="form-label text-xs">Amount (₹)</label>
+                <label htmlFor="refund-amount" className="form-label text-xs">Amount (₹)</label>
                 <input
+                  id="refund-amount"
                   type="number"
                   min="0.01"
                   step="0.01"
-                  max={refundableOn(refundDetail)}
+                  max={refundLimit}
                   value={refundAmount || ''}
                   onChange={e => setRefundAmount(Number(e.target.value))}
                   className="form-input font-mono text-xs"
@@ -1738,8 +2043,9 @@ export default function Billing() {
                 />
               </div>
               <div className="form-group">
-                <label className="form-label text-xs">Refunded via</label>
+                <label htmlFor="refund-method" className="form-label text-xs">Refunded via</label>
                 <select
+                  id="refund-method"
                   className="form-select text-xs"
                   value={refundMethod}
                   onChange={e => setRefundMethod(e.target.value as typeof refundMethod)}
@@ -1748,28 +2054,35 @@ export default function Billing() {
                   <option value="cash">Cash</option>
                   <option value="card">Card</option>
                   <option value="netbanking">Net Banking</option>
+                  {selectedRefundSource?.method.toLowerCase() === 'razorpay' && selectedRefundSource.razorpayPaymentId && <option value="razorpay">Razorpay · original captured payment</option>}
                 </select>
               </div>
             </div>
 
-            <div className="form-group">
-              <label className="form-label text-xs">Refund reference (UTR / gateway refund ID / voucher)</label>
+            {refundMethod === 'razorpay' ? <p className="text-xs text-[var(--color-text-muted)]">The server requests the actual provider refund. A gateway reference appears only after the provider acknowledges it; completion waits for processed status.</p> : <div className="form-group">
+              <label htmlFor="refund-reference" className="form-label text-xs">Actual payout reference (UTR / cash voucher)</label>
               <input
+                id="refund-reference"
                 type="text"
                 value={refundReference}
                 onChange={e => setRefundReference(e.target.value)}
                 className="form-input text-xs"
+                maxLength={100}
                 required
               />
-            </div>
+              <p className="text-xs text-[var(--color-text-muted)]">Only record a manual refund after the payout or cash handover has been verified.</p>
+            </div>}
 
             <div className="form-group">
-              <label className="form-label text-xs">Reason</label>
+              <label htmlFor="refund-reason" className="form-label text-xs">Reason</label>
               <input
+                id="refund-reason"
                 type="text"
                 value={refundReason}
                 onChange={e => setRefundReason(e.target.value)}
                 className="form-input text-xs"
+                minLength={3}
+                maxLength={500}
                 required
               />
             </div>
@@ -1780,7 +2093,7 @@ export default function Billing() {
               </button>
               <button
                 type="submit"
-                disabled={actionLoading === 'refund' || refundableOn(refundDetail) <= 0}
+                disabled={actionLoading === 'refund' || refundLimit <= 0}
                 className="btn btn-danger"
               >
                 {actionLoading === 'refund' ? 'Processing…' : 'Issue Refund'}
@@ -1915,7 +2228,12 @@ export default function Billing() {
         description="Per-line tax calculation based on Notification 12/2017 healthcare exemptions."
         size="lg"
       >
-        <form onSubmit={handleSubmit(handleCreateInvoice)} className="space-y-4">
+        {createError && <Alert variant="error">{createError}</Alert>}
+        {invoicePending && <p role="status" className="my-4 text-sm text-[var(--color-text-secondary)]">
+          Invoice queued on this device; saved invoice is not yet confirmed. Details and the retry key are frozen. Retry unchanged here or recover from Offline work on the Dashboard after navigation or reload.
+        </p>}
+        <form onSubmit={invoicePending ? e => { e.preventDefault(); void handleCreateInvoice() } : handleSubmit(handleCreateInvoice)} className="space-y-4">
+          <fieldset disabled={invoicePending || actionLoading === 'create-invoice'} className="min-w-0 space-y-4 border-0 p-0">
           <div className="form-group">
             <label htmlFor="invoice-patient" className="form-label">Patient</label>
             <select
@@ -2009,22 +2327,27 @@ export default function Billing() {
                   <input
                     type="text"
                     {...register(`lineItems.${idx}.description` as const)}
+                    aria-label={`Service description ${idx + 1}`}
                     placeholder="Service description"
                     className="form-input flex-1 text-xs"
                   />
                   <input
                     type="number"
                     {...register(`lineItems.${idx}.quantity` as const, { valueAsNumber: true })}
+                    aria-label={`Quantity ${idx + 1}`}
                     placeholder="Qty"
                     className="form-input w-16 font-mono text-xs"
                     min="1"
+                    step="1"
                   />
                   <input
                     type="number"
                     {...register(`lineItems.${idx}.unitPrice` as const, { valueAsNumber: true })}
+                    aria-label={`Unit price ${idx + 1}`}
                     placeholder="Rate"
                     className="form-input w-24 font-mono text-xs"
-                    min="0"
+                    min="0.01"
+                    step="0.01"
                   />
                   {fields.length > 1 && (
                     <button
@@ -2032,17 +2355,20 @@ export default function Billing() {
                       onClick={() => remove(idx)}
                       className="text-[var(--color-text-muted)] hover:text-rose-500 p-1 cursor-pointer"
                       title="Remove line"
+                      aria-label={`Remove service line ${idx + 1}`}
                     >
                       ✕
                     </button>
                   )}
                 </div>
+                {errors.lineItems?.[idx] && <p className="form-error">{errors.lineItems[idx]?.description?.message ?? errors.lineItems[idx]?.quantity?.message ?? errors.lineItems[idx]?.unitPrice?.message ?? errors.lineItems[idx]?.gstRate?.message}</p>}
 
                 <div className="grid grid-cols-3 gap-2 text-xs">
                   <div>
                     <label className="text-[10px] text-[var(--color-text-muted)]">Tax Category</label>
                     <select
                       {...register(`lineItems.${idx}.taxCategory` as const)}
+                      aria-label={`Tax category ${idx + 1}`}
                       className="form-select text-xs py-1"
                     >
                       <option value="Exempt">Exempt (0% - Notif 12/2017)</option>
@@ -2055,6 +2381,7 @@ export default function Billing() {
                     <input
                       type="text"
                       {...register(`lineItems.${idx}.hsnSacCode` as const)}
+                      aria-label={`SAC / HSN code ${idx + 1}`}
                       placeholder="999312"
                       className="form-input text-xs py-1 font-mono"
                     />
@@ -2064,9 +2391,12 @@ export default function Billing() {
                     <input
                       type="number"
                       {...register(`lineItems.${idx}.gstRate` as const, { valueAsNumber: true })}
+                      aria-label={`GST rate ${idx + 1}`}
                       placeholder="0"
                       className="form-input text-xs py-1 font-mono"
                       min="0"
+                      max="100"
+                      step="0.01"
                     />
                   </div>
                 </div>
@@ -2077,14 +2407,17 @@ export default function Billing() {
           {/* Discount & Finalize Toggle */}
           <div className="grid grid-cols-2 gap-3 pt-2">
             <div>
-              <label className="form-label text-xs">Discount Amount (₹)</label>
+              <label htmlFor="invoice-discount" className="form-label text-xs">Discount amount (₹)</label>
               <input
+                id="invoice-discount"
                 type="number"
                 {...register('discountAmount', { valueAsNumber: true })}
                 placeholder="0"
                 className="form-input font-mono text-xs"
                 min="0"
+                step="0.01"
               />
+              {errors.discountAmount && <p className="form-error">{errors.discountAmount.message}</p>}
             </div>
             <div>
               <label className="form-label text-xs">Discount Reason Code</label>
@@ -2133,21 +2466,23 @@ export default function Billing() {
               Finalize immediately and assign sequential invoice number (locks record)
             </label>
           </div>
+          </fieldset>
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-[var(--color-border)]">
             <button
               type="button"
               onClick={closeCreateModal}
+              disabled={actionLoading === 'create-invoice'}
               className="btn btn-secondary cursor-pointer"
             >
-              Cancel
+              {invoicePending ? 'Close and resume later' : 'Cancel'}
             </button>
             <button
               type="submit"
               disabled={actionLoading === 'create-invoice'}
               className="btn btn-primary cursor-pointer"
             >
-              {actionLoading === 'create-invoice' ? 'Generating…' : 'Generate Invoice'}
+              {actionLoading === 'create-invoice' ? 'Generating…' : invoicePending ? 'Retry invoice' : 'Generate Invoice'}
             </button>
           </div>
         </form>

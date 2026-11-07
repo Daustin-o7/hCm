@@ -46,6 +46,8 @@ export interface PatientDetails {
 }
 
 export interface PrescriptionDraft {
+  prescriptionItemId?: string
+  drugId?: string
   medicine: string
   dosage: string
   frequency: string
@@ -59,8 +61,32 @@ export interface PrescriptionDraft {
   durationUnit?: string
   timing?: string
   totalQuantity?: number
+  specialInstructions?: string
+  dispensedQuantity?: number
   scheduleClass?: string
   isUnverified?: boolean
+}
+
+export function toPrescriptionItem(p: PrescriptionDraft) {
+  const duration = p.duration.trim().match(/^(\d+)\s*(Days?|Weeks?|Months?)?$/i)
+  return {
+    prescriptionItemId: p.prescriptionItemId,
+    drugId: p.drugId,
+    genericName: p.genericName || p.medicine,
+    brandName: p.brandName,
+    dosageForm: p.dosageForm,
+    strength: p.strength || p.dosage,
+    route: p.route,
+    frequency: p.frequency,
+    duration: p.durationCount && p.durationCount > 0 ? p.durationCount : duration ? Number(duration[1]) : null,
+    durationUnit: p.durationUnit || duration?.[2] || '',
+    durationText: p.duration,
+    timing: p.timing,
+    totalQuantity: p.totalQuantity ?? null,
+    specialInstructions: p.specialInstructions,
+    scheduleClass: p.scheduleClass,
+    isUnverified: p.isUnverified
+  }
 }
 
 export interface PatientClinicalContext {
@@ -100,7 +126,7 @@ export interface PatientClinicalContext {
       dosageForm?: string
       strength?: string
       frequency?: string
-      duration?: string
+      duration?: string | number
       timing?: string
     }>
   } | null

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { NavLink, useNavigate, Outlet, useLocation } from 'react-router-dom'
 import { useBranding } from '../context/BrandingContext'
 import { useAuth } from '../context/AuthContext'
@@ -6,8 +6,7 @@ import { BrandLogo } from './ui/BrandLogo'
 import { ThemeToggle } from './ui/ThemeToggle'
 import { formatLocalDate, formatLocalTime, getTimezoneLabel } from '../utils/timezone'
 import { drainPaymentBridge, isPaymentBridgeAvailable } from '../services/paymentBridge'
-import { readOutbox, clearOutbox } from '../services/offlineOutbox'
-import api from '../services/api'
+import { captureOutboxSession, readOutbox, flushOutbox, legacyOutboxStatus, retryOutboxItem, type OutboxEntry } from '../services/offlineOutbox'
 
 // ── Categorized Healthcare Navigation ──────────────────────────────────────────
 export interface NavItem {
@@ -202,12 +201,12 @@ const NAV_SECTIONS: NavSection[] = [
 ]
 
 const ROLE_LABEL: Record<string, string> = {
-  clinicadmin:   'Administrator',
-  owner:         'Owner',
-  doctor:        'Doctor',
-  receptionist:  'Receptionist',
-  pharmacist:    'Pharmacist',
-  nurse:         'Nurse',
+  clinicadmin: 'Administrator',
+  owner: 'Owner',
+  doctor: 'Doctor',
+  receptionist: 'Receptionist',
+  pharmacist: 'Pharmacist',
+  nurse: 'Nurse',
   platformadmin: 'Platform Admin',
 }
 
@@ -239,6 +238,100 @@ function HeaderClock({ timezone }: { timezone?: string }) {
 }
 
 export default function DashboardLayout() {
+  const { sessionGeneration, loading } = useAuth()
+  if (loading) return <div role="status" className="p-6 text-sm">Changing clinic session…</div>
+  // Remount tenant-sensitive views and shell state at the same identity boundary.
+  return <DashboardSession key={sessionGeneration} />
+}
+
+function OfflineWork() {
+  const [entries, setEntries] = useState<OutboxEntry[]>([])
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(true)
+  const [legacy, setLegacy] = useState(legacyOutboxStatus)
+  const run = useRef<(sync: boolean) => Promise<void>>(async () => {})
+
+  useEffect(() => {
+    let active = true
+    let running = false
+    let rerun: boolean | null = null
+    const refresh = async (sync: boolean) => {
+      if (!active) return
+      if (running) { rerun = sync || rerun === true; return }
+      running = true
+      setBusy(true)
+      setError('')
+      setLegacy(legacyOutboxStatus())
+      try {
+        const session = captureOutboxSession()
+        if (sync) {
+          try { await flushOutbox(session) } catch (failure) {
+            if (active) setError(failure instanceof Error ? failure.message : 'Offline sync failed. Stored work is retained.')
+          }
+        }
+        const items = await readOutbox(session)
+        if (active) setEntries(items)
+      } catch (failure) {
+        if (active) setError(failure instanceof Error ? failure.message : 'Offline storage could not be read.')
+      } finally {
+        running = false
+        if (active) {
+          setBusy(false)
+          if (rerun !== null) {
+            const sync = rerun
+            rerun = null
+            void refresh(sync)
+          }
+        }
+      }
+    }
+    run.current = refresh
+    const reconnect = () => { void refresh(true) }
+    const changed = () => { void refresh(false) }
+    void refresh(true)
+    window.addEventListener('online', reconnect)
+    window.addEventListener('focus', changed)
+    window.addEventListener('samstack:outbox-changed', changed)
+    return () => {
+      active = false
+      run.current = async () => {}
+      window.removeEventListener('online', reconnect)
+      window.removeEventListener('focus', changed)
+      window.removeEventListener('samstack:outbox-changed', changed)
+    }
+  }, [])
+
+  const retry = async (id: string) => {
+    try { await retryOutboxItem(id); await run.current(true) } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'Offline retry failed. Stored work is retained.')
+    }
+  }
+  if (!entries.length && !error && legacy === 'absent') return null
+  return (
+    <section aria-label="Offline work" className="mb-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-4 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h2 className="font-semibold">Offline work {entries.length > 0 ? `(${entries.length} retained)` : ''}</h2>
+        <button type="button" className="btn btn-secondary min-h-11 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-teal-600"
+          disabled={busy} onClick={() => void run.current(true)}>{busy ? 'Checking offline work…' : 'Check and sync'}</button>
+      </div>
+      {error && <p role="alert" className="mt-3 text-[var(--color-danger)]">{error}</p>}
+      {legacy !== 'absent' && <p role="status" className="mt-3 text-[var(--color-text-secondary)]">
+        {legacy === 'present' ? 'Unowned legacy offline work is present on this device. It is untouched and cannot be opened or synced. Ask the clinic administrator for authorized recovery.'
+          : 'Legacy storage could not be checked. Recovery may be needed; no legacy work has been changed.'}
+      </p>}
+      <ul className="divide-y divide-[var(--color-border)]" aria-live="polite">
+        {entries.map(entry => <li key={entry.id} className="flex flex-wrap items-center justify-between gap-4 py-3">
+          <p className="min-w-0 flex-1"><span className="font-mono">{entry.id.slice(0, 8)}</span> — {entry.message}</p>
+          {entry.item && ['rejected', 'unknown'].includes(entry.status) && <button type="button" disabled={busy}
+            className="btn btn-secondary min-h-11 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-teal-600"
+            onClick={() => void retry(entry.id)}>Retry unchanged</button>}
+        </li>)}
+      </ul>
+    </section>
+  )
+}
+
+function DashboardSession() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [showNotifications, setShowNotifications] = useState(false)
@@ -333,24 +426,6 @@ export default function DashboardLayout() {
     return () => clearInterval(timer)
   }, [rawRole])
 
-  // FR-22: Flush durable offline outbox when network is reconnected
-  useEffect(() => {
-    const flushOutbox = async () => {
-      try {
-        const items = readOutbox()
-        if (items.length === 0) return
-        await api.post('/sync/push', { items })
-        clearOutbox()
-      } catch {
-        // Retry next time network is online
-      }
-    }
-
-    void flushOutbox()
-    window.addEventListener('online', flushOutbox)
-    return () => window.removeEventListener('online', flushOutbox)
-  }, [])
-
   const effectiveTimezone = branding.timezone || undefined
 
   return (
@@ -367,9 +442,8 @@ export default function DashboardLayout() {
       {/* Desktop & Mobile Sidebar */}
       {/* Desktop & Mobile Sidebar */}
       <aside
-        className={`fixed top-0 bottom-0 left-0 z-50 w-64 bg-[#0F172A] text-slate-200 flex flex-col border-r border-slate-800/80 transition-transform duration-300 ease-in-out lg:translate-x-0 shadow-2xl lg:shadow-none ${
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
-        }`}
+        className={`fixed top-0 bottom-0 left-0 z-50 w-64 bg-[#0F172A] text-slate-200 flex flex-col border-r border-slate-800/80 transition-transform duration-300 ease-in-out lg:translate-x-0 shadow-2xl lg:shadow-none ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          }`}
       >
         {/* Brand Header */}
         <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between bg-[#0B1322]/90 backdrop-blur-md">
@@ -479,10 +553,9 @@ export default function DashboardLayout() {
                     to={item.href}
                     end={item.end}
                     className={({ isActive }) =>
-                      `relative flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${
-                        isActive
-                          ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
-                          : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
+                      `relative flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${isActive
+                        ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
+                        : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
                       }`
                     }
                   >
@@ -490,11 +563,10 @@ export default function DashboardLayout() {
                       <>
                         <div className="flex items-center gap-2.5 min-w-0">
                           <item.icon
-                            className={`w-4 h-4 shrink-0 transition-colors ${
-                              isActive
+                            className={`w-4 h-4 shrink-0 transition-colors ${isActive
                                 ? 'text-teal-400'
                                 : 'text-slate-400 group-hover:text-slate-200'
-                            }`}
+                              }`}
                           />
                           <span className="truncate">{item.name}</span>
                         </div>
@@ -519,19 +591,17 @@ export default function DashboardLayout() {
             <NavLink
               to="/dashboard/settings"
               className={({ isActive }) =>
-                `flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${
-                  isActive
-                    ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
-                    : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
+                `flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium tracking-tight transition-all duration-150 group ${isActive
+                  ? 'bg-white/[0.09] text-white font-semibold before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-[3px] before:rounded-r before:bg-teal-400 shadow-xs'
+                  : 'text-slate-400 hover:text-slate-100 hover:bg-white/[0.04]'
                 }`
               }
             >
               {({ isActive }) => (
                 <>
                   <SettingsIcon
-                    className={`w-4 h-4 shrink-0 transition-colors ${
-                      isActive ? 'text-teal-400' : 'text-slate-400 group-hover:text-slate-200'
-                    }`}
+                    className={`w-4 h-4 shrink-0 transition-colors ${isActive ? 'text-teal-400' : 'text-slate-400 group-hover:text-slate-200'
+                      }`}
                   />
                   <span className="truncate">Settings</span>
                 </>
@@ -543,7 +613,7 @@ export default function DashboardLayout() {
         {/* Refined User Footer Card */}
         <div className="p-2.5 border-t border-slate-800/80 bg-[#0B1322]/90">
           <div className="flex items-center gap-2.5 p-2 rounded-lg bg-white/[0.03] border border-white/10 shadow-xs">
-            <div className="w-8 h-8 rounded-md bg-[#1E3A2E] text-teal-300 border border-teal-500/30 flex items-center justify-center font-bold text-xs shrink-0">
+            <div className="w-8 h-8 rounded-md bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs flex items-center justify-center font-bold text-xs shrink-0">
               {user?.name ? user.name.charAt(0).toUpperCase() : 'U'}
             </div>
             <div className="flex-1 min-w-0">
@@ -643,7 +713,7 @@ export default function DashboardLayout() {
 
             {/* Quick Profile Chip */}
             <div className="flex items-center gap-2 pl-2 border-l border-[var(--color-border)]">
-              <div className="w-8 h-8 rounded-md bg-[#1E3A2E] text-teal-200 border border-teal-600/30 flex items-center justify-center font-bold text-xs shadow-xs">
+              <div className="w-8 h-8 rounded-md bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs flex items-center justify-center font-bold text-xs shadow-xs">
                 {user?.name ? user.name.charAt(0).toUpperCase() : 'A'}
               </div>
             </div>
@@ -676,6 +746,7 @@ export default function DashboardLayout() {
 
         {/* Page Main Content with Mobile Bottom Padding */}
         <main className="flex-1 p-3.5 sm:p-4 lg:p-8 max-w-7xl w-full mx-auto pb-24 lg:pb-8">
+          <OfflineWork />
           <Outlet />
         </main>
 
@@ -688,10 +759,9 @@ export default function DashboardLayout() {
             to="/dashboard"
             end
             className={({ isActive }) =>
-              `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                isActive
-                  ? 'text-teal-700 dark:text-teal-400 font-bold bg-teal-50/80 dark:bg-teal-950/50'
-                  : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+              `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                ? 'text-teal-700 dark:text-teal-400 font-bold bg-teal-50/80 dark:bg-teal-950/50'
+                : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
               }`
             }
           >
@@ -704,10 +774,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/pharmacy/pos"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -718,10 +787,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/pharmacy/batches"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -732,10 +800,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/pharmacy/compliance"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -748,10 +815,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/patients"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -762,10 +828,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/queue"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -776,10 +841,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/roster"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -792,10 +856,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/patients"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -806,10 +869,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/appointments"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >
@@ -820,10 +882,9 @@ export default function DashboardLayout() {
               <NavLink
                 to="/dashboard/queue"
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${
-                    isActive
-                      ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
-                      : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
+                  `flex flex-col items-center justify-center py-1 px-2.5 rounded-xl text-[10px] tracking-tight transition-all min-w-[54px] min-h-[44px] ${isActive
+                    ? 'text-teal-700 dark:text-teal-400 font-extrabold bg-teal-50/90 dark:bg-teal-950/60 scale-105'
+                    : 'text-slate-800 dark:text-slate-200 font-bold hover:text-teal-600'
                   }`
                 }
               >

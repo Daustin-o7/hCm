@@ -1,5 +1,6 @@
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Domain.Utils;
@@ -9,6 +10,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 
 namespace Hospital_CRM.Api.Controllers;
 
@@ -18,10 +20,13 @@ namespace Hospital_CRM.Api.Controllers;
 public class ReportsController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
+    private readonly ITimezoneService _timezone;
+    private const string AccountingTimezone = "Asia/Kolkata";
 
-    public ReportsController(HospitalCrmDbContext db)
+    public ReportsController(HospitalCrmDbContext db, ITimezoneService? timezone = null)
     {
         _db = db;
+        _timezone = timezone ?? new TimezoneService();
     }
 
     // ----- FR-11: Financial Analytics & Tax Audit Reports -----
@@ -30,18 +35,18 @@ public class ReportsController : ControllerBase
     public async Task<IActionResult> FinancialSummary([FromQuery] string? month, CancellationToken ct)
     {
         var userId = User.GetUserId();
-        var userRole = User.GetUserRole();
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var (year, monthNum) = ParseMonth(month);
-        var startDate = new DateOnly(year, monthNum, 1);
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
         var endDate = startDate.AddMonths(1);
-        var startDt = startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var endDt = endDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var startDt = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var endDt = _timezone.GetStartOfDayUtc(endDate, AccountingTimezone);
 
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
         var clinicId = await GetUserClinicId(userId.Value, ct);
+        if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
+        var tenantId = User.GetTenantId()!.Value;
 
         // Income from completed payments
         var payments = await QueryPayments(startDt, endDt, clinicId).ToListAsync(ct);
@@ -57,11 +62,6 @@ public class ReportsController : ControllerBase
         var expensesQuery = _db.LedgerExpenses
             .Where(e => e.TenantId == tenantId && e.ExpenseDate >= startDate && e.ExpenseDate < endDate);
 
-        if (clinicId.HasValue)
-        {
-            // Note: LedgerExpense doesn't have ClinicId directly, using TenantId for now
-        }
-
         var expenses = await expensesQuery.ToListAsync(ct);
         var totalExpenses = expenses.Sum(e => e.Amount);
         var expenseByCategory = expenses
@@ -75,7 +75,7 @@ public class ReportsController : ControllerBase
         var deemedIncome44ADA = Math.Round(grossIncome * 0.5m, 2);
 
         // Prior month for MoM comparison
-        var prevStartDt = startDate.AddMonths(-1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var prevStartDt = _timezone.GetStartOfDayUtc(startDate.AddMonths(-1), AccountingTimezone);
         var prevGross = await QueryPayments(prevStartDt, startDt, clinicId).SumAsync(p => p.Amount, ct);
         var grossCollectionsMoMChange = prevGross == 0 ? 0m : Math.Round((grossIncome - prevGross) / prevGross * 100m, 1);
         var expensesPercentage = grossIncome == 0 ? 0m : Math.Round(totalExpenses / grossIncome * 100m, 1);
@@ -83,7 +83,7 @@ public class ReportsController : ControllerBase
 
         return Ok(new
         {
-            month = $"{year:D4}-{monthNum:D2}",
+            month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             grossIncome,
             expenses = totalExpenses,
             expensesPercentage,
@@ -105,13 +105,14 @@ public class ReportsController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var (year, monthNum) = ParseMonth(month);
-        var startDate = new DateOnly(year, monthNum, 1);
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
         var endDate = startDate.AddMonths(1);
-        var startDt = startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var endDt = endDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var startDt = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var endDt = _timezone.GetStartOfDayUtc(endDate, AccountingTimezone);
 
         var clinicId = await GetUserClinicId(userId.Value, ct);
+        if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
 
         var payments = await QueryPayments(startDt, endDt, clinicId).ToListAsync(ct);
 
@@ -121,7 +122,7 @@ public class ReportsController : ControllerBase
 
         return Ok(new
         {
-            month = $"{year:D4}-{monthNum:D2}",
+            month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             grossReceipts,
             deemedProfitRate = "50%",
             deemedProfit,
@@ -138,14 +139,15 @@ public class ReportsController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var (year, monthNum) = ParseMonth(month);
-        var startDate = new DateOnly(year, monthNum, 1);
-        var startDt = startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var endDt = startDate.AddMonths(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
+        var startDt = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var endDt = _timezone.GetStartOfDayUtc(startDate.AddMonths(1), AccountingTimezone);
 
         var clinicId = await GetUserClinicId(userId.Value, ct);
+        if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
 
-        return Ok(await BuildGstr1Async($"{year:D4}-{monthNum:D2}", startDt, endDt, clinicId, ct));
+        return Ok(await BuildGstr1Async(startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture), startDt, endDt, clinicId, ct));
     }
 
     [HttpGet("payment-distribution")]
@@ -155,10 +157,12 @@ public class ReportsController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var (year, monthNum) = ParseMonth(month);
-        var startDt = new DateOnly(year, monthNum, 1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var endDt = startDt.AddMonths(1);
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
+        var startDt = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var endDt = _timezone.GetStartOfDayUtc(startDate.AddMonths(1), AccountingTimezone);
         var clinicId = await GetUserClinicId(userId.Value, ct);
+        if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
 
         var payments = await QueryPayments(startDt, endDt, clinicId).ToListAsync(ct);
 
@@ -170,7 +174,7 @@ public class ReportsController : ControllerBase
 
         return Ok(new
         {
-            month = $"{year:D4}-{monthNum:D2}",
+            month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             upiAmount = upi,
             upiPercentage = Pct(upi, total),
             cardAmount = card,
@@ -189,23 +193,25 @@ public class ReportsController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var (year, monthNum) = ParseMonth(month);
-        var startDt = new DateOnly(year, monthNum, 1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var endDt = startDt.AddMonths(1);
+        if (!TryParseMonth(month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
+        var startDt = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var endDt = _timezone.GetStartOfDayUtc(startDate.AddMonths(1), AccountingTimezone);
+        var clinicId = await GetUserClinicId(userId.Value, ct);
+        if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
+        var tenantId = User.GetTenantId()!.Value;
 
-        var activeTenants = await _db.Users
-            .Where(u => u.ClinicId != null)
-            .Select(u => u.ClinicId)
-            .Distinct()
-            .CountAsync(ct);
-        var totalUsers = await _db.Users.CountAsync(ct);
+        var totalUsers = await _db.TenantMemberships
+            .Where(m => m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active")
+            .Select(m => m.UserId).Distinct().CountAsync(ct);
         var monthlyConsultations = await _db.Consultations
-            .CountAsync(c => c.CreatedAt >= startDt && c.CreatedAt < endDt, ct);
+            .CountAsync(c => c.TenantId == tenantId && c.Appointment.TenantId == tenantId
+                && c.Appointment.ClinicId == clinicId && c.CreatedAt >= startDt && c.CreatedAt < endDt, ct);
 
         return Ok(new
         {
-            month = $"{year:D4}-{monthNum:D2}",
-            activeTenants,
+            month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
+            activeTenants = 1,
             totalUsers,
             monthlyConsultations,
             overallStatus = totalUsers > 0 ? "healthy" : "degraded"
@@ -219,11 +225,13 @@ public class ReportsController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var (year, monthNum) = ParseMonth(request.Month);
-        var month = $"{year:D4}-{monthNum:D2}";
-        var startDt = new DateOnly(year, monthNum, 1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var endDt = startDt.AddMonths(1);
+        if (!TryParseMonth(request.Month, out var startDate))
+            return BadRequest(new { error = "invalid_month", message = "Use YYYY-MM." });
+        var month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+        var startDt = _timezone.GetStartOfDayUtc(startDate, AccountingTimezone);
+        var endDt = _timezone.GetStartOfDayUtc(startDate.AddMonths(1), AccountingTimezone);
         var clinicId = await GetUserClinicId(userId.Value, ct);
+        if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
 
         switch (request.Format)
         {
@@ -234,13 +242,13 @@ public class ReportsController : ControllerBase
                     var deemedProfit = Math.Round(gross * 0.5m, 2);
                     var sb = new StringBuilder();
                     sb.AppendLine("Section 44ADA Computation,Value (INR)");
-                    sb.AppendLine($"Gross Professional Receipts,{gross:0.00}");
-                    sb.AppendLine($"Deemed Profit (50%),{deemedProfit:0.00}");
-                    sb.AppendLine($"Taxable Income,{deemedProfit:0.00}");
+                    sb.AppendLine(FormattableString.Invariant($"Gross Professional Receipts,{gross:0.00}"));
+                    sb.AppendLine(FormattableString.Invariant($"Deemed Profit (50%),{deemedProfit:0.00}"));
+                    sb.AppendLine(FormattableString.Invariant($"Taxable Income,{deemedProfit:0.00}"));
                     sb.AppendLine();
-                    sb.AppendLine("Paid At,Invoice,Method,Amount");
+                    sb.AppendLine("Paid At (Asia/Kolkata),Invoice,Method,Amount");
                     foreach (var p in payments.OrderBy(p => p.PaidAt))
-                        sb.AppendLine($"{p.PaidAt:yyyy-MM-dd HH:mm},{p.Invoice?.InvoiceNumber ?? 0},{p.Method},{p.Amount:0.00}");
+                        sb.AppendLine(FormattableString.Invariant($"{TimeZoneInfo.ConvertTime(p.PaidAt!.Value, _timezone.ResolveTimeZone(null, AccountingTimezone)):yyyy-MM-dd HH:mm},{p.Invoice?.InvoiceNumber ?? 0},{p.Method},{p.Amount:0.00}"));
                     return File(Encoding.UTF8.GetBytes(sb.ToString()), "text/csv", $"ITR4-{month}.csv");
                 }
             case "GSTR-1 JSON":
@@ -256,46 +264,46 @@ public class ReportsController : ControllerBase
 
     private IQueryable<Payment> QueryPayments(DateTime startDt, DateTime endDt, Guid? clinicId)
     {
+        var tenantId = User.GetTenantId()!.Value;
         var query = _db.Payments
             .Include(p => p.Invoice).ThenInclude(inv => inv.Appointment)
-            .Where(p => p.Status == PaymentStatus.Completed
+            .Where(p => p.TenantId == tenantId && p.Invoice.TenantId == tenantId
+                     && p.Status == PaymentStatus.Completed
                      && p.PaidAt >= startDt
                      && p.PaidAt < endDt);
 
-        // Walk-in invoices have no appointment, so there is nothing to clinic-scope them by —
-        // excluding them silently dropped all walk-in revenue from every tax report.
-        // shortcut: clinic-scoping for walk-in invoices needs the tenant key (Master TODO A3/B1).
-        if (clinicId.HasValue)
-            query = query.Where(p => p.Invoice.Appointment == null
-                                  || p.Invoice.Appointment.ClinicId == clinicId.Value);
+        // Walk-ins belong to the tenant's unique clinic; appointment joins must agree too.
+        query = query.Where(p => p.Invoice.AppointmentId == null
+                              || p.Invoice.Appointment != null && p.Invoice.Appointment.TenantId == tenantId
+                                  && p.Invoice.Appointment.ClinicId == clinicId);
 
         return query;
     }
 
     private IQueryable<Invoice> QueryInvoices(DateTime startDt, DateTime endDt, Guid? clinicId)
     {
+        var tenantId = User.GetTenantId()!.Value;
         var query = _db.Invoices
             .Include(i => i.Appointment).ThenInclude(a => a!.Patient)
             // A draft has no legal number yet; cancelled documents are reported separately, never as supply.
-            .Where(i => i.CreatedAt >= startDt && i.CreatedAt < endDt
+            .Where(i => i.TenantId == tenantId && i.CreatedAt >= startDt && i.CreatedAt < endDt
                      && i.InvoiceNumber > 0
                      && i.Status != InvoiceStatus.Draft
                      && i.Status != InvoiceStatus.Cancelled);
 
-        // See QueryPayments: walk-in invoices have no appointment to scope by.
-        if (clinicId.HasValue)
-            query = query.Where(i => i.Appointment == null
-                                  || i.Appointment.ClinicId == clinicId.Value);
+        query = query.Where(i => i.AppointmentId == null
+                              || i.Appointment != null && i.Appointment.TenantId == tenantId
+                                  && i.Appointment.ClinicId == clinicId);
 
         return query;
     }
 
     private async Task<object> BuildGstr1Async(string month, DateTime startDt, DateTime endDt, Guid? clinicId, CancellationToken ct)
     {
-        var tenantId = User.GetTenantId() ?? Guid.Empty;
+        var tenantId = User.GetTenantId()!.Value;
 
         var taxProfile = await _db.TenantTaxProfiles.AsNoTracking()
-            .Where(p => p.TenantId == tenantId)
+            .Where(p => p.TenantId == tenantId && (p.ClinicId == null || p.ClinicId == clinicId))
             .OrderByDescending(p => p.ClinicId == clinicId)
             .FirstOrDefaultAsync(ct);
 
@@ -307,6 +315,9 @@ public class ReportsController : ControllerBase
         var creditNotes = await _db.CreditNotes.AsNoTracking()
             .Include(c => c.Invoice)
             .Where(c => c.TenantId == tenantId
+                     && c.Invoice.TenantId == tenantId
+                     && (c.Invoice.AppointmentId == null || c.Invoice.Appointment != null
+                         && c.Invoice.Appointment.TenantId == tenantId && c.Invoice.Appointment.ClinicId == clinicId)
                      && c.Status == CreditNoteStatus.Approved
                      && c.IssuedAt >= startDt && c.IssuedAt < endDt)
             .ToListAsync(ct);
@@ -314,7 +325,7 @@ public class ReportsController : ControllerBase
         return BuildGstr1Payload(month, invoices, creditNotes, taxProfile);
     }
 
-    private static object BuildGstr1Payload(
+    private object BuildGstr1Payload(
         string month,
         List<Invoice> invoices,
         List<CreditNote> creditNotes,
@@ -411,7 +422,8 @@ public class ReportsController : ControllerBase
                 return new
                 {
                     noteNumber = cn.FormatCreditNoteNumber(),
-                    noteDate = cn.IssuedAt.ToString("yyyy-MM-dd"),
+                    noteDate = TimeZoneInfo.ConvertTime(cn.IssuedAt, _timezone.ResolveTimeZone(null, AccountingTimezone))
+                        .ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                     noteType = "C",
                     noteValue = cn.Amount,
                     taxableValue,
@@ -459,19 +471,25 @@ public class ReportsController : ControllerBase
 
     private async Task<Guid?> GetUserClinicId(Guid userId, CancellationToken ct)
     {
-        var user = await _db.Users.FindAsync([userId], ct);
-        return user?.ClinicId;
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        if (tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty)
+            return null;
+        return await _db.Clinics.AnyAsync(c => c.Id == clinicId && c.TenantId == tenantId, ct)
+            && await _db.TenantMemberships.AnyAsync(m => m.UserId == userId && m.TenantId == tenantId
+                && m.ClinicId == clinicId && m.Status == "active", ct) ? clinicId : null;
     }
 
-    private static (int year, int month) ParseMonth(string? month)
+    private bool TryParseMonth(string? month, out DateOnly startDate)
     {
-        if (!string.IsNullOrWhiteSpace(month) &&
-            DateOnly.TryParse($"{month}-01", out var parsed))
+        if (month is null)
         {
-            return (parsed.Year, parsed.Month);
+            var today = _timezone.GetLocalDate(null, AccountingTimezone);
+            startDate = new DateOnly(today.Year, today.Month, 1);
+            return true;
         }
-        var now = DateTime.UtcNow;
-        return (now.Year, now.Month);
+        return DateOnly.TryParseExact($"{month}-01", "yyyy-MM-dd", CultureInfo.InvariantCulture,
+            DateTimeStyles.None, out startDate) && startDate.Year is > 1 and < 9999;
     }
 }
 

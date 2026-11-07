@@ -42,12 +42,10 @@ public class PayeeAccountsController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Owner", "Receptionist", "Doctor")]
     public async Task<IActionResult> ListAccounts([FromQuery] bool? includeInactive, CancellationToken ct)
     {
+        if (!await HasSelectedMembershipAsync(admin: false, ct)) return Forbid();
         var tenantId = TenantId;
         var clinicId = ClinicId;
-        var query = _db.PayeeAccounts.Where(p => p.TenantId == tenantId);
-
-        if (clinicId.HasValue)
-            query = query.Where(p => p.ClinicId == clinicId.Value);
+        var query = _db.PayeeAccounts.Where(p => p.TenantId == tenantId && p.ClinicId == clinicId);
 
         if (includeInactive != true)
             query = query.Where(p => p.IsActive);
@@ -84,7 +82,7 @@ public class PayeeAccountsController : ControllerBase
         if (tenantId == Guid.Empty)
             return Unauthorized(new { error = "invalid_tenant" });
 
-        var stepUp = await RequireStepUp(req.CurrentPassword, req.MfaCode, tenantId, ct);
+        var stepUp = await RequireStepUp(req.CurrentPassword, req.MfaCode, ct);
         if (stepUp is not null) return stepUp;
 
         // Basic VPA format validation (e.g. username@bank)
@@ -129,7 +127,7 @@ public class PayeeAccountsController : ControllerBase
         _db.PayeeAccounts.Add(account);
         await _db.SaveChangesAsync(ct);
 
-        await NotifyAdminsAsync(tenantId,
+        await NotifyAdminsAsync(account.TenantId, account.ClinicId!.Value,
             "Payee account added",
             $"A payee account {account.Vpa} ({account.AccountNumberMasked}) was added by {User.Identity?.Name ?? "a clinic admin"}. It cannot receive QR traffic for 24 hours.",
             ct);
@@ -157,12 +155,12 @@ public class PayeeAccountsController : ControllerBase
     {
         var tenantId = TenantId;
         var clinicId = ClinicId;
-        var stepUp = await RequireStepUp(req.CurrentPassword, req.MfaCode, tenantId, ct);
+        var stepUp = await RequireStepUp(req.CurrentPassword, req.MfaCode, ct);
         if (stepUp is not null) return stepUp;
 
         var account = await _db.PayeeAccounts
             .FirstOrDefaultAsync(p => p.Id == id && p.TenantId == tenantId
-                && (!clinicId.HasValue || p.ClinicId == clinicId.Value), ct);
+                && p.ClinicId == clinicId, ct);
 
         if (account == null)
             return NotFound(new { error = "payee_account_not_found" });
@@ -190,7 +188,7 @@ public class PayeeAccountsController : ControllerBase
         account.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(ct);
 
-        await NotifyAdminsAsync(tenantId,
+        await NotifyAdminsAsync(account.TenantId, account.ClinicId!.Value,
             "Payee account changed",
             $"Payee account {account.Vpa} ({account.AccountNumberMasked}) was updated by {User.Identity?.Name ?? "a clinic admin"}. Active: {account.IsActive}. Priority: {account.PriorityOrder}.",
             ct);
@@ -211,12 +209,14 @@ public class PayeeAccountsController : ControllerBase
     /// Re-authentication for a money-routing change: password always, plus the
     /// enrolled second factor when MFA is on. A stolen session alone cannot redirect settlement.
     /// </summary>
-    private async Task<IActionResult?> RequireStepUp(string? password, string? mfaCode, Guid tenantId, CancellationToken ct)
+    private async Task<IActionResult?> RequireStepUp(string? password, string? mfaCode, CancellationToken ct)
     {
         var userId = User.GetUserId();
         if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == userId.Value && u.TenantId == tenantId, ct);
+        if (!await HasSelectedMembershipAsync(admin: true, ct)) return Forbid();
+
+        var user = await _db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId.Value, ct);
         if (user is null) return Unauthorized(new { error = "invalid_token" });
 
         if (string.IsNullOrWhiteSpace(password) || !password.VerifyPassword(user.PasswordHash))
@@ -237,24 +237,48 @@ public class PayeeAccountsController : ControllerBase
         return null;
     }
 
-    private async Task NotifyAdminsAsync(Guid tenantId, string subject, string body, CancellationToken ct)
+    private Task<bool> HasSelectedMembershipAsync(bool admin, CancellationToken ct)
     {
-        var emails = await _db.Users
-            .Where(u => u.TenantId == tenantId && u.Role == UserRole.ClinicAdmin)
-            .Select(u => u.Email)
-            .ToListAsync(ct);
+        var userId = User.GetUserId();
+        var tenantId = TenantId;
+        var clinicId = ClinicId;
+        if (userId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty)
+            return Task.FromResult(false);
+        return _db.TenantMemberships.AsNoTracking().AnyAsync(m =>
+            m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active"
+            && (m.Role == UserRole.ClinicAdmin || m.Role == UserRole.Owner
+                || !admin && (m.Role == UserRole.Receptionist || m.Role == UserRole.Doctor))
+            && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
+    }
 
-        foreach (var to in emails)
+    private async Task NotifyAdminsAsync(Guid tenantId, Guid clinicId, string subject, string body, CancellationToken ct)
+    {
+        try
         {
-            try
+            var admins = _db.TenantMemberships.AsNoTracking().Where(m =>
+                m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active"
+                && m.Role == UserRole.ClinicAdmin && m.Clinic != null && m.Clinic.TenantId == tenantId);
+            var ids = await admins.OrderBy(m => m.Id).Select(m => m.Id).ToListAsync(ct);
+            foreach (var id in ids)
             {
-                await _email.SendAsync(to, subject, body, ct);
+                try
+                {
+                    // A previous send may outlive a role change; resolve eligibility and address again.
+                    var to = await admins.Where(m => m.Id == id).Select(m => m.User.Email).SingleOrDefaultAsync(ct);
+                    if (to is null) continue;
+                    if (!await _email.SendAsync(to, subject, body, ct))
+                        _logger.LogWarning("Payee account alert handoff failed for membership {MembershipId}", id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Payee account alert failed for membership {MembershipId}; the account change was committed", id);
+                }
             }
-            catch (Exception ex)
-            {
-                // The account change already committed; a failed alert must not undo or 500 it.
-                _logger.LogWarning(ex, "Payee account alert to {Email} failed", to);
-            }
+        }
+        catch (Exception ex)
+        {
+            // Recipient lookup and cancellation are also post-commit failures.
+            _logger.LogWarning(ex, "Payee account alert lookup failed; the account change was committed");
         }
     }
 

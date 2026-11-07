@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Caching.Memory;
 
 namespace Hospital_CRM.Api.Middlewares;
@@ -57,6 +58,19 @@ public class IdempotencyMiddleware
                 error = "invalid_idempotency_key",
                 message = "Idempotency key length must be 128 characters or fewer."
             }));
+            return;
+        }
+
+        // Durable writes validate the original payload and return current saved state themselves.
+        var path = context.Request.Path.Value?.TrimEnd('/');
+        if (string.Equals(path, "/api/v1/pharmacy/checkout", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(path, "/api/v1/pharmacy/dispense", StringComparison.OrdinalIgnoreCase)
+            || HttpMethods.IsPost(context.Request.Method) && (
+                string.Equals(path, "/api/v1/patients", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(path, "/api/v1/platform-admin/tenants", StringComparison.OrdinalIgnoreCase)
+                || Regex.IsMatch(path ?? "", @"^/api/v1/invoices/[^/]+/(?:payment|payments/(?:report|confirm))$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)))
+        {
+            await _next(context);
             return;
         }
 

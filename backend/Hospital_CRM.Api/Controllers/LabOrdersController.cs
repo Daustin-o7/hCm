@@ -1,5 +1,7 @@
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
+using System.Security.Cryptography;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
@@ -15,16 +17,12 @@ namespace Hospital_CRM.Api.Controllers;
 public class LabOrdersController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
-    private readonly IConfiguration _config;
-    private readonly string _uploadDir;
+    private readonly LabFileStorage? _files;
 
-    public LabOrdersController(HospitalCrmDbContext db, IConfiguration config)
+    public LabOrdersController(HospitalCrmDbContext db, IConfiguration config, LabFileStorage? files = null)
     {
         _db = db;
-        _config = config;
-        // Local disk storage for pilot. S3 swap is a config + DI change later.
-        _uploadDir = config["Lab:UploadDir"] ?? "lab-uploads";
-        Directory.CreateDirectory(_uploadDir);
+        _files = files;
     }
 
     // ----- FR-08-01: Create Lab Order -----
@@ -107,8 +105,13 @@ public class LabOrdersController : ControllerBase
         if (string.IsNullOrWhiteSpace(resultText) && file is null)
             return BadRequest(new { error = "result_text_or_file_required" });
 
+        if (User.Identity?.IsAuthenticated != true || !User.GetUserId().HasValue) return Unauthorized();
+        if (!User.GetTenantId().HasValue || User.GetTenantId() == Guid.Empty) return Forbid();
+        if (!User.IsInRole("Doctor") && !User.IsInRole("ClinicAdmin") && !User.IsInRole("Owner")) return Forbid();
+
         if (file is not null)
         {
+            if (file.Length <= 0) return BadRequest(new { error = "empty_lab_file" });
             if (file.Length > MaxLabFileSizeBytes)
                 return StatusCode(StatusCodes.Status413PayloadTooLarge, new { error = "file_too_large", maxSizeBytes = MaxLabFileSizeBytes });
 
@@ -124,23 +127,23 @@ public class LabOrdersController : ControllerBase
 
         // FR-08-02 edge case: correction = new version, original preserved
         var latest = await _db.LabResults
-            .Where(r => r.LabOrderId == id)
+            .Where(r => r.LabOrderId == id && r.TenantId == tenantId)
             .OrderByDescending(r => r.Version)
             .FirstOrDefaultAsync(ct);
         var version = (latest?.Version ?? 0) + 1;
 
+        var resultId = Guid.NewGuid();
         string? fileUrl = null;
         if (file is not null)
         {
-            // Local disk storage; swap for S3 in production (TRD-Phase2 §3)
-            var ext = Path.GetExtension(file.FileName);
-            var fileName = $"{id}_v{version}_{Guid.NewGuid():N}{ext}";
-            var path = Path.Combine(_uploadDir, fileName);
-            await using (var stream = System.IO.File.Create(path))
+            if (_files is null) return StatusCode(503, new { error = "lab_storage_unavailable" });
+            try
             {
-                await file.CopyToAsync(stream, ct);
+                fileUrl = await _files.WriteAsync(tenantId, id, resultId, file, ct);
             }
-            fileUrl = $"/lab-uploads/{fileName}";
+            catch (InvalidDataException) { return BadRequest(new { error = "invalid_lab_file" }); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException)
+            { return StatusCode(503, new { error = "lab_storage_unavailable" }); }
         }
 
         var userId = User.GetUserId();
@@ -148,7 +151,7 @@ public class LabOrdersController : ControllerBase
 
         var result = new LabResult
         {
-            Id = Guid.NewGuid(),
+            Id = resultId,
             TenantId = order.TenantId,
             LabOrderId = id,
             ResultText = resultText,
@@ -173,7 +176,8 @@ public class LabOrdersController : ControllerBase
             version = result.Version,
             previousVersionId = result.PreviousVersionId,
             resultText = result.ResultText,
-            fileUrl = result.FileUrl,
+            fileUrl = DownloadUrl(result),
+            fileExtension = DownloadExtension(result),
             isAbnormal = result.IsAbnormal,
             orderStatus = order.Status.ToString().ToLower()
         });
@@ -219,13 +223,49 @@ public class LabOrdersController : ControllerBase
                 version = result.Version,
                 previousVersionId = result.PreviousVersionId,
                 resultText = result.ResultText,
-                fileUrl = result.FileUrl,
+                fileUrl = DownloadUrl(result),
+                fileExtension = DownloadExtension(result),
                 isAbnormal = result.IsAbnormal,
                 referenceRange = result.ReferenceRange,
                 units = result.Units,
                 enteredAt = result.EnteredAt
             }
         });
+    }
+
+    private static string? DownloadUrl(LabResult result) => string.IsNullOrEmpty(result.FileUrl)
+        ? null : $"/api/v1/lab-orders/{result.LabOrderId}/results/{result.Id}/file";
+
+    private static string? DownloadExtension(LabResult result) =>
+        Path.GetExtension(result.FileUrl)?.ToLowerInvariant() is { } extension && AllowedExtensions.Contains(extension)
+            ? extension : null;
+
+    [HttpGet("lab-orders/{id:guid}/results/{resultId:guid}/file")]
+    [AuthorizeRoles("Doctor", "ClinicAdmin", "Nurse")]
+    public async Task<IActionResult> DownloadResult(Guid id, Guid resultId, CancellationToken ct)
+    {
+        if (User.Identity?.IsAuthenticated != true || !User.GetUserId().HasValue) return Unauthorized();
+        var tenantId = User.GetTenantId();
+        if (!tenantId.HasValue || tenantId == Guid.Empty) return Forbid();
+        if (!User.IsInRole("Doctor") && !User.IsInRole("ClinicAdmin") && !User.IsInRole("Owner") && !User.IsInRole("Nurse"))
+            return Forbid();
+        var result = await _db.LabResults.AsNoTracking().FirstOrDefaultAsync(r =>
+            r.Id == resultId && r.LabOrderId == id && r.TenantId == tenantId &&
+            _db.LabOrders.Any(o => o.Id == id && o.TenantId == tenantId), ct);
+        if (string.IsNullOrEmpty(result?.FileUrl)) return NotFound(new { error = "lab_file_not_found" });
+        if (_files is null) return StatusCode(503, new { error = "lab_storage_unavailable" });
+        Response.Headers.CacheControl = "no-store, private";
+        Response.Headers.Pragma = "no-cache";
+        Response.Headers["X-Content-Type-Options"] = "nosniff";
+        try
+        {
+            var file = await _files.ReadAsync(tenantId.Value, id, resultId, result.FileUrl, ct);
+            return File(file.Bytes, file.ContentType, $"lab-result-v{result.Version}{file.Extension}");
+        }
+        catch (FileNotFoundException) { return NotFound(new { error = "lab_file_not_found" }); }
+        catch (InvalidDataException) { return StatusCode(503, new { error = "lab_file_unavailable" }); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException)
+        { return StatusCode(503, new { error = "lab_file_unavailable" }); }
     }
 
     [HttpPost("lab-orders/{id:guid}/doctor-review")]

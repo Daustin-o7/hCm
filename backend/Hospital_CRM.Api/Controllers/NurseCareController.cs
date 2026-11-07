@@ -29,20 +29,26 @@ public class NurseCareController : ControllerBase
         var callerId = User.GetUserId();
         if (!callerId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var caller = await _db.Users.FindAsync([callerId.Value], ct);
-        if (caller?.ClinicId is null) return Forbid();
+        var caller = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin);
+        if (caller is null) return Forbid();
 
         var patient = await _db.Patients
-            .FirstOrDefaultAsync(p => p.Id == request.PatientId &&
-                (p.CreatedByUser.ClinicId == null || p.CreatedByUser.ClinicId == caller.ClinicId || p.Appointments.Any(a => a.ClinicId == caller.ClinicId)), ct);
+            .FirstOrDefaultAsync(p => p.Id == request.PatientId && p.TenantId == caller.TenantId, ct);
         if (patient is null) return NotFound(new { error = "patient_not_found" });
 
-        var nurse = await _db.NurseProfiles
-            .FirstOrDefaultAsync(p => p.Id == request.NurseProfileId && p.User.ClinicId == caller.ClinicId, ct);
+        var nurse = await NursingScope.Profiles(_db, caller)
+            .FirstOrDefaultAsync(p => p.Id == request.NurseProfileId, ct);
         if (nurse is null) return NotFound(new { error = "nurse_not_found" });
 
+        if (request.AppointmentId.HasValue && !await _db.Appointments.AnyAsync(a => a.Id == request.AppointmentId &&
+            a.TenantId == caller.TenantId && a.ClinicId == caller.ClinicId && a.PatientId == patient.Id, ct))
+            return NotFound(new { error = "appointment_not_found" });
+        if (request.ShiftId.HasValue && !await _db.NurseShifts.AnyAsync(s => s.Id == request.ShiftId &&
+            s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId && s.NurseProfileId == nurse.Id, ct))
+            return NotFound(new { error = "shift_not_found" });
+
         var alreadyActive = await _db.PatientNurseAssignments.AnyAsync(a =>
-            a.PatientId == request.PatientId &&
+            a.TenantId == caller.TenantId && a.PatientId == request.PatientId &&
             a.NurseProfileId == request.NurseProfileId &&
             a.Status == NurseAssignmentStatus.Active, ct);
         if (alreadyActive) return Conflict(new { error = "assignment_already_active" });
@@ -50,7 +56,7 @@ public class NurseCareController : ControllerBase
         var assignment = new PatientNurseAssignment
         {
             Id = Guid.NewGuid(),
-            TenantId = User.GetTenantId() ?? caller.TenantId ?? Guid.Empty,
+            TenantId = caller.TenantId,
             PatientId = request.PatientId,
             NurseProfileId = request.NurseProfileId,
             AppointmentId = request.AppointmentId,
@@ -63,7 +69,7 @@ public class NurseCareController : ControllerBase
         _db.PatientNurseAssignments.Add(assignment);
         await _db.SaveChangesAsync(ct);
         await ShiftsController.LogAudit(_db, "PatientNurseAssignment", assignment.Id, request.NurseProfileId,
-            "created", null, $"patient:{request.PatientId}", callerId.Value, User.GetTenantId() ?? Guid.Empty, ct);
+            "created", null, $"patient:{request.PatientId}", callerId.Value, caller.TenantId, ct);
 
         return Ok(new { assignmentId = assignment.Id, status = assignment.Status.ToString() });
     }
@@ -75,20 +81,21 @@ public class NurseCareController : ControllerBase
         var callerId = User.GetUserId();
         if (!callerId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var caller = await _db.Users.FindAsync([callerId.Value], ct);
-        if (caller?.ClinicId is null) return Forbid();
+        var caller = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (caller is null) return Forbid();
 
-        var query = _db.PatientNurseAssignments.AsQueryable();
+        var profiles = NursingScope.Profiles(_db, caller);
+        var query = _db.PatientNurseAssignments.Where(a => a.TenantId == caller.TenantId &&
+            profiles.Any(n => n.Id == a.NurseProfileId) && _db.Patients.Any(p => p.Id == a.PatientId && p.TenantId == caller.TenantId) &&
+            (a.AppointmentId == null || _db.Appointments.Any(v => v.Id == a.AppointmentId && v.TenantId == caller.TenantId &&
+                v.ClinicId == caller.ClinicId && v.PatientId == a.PatientId)) &&
+            (a.ShiftId == null || _db.NurseShifts.Any(s => s.Id == a.ShiftId && s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId)));
 
         if (caller.Role == UserRole.Nurse)
         {
-            var own = await _db.NurseProfiles.Where(p => p.UserId == callerId.Value).Select(p => (Guid?)p.Id).FirstOrDefaultAsync(ct);
+            var own = await profiles.Where(p => p.UserId == callerId.Value).Select(p => (Guid?)p.Id).FirstOrDefaultAsync(ct);
             if (own is null) return Forbid();
             query = query.Where(a => a.NurseProfileId == own);
-        }
-        else
-        {
-            query = query.Where(a => a.Nurse.User.ClinicId == caller.ClinicId);
         }
 
         if (patientId.HasValue)
@@ -121,29 +128,29 @@ public class NurseCareController : ControllerBase
         var callerId = User.GetUserId();
         if (!callerId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var caller = await _db.Users.FindAsync([callerId.Value], ct);
-        if (caller?.ClinicId is null) return Forbid();
+        var caller = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (caller is null) return Forbid();
 
+        var profiles = NursingScope.Profiles(_db, caller);
         var assignment = await _db.PatientNurseAssignments
-            .Include(a => a.Nurse).ThenInclude(n => n.User)
-            .FirstOrDefaultAsync(a => a.Id == id, ct);
+            .FirstOrDefaultAsync(a => a.Id == id && a.TenantId == caller.TenantId &&
+                profiles.Any(p => p.Id == a.NurseProfileId) && _db.Patients.Any(p => p.Id == a.PatientId && p.TenantId == caller.TenantId) &&
+                (a.AppointmentId == null || _db.Appointments.Any(v => v.Id == a.AppointmentId && v.TenantId == caller.TenantId &&
+                    v.ClinicId == caller.ClinicId && v.PatientId == a.PatientId)) &&
+                (a.ShiftId == null || _db.NurseShifts.Any(s => s.Id == a.ShiftId && s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId)), ct);
         if (assignment is null) return NotFound(new { error = "assignment_not_found" });
 
         if (caller.Role == UserRole.Nurse)
         {
-            var own = await _db.NurseProfiles.Where(p => p.UserId == callerId.Value).Select(p => (Guid?)p.Id).FirstOrDefaultAsync(ct);
+            var own = await profiles.Where(p => p.UserId == callerId.Value).Select(p => (Guid?)p.Id).FirstOrDefaultAsync(ct);
             if (assignment.NurseProfileId != own) return Forbid();
-        }
-        else if (assignment.Nurse.User.ClinicId != caller.ClinicId)
-        {
-            return Forbid();
         }
 
         assignment.Status = NurseAssignmentStatus.Completed;
         assignment.CompletedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(ct);
         await ShiftsController.LogAudit(_db, "PatientNurseAssignment", assignment.Id, assignment.NurseProfileId,
-            "status", "Active", "Completed", callerId.Value, User.GetTenantId() ?? Guid.Empty, ct);
+            "status", "Active", "Completed", callerId.Value, caller.TenantId, ct);
 
         return Ok(new { assignmentId = assignment.Id, status = assignment.Status.ToString() });
     }
@@ -158,8 +165,8 @@ public class NurseCareController : ControllerBase
         var callerId = User.GetUserId();
         if (!callerId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var caller = await _db.Users.FindAsync([callerId.Value], ct);
-        if (caller?.ClinicId is null) return Forbid();
+        var caller = await NursingScope.SelectedAsync(_db, User, ct, UserRole.Nurse);
+        if (caller is null) return Forbid();
 
         var whatHappened = !string.IsNullOrWhiteSpace(request.WhatHappened)
             ? request.WhatHappened.Trim()
@@ -172,23 +179,25 @@ public class NurseCareController : ControllerBase
         if (string.IsNullOrWhiteSpace(whatHappened))
             return BadRequest(new { error = "what_happened_or_note_required" });
 
-        var own = await _db.NurseProfiles
-            .FirstOrDefaultAsync(p => p.UserId == callerId.Value && p.User.ClinicId == caller.ClinicId, ct);
+        var profiles = NursingScope.Profiles(_db, caller);
+        var own = await profiles.FirstOrDefaultAsync(p => p.UserId == callerId.Value, ct);
         if (own is null) return Forbid();
+
+        if (request.ShiftId.HasValue && !await _db.NurseShifts.AnyAsync(s => s.Id == request.ShiftId &&
+            s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId && s.NurseProfileId == own.Id, ct))
+            return NotFound(new { error = "shift_not_found" });
 
         // If ToNurseProfileId is provided, validate it; otherwise auto-select the other nurse or self
         Guid targetNurseId;
         if (request.ToNurseProfileId.HasValue && request.ToNurseProfileId.Value != Guid.Empty)
         {
-            var toNurse = await _db.NurseProfiles
-                .FirstOrDefaultAsync(p => p.Id == request.ToNurseProfileId.Value && p.User.ClinicId == caller.ClinicId, ct);
+            var toNurse = await profiles.FirstOrDefaultAsync(p => p.Id == request.ToNurseProfileId.Value, ct);
             if (toNurse is null) return NotFound(new { error = "nurse_not_found" });
             targetNurseId = toNurse.Id;
         }
         else
         {
-            var otherNurse = await _db.NurseProfiles
-                .Where(p => p.Id != own.Id && p.User.ClinicId == caller.ClinicId)
+            var otherNurse = await profiles.Where(p => p.Id != own.Id)
                 .Select(p => p.Id)
                 .FirstOrDefaultAsync(ct);
             targetNurseId = otherNurse != Guid.Empty ? otherNurse : own.Id;
@@ -199,22 +208,22 @@ public class NurseCareController : ControllerBase
         if (request.PatientId.HasValue && request.PatientId.Value != Guid.Empty)
         {
             var patient = await _db.Patients
-                .FirstOrDefaultAsync(p => p.Id == request.PatientId.Value &&
-                    (p.CreatedByUser.ClinicId == null || p.CreatedByUser.ClinicId == caller.ClinicId || p.Appointments.Any(a => a.ClinicId == caller.ClinicId)), ct);
+                .FirstOrDefaultAsync(p => p.Id == request.PatientId.Value && p.TenantId == caller.TenantId, ct);
             if (patient is null) return NotFound(new { error = "patient_not_found" });
             targetPatientId = patient.Id;
         }
         else
         {
             var activePatientId = await _db.PatientNurseAssignments
-                .Where(a => a.NurseProfileId == own.Id && a.Status == NurseAssignmentStatus.Active)
+                .Where(a => a.TenantId == caller.TenantId && a.NurseProfileId == own.Id && a.Status == NurseAssignmentStatus.Active &&
+                    _db.Patients.Any(p => p.Id == a.PatientId && p.TenantId == caller.TenantId))
                 .Select(a => (Guid?)a.PatientId)
                 .FirstOrDefaultAsync(ct);
 
             if (!activePatientId.HasValue)
             {
                 activePatientId = await _db.Patients
-                    .Where(p => p.CreatedByUser.ClinicId == caller.ClinicId || p.Appointments.Any(a => a.ClinicId == caller.ClinicId))
+                    .Where(p => p.TenantId == caller.TenantId)
                     .OrderByDescending(p => p.CreatedAt)
                     .Select(p => (Guid?)p.Id)
                     .FirstOrDefaultAsync(ct);
@@ -229,7 +238,7 @@ public class NurseCareController : ControllerBase
         var handover = new ShiftHandover
         {
             Id = Guid.NewGuid(),
-            TenantId = User.GetTenantId() ?? caller.TenantId ?? Guid.Empty,
+            TenantId = caller.TenantId,
             PatientId = targetPatientId,
             AuthorNurseProfileId = own.Id,
             ToNurseProfileId = targetNurseId,
@@ -243,7 +252,7 @@ public class NurseCareController : ControllerBase
         _db.ShiftHandovers.Add(handover);
         await _db.SaveChangesAsync(ct);
         await ShiftsController.LogAudit(_db, "ShiftHandover", handover.Id, own.Id, "created", null,
-            $"patient:{targetPatientId}", callerId.Value, User.GetTenantId() ?? Guid.Empty, ct);
+            $"patient:{targetPatientId}", callerId.Value, caller.TenantId, ct);
 
         return Ok(new { handoverId = handover.Id });
     }
@@ -256,25 +265,23 @@ public class NurseCareController : ControllerBase
         var callerId = User.GetUserId();
         if (!callerId.HasValue) return Unauthorized(new { error = "invalid_token" });
 
-        var caller = await _db.Users.FindAsync([callerId.Value], ct);
-        if (caller?.ClinicId is null) return Forbid();
+        var caller = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Doctor, UserRole.Nurse);
+        if (caller is null) return Forbid();
 
-        var query = _db.ShiftHandovers.AsQueryable();
+        var profiles = NursingScope.Profiles(_db, caller);
+        var query = _db.ShiftHandovers.Where(h => h.TenantId == caller.TenantId &&
+            profiles.Any(n => n.Id == h.AuthorNurseProfileId) && profiles.Any(n => n.Id == h.ToNurseProfileId) &&
+            _db.Patients.Any(p => p.Id == h.PatientId && p.TenantId == caller.TenantId) &&
+            (h.ShiftId == null || _db.NurseShifts.Any(s => s.Id == h.ShiftId && s.TenantId == caller.TenantId && s.ClinicId == caller.ClinicId)));
 
         if (patientId.HasValue && patientId.Value != Guid.Empty)
         {
             var patientExists = await _db.Patients
-                .AnyAsync(p => p.Id == patientId.Value &&
-                    (p.CreatedByUser.ClinicId == null || p.CreatedByUser.ClinicId == caller.ClinicId || p.Appointments.Any(a => a.ClinicId == caller.ClinicId)), ct);
+                .AnyAsync(p => p.Id == patientId.Value && p.TenantId == caller.TenantId, ct);
             if (!patientExists)
                 return NotFound(new { error = "patient_not_found" });
 
             query = query.Where(h => h.PatientId == patientId.Value);
-        }
-        else
-        {
-            query = query.Where(h => _db.Patients.Any(p => p.Id == h.PatientId &&
-                (p.CreatedByUser.ClinicId == null || p.CreatedByUser.ClinicId == caller.ClinicId || p.Appointments.Any(a => a.ClinicId == caller.ClinicId))));
         }
 
         var rows = await query

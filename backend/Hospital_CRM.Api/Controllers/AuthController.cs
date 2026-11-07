@@ -27,6 +27,7 @@ public class AuthController : ControllerBase
     private readonly IWebHostEnvironment _env;
     private readonly ISecretProtector _secretProtector;
     private readonly IEmailSender _email;
+    private readonly ITenantContext? _tenantContext;
 
     public AuthController(
         HospitalCrmDbContext db,
@@ -34,7 +35,8 @@ public class AuthController : ControllerBase
         IPersistentKeyService keyService,
         IWebHostEnvironment env,
         ISecretProtector secretProtector,
-        IEmailSender email)
+        IEmailSender email,
+        ITenantContext? tenantContext = null)
     {
         _db = db;
         _config = config;
@@ -42,6 +44,7 @@ public class AuthController : ControllerBase
         _env = env;
         _secretProtector = secretProtector;
         _email = email;
+        _tenantContext = tenantContext;
     }
 
     [HttpPost("login")]
@@ -60,6 +63,11 @@ public class AuthController : ControllerBase
             return Unauthorized(new { error = "invalid_credentials" });
         }
 
+        return await SessionMutation.RunAsync(_db, user.Id, () => LoginLockedAsync(user, request, ct), ct);
+    }
+
+    private async Task<IActionResult> LoginLockedAsync(User user, LoginRequest request, CancellationToken ct)
+    {
         if (user.LockedUntil.HasValue && user.LockedUntil.Value > DateTimeOffset.UtcNow)
         {
             await AuthAudit.LogAsync(_db, HttpContext, AuthEvent.LoginLocked, "denied",
@@ -121,20 +129,16 @@ public class AuthController : ControllerBase
 
         var memberships = await _db.TenantMemberships
             .AsNoTracking()
-            .Include(m => m.Clinic)
             .Where(m => m.UserId == user.Id && m.Status == "active")
             .ToListAsync(ct);
 
         if (requestedTenantId.HasValue && requestedTenantId.Value != Guid.Empty)
         {
             var chosen = memberships.FirstOrDefault(m => m.TenantId == requestedTenantId.Value);
-            if (chosen == null && user.TenantId != requestedTenantId.Value)
+            if (chosen == null)
                 return StatusCode(StatusCodes.Status403Forbidden, new { error = "unauthorized_tenant" });
 
-            var targetTenant = chosen?.TenantId ?? user.TenantId;
-            var targetClinic = chosen?.ClinicId ?? user.ClinicId;
-            var targetRole = chosen?.Role ?? user.Role;
-            return await CheckSubscriptionAndIssueSessionAsync(user, targetTenant, targetClinic, targetRole, ct);
+            return await CheckSubscriptionAndIssueSessionAsync(user, chosen.TenantId, chosen.ClinicId, chosen.Role, ct);
         }
 
         // Multiple memberships -> return clinic selection prompt
@@ -155,8 +159,7 @@ public class AuthController : ControllerBase
             return await CheckSubscriptionAndIssueSessionAsync(user, memberships[0].TenantId, memberships[0].ClinicId, memberships[0].Role, ct);
         }
 
-        // Fallback for legacy seed users without explicit TenantMembership rows
-        return await CheckSubscriptionAndIssueSessionAsync(user, user.TenantId, user.ClinicId, user.Role, ct);
+        return StatusCode(StatusCodes.Status403Forbidden, new { error = "unauthorized_tenant" });
     }
 
     private async Task<IActionResult> CheckSubscriptionAndIssueSessionAsync(
@@ -166,6 +169,14 @@ public class AuthController : ControllerBase
         UserRole role,
         CancellationToken ct)
     {
+        using var selectedTenant = tenantId is { } selected && selected != Guid.Empty
+            ? _tenantContext?.PushTenant(selected) : null;
+        if (!Enum.IsDefined(role) || role == UserRole.PlatformAdmin && user.Role != UserRole.PlatformAdmin)
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = "unauthorized_tenant" });
+        if (role != UserRole.PlatformAdmin && (tenantId is null || tenantId == Guid.Empty
+            || clinicId is null || clinicId == Guid.Empty
+            || !await _db.Clinics.IgnoreQueryFilters().AnyAsync(c => c.Id == clinicId && c.TenantId == tenantId, ct)))
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = "unauthorized_tenant" });
         if (role != UserRole.PlatformAdmin && tenantId.HasValue && tenantId.Value != Guid.Empty)
         {
             var tenant = await _db.Tenants.AsNoTracking()
@@ -194,17 +205,19 @@ public class AuthController : ControllerBase
     private async Task<IActionResult> IssueSessionAsync(
         User user,
         CancellationToken ct,
-        Guid? tenantId = null,
-        Guid? clinicId = null,
-        UserRole? role = null)
+        Guid? tenantId,
+        Guid? clinicId,
+        UserRole role)
     {
         var (tokenExpiry, refreshExpiryDays) = TokenLifetimes();
 
-        var effectiveTenantId = tenantId ?? user.TenantId;
-        var effectiveClinicId = clinicId ?? user.ClinicId;
-        var effectiveRole = role ?? user.Role;
+        var effectiveTenantId = role == UserRole.PlatformAdmin ? null : tenantId;
+        var effectiveClinicId = role == UserRole.PlatformAdmin ? null : clinicId;
+        var effectiveRole = role;
+        var familyId = Guid.NewGuid();
 
         var extraClaims = SessionClaims(user, effectiveRole);
+        extraClaims["session_id"] = familyId.ToString();
         if (effectiveClinicId.HasValue && effectiveClinicId.Value != Guid.Empty)
             extraClaims["clinicId"] = effectiveClinicId.Value.ToString();
 
@@ -214,7 +227,7 @@ public class AuthController : ControllerBase
         var refreshToken = Guid.NewGuid().ToString("N");
         _db.RefreshTokens.Add(NewRefreshToken(
             user.Id, refreshToken, effectiveTenantId, effectiveClinicId,
-            effectiveRole, Guid.NewGuid(), refreshExpiryDays));
+            effectiveRole, familyId, refreshExpiryDays));
 
         user.FailedLoginCount = 0;
         user.LockedUntil = null;
@@ -361,11 +374,22 @@ public class AuthController : ControllerBase
             return Unauthorized(new { error = "invalid_refresh_token" });
         }
 
+        return await SessionMutation.RunAsync(_db, storedToken.UserId, () => RefreshLockedAsync(storedToken, ct), ct);
+    }
+
+    private async Task<IActionResult> RefreshLockedAsync(RefreshToken storedToken, CancellationToken ct)
+    {
+        if (_db.Database.IsRelational())
+        {
+            await _db.Entry(storedToken).ReloadAsync(ct);
+        }
         // Presenting an already-revoked token means the credential leaked. Burn the family.
         if (storedToken.RevokedAt is not null)
         {
             var family = await _db.RefreshTokens
-                .Where(t => t.FamilyId == storedToken.FamilyId && t.RevokedAt == null)
+                .Where(t => t.UserId == storedToken.UserId && t.RevokedAt == null
+                    && (storedToken.FamilyId != null && t.FamilyId == storedToken.FamilyId
+                        || storedToken.FamilyId == null && t.Id == storedToken.Id))
                 .ToListAsync(ct);
 
             foreach (var token in family)
@@ -379,7 +403,7 @@ public class AuthController : ControllerBase
             return Unauthorized(new
             {
                 error = "token_theft_detected",
-                message = "Refresh token reuse detected. All active sessions have been revoked for security."
+                message = "Refresh token reuse detected. The affected session has been revoked."
             });
         }
 
@@ -397,6 +421,9 @@ public class AuthController : ControllerBase
                 storedToken.UserId, storedToken.TenantId, detail: "user_missing", ct: ct);
             return Unauthorized(new { error = "invalid_refresh_token" });
         }
+
+        if (user.LockedUntil > DateTimeOffset.UtcNow)
+            return Unauthorized(new { error = "invalid_refresh_token" });
 
         var scope = await ResolveStoredScopeAsync(storedToken, user, ct);
         if (!scope.Allowed)
@@ -443,7 +470,12 @@ public class AuthController : ControllerBase
         }
 
         var (tokenExpiry, refreshExpiryDays) = TokenLifetimes();
+        var familyId = storedToken.FamilyId is { } existingFamily && existingFamily != Guid.Empty
+            ? existingFamily : Guid.NewGuid();
+        // Bind the rotated parent too, so replay of a legacy token burns its new child.
+        storedToken.FamilyId = familyId;
         var extraClaims = SessionClaims(user, scope.Role);
+        extraClaims["session_id"] = familyId.ToString();
         if (scope.ClinicId.HasValue && scope.ClinicId.Value != Guid.Empty)
             extraClaims["clinicId"] = scope.ClinicId.Value.ToString();
 
@@ -453,7 +485,7 @@ public class AuthController : ControllerBase
         var newRefreshToken = Guid.NewGuid().ToString("N");
         _db.RefreshTokens.Add(NewRefreshToken(
             user.Id, newRefreshToken, scope.TenantId, scope.ClinicId,
-            scope.Role, storedToken.FamilyId ?? Guid.NewGuid(), refreshExpiryDays));
+            scope.Role, familyId, refreshExpiryDays));
 
         await _db.SaveChangesAsync(ct);
         AppendRefreshCookie(newRefreshToken, refreshExpiryDays);
@@ -475,12 +507,16 @@ public class AuthController : ControllerBase
     private async Task<ScopeResolution> ResolveStoredScopeAsync(
         RefreshToken token, User user, CancellationToken ct)
     {
-        var effectiveTenantId = (token.TenantId.HasValue && token.TenantId != Guid.Empty)
-            ? token.TenantId.Value
-            : user.TenantId;
+        if (user.Role == UserRole.PlatformAdmin)
+            return new ScopeResolution(token.Role == UserRole.PlatformAdmin && token.TenantId is null && token.ClinicId is null,
+                null, null, UserRole.PlatformAdmin, "unauthorized_tenant");
+        if (token.Role == UserRole.PlatformAdmin)
+            return new ScopeResolution(false, null, null, token.Role, "unauthorized_tenant");
 
-        if (effectiveTenantId is null || effectiveTenantId == Guid.Empty)
-            return new ScopeResolution(true, user.TenantId, user.ClinicId, user.Role, null);
+        var effectiveTenantId = token.TenantId;
+        if (effectiveTenantId is null || effectiveTenantId == Guid.Empty || token.ClinicId is null || token.ClinicId == Guid.Empty)
+            return new ScopeResolution(false, null, null, token.Role, "unauthorized_tenant");
+        using var selectedTenant = _tenantContext?.PushTenant(effectiveTenantId.Value);
 
         var tenant = await _db.Tenants.AsNoTracking()
             .Where(t => t.Id == effectiveTenantId.Value)
@@ -495,22 +531,14 @@ public class AuthController : ControllerBase
         if (access == EffectiveAccessLevel.Blocked)
             return new ScopeResolution(false, null, null, token.Role, "tenant_suspended");
 
-        if (token.TenantId is null || token.TenantId == Guid.Empty)
-            return new ScopeResolution(true, user.TenantId, user.ClinicId, user.Role, null);
-
-        var membership = await _db.TenantMemberships.AsNoTracking()
+        var membership = await _db.TenantMemberships.IgnoreQueryFilters().AsNoTracking()
             .FirstOrDefaultAsync(m => m.UserId == user.Id
                 && m.TenantId == token.TenantId
                 && m.ClinicId == token.ClinicId
-                && m.Status == "active", ct);
+                && m.Status == "active" && m.Clinic != null && m.Clinic.TenantId == token.TenantId, ct);
 
-        if (membership is not null)
+        if (membership is not null && membership.Role != UserRole.PlatformAdmin && Enum.IsDefined(membership.Role))
             return new ScopeResolution(true, membership.TenantId, membership.ClinicId, membership.Role, null);
-
-        // Legacy rows predate TenantMembership; they only stay valid on the primary tenant.
-        var hasMemberships = await _db.TenantMemberships.AnyAsync(m => m.UserId == user.Id, ct);
-        if (!hasMemberships && user.TenantId == token.TenantId)
-            return new ScopeResolution(true, token.TenantId, token.ClinicId, token.Role, null);
 
         return new ScopeResolution(false, null, null, token.Role, "unauthorized_tenant");
     }
@@ -526,6 +554,8 @@ public class AuthController : ControllerBase
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> SelectTenant([FromBody] SelectTenantRequest request, CancellationToken ct)
     {
+        if (User.HasClaim(c => c.Type is "impersonated_by" or "impersonation_id"))
+            return Unauthorized(new { error = "invalid_credentials" });
         Guid? userId = User.GetUserId();
         if (!userId.HasValue && !string.IsNullOrWhiteSpace(request.SelectionToken))
         {
@@ -535,25 +565,27 @@ public class AuthController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_credentials" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user is null)
+        return await SessionMutation.RunAsync(_db, userId.Value, () => SelectTenantLockedAsync(userId.Value, request, ct), ct);
+    }
+
+    private async Task<IActionResult> SelectTenantLockedAsync(Guid userId, SelectTenantRequest request, CancellationToken ct)
+    {
+        if (User.GetUserId().HasValue && await CurrentSessionScopeAsync(ct) is null)
+            return Unauthorized(new { error = "invalid_credentials" });
+        var user = await _db.Users.FindAsync([userId], ct);
+        if (user is null || user.LockedUntil > DateTimeOffset.UtcNow || user.Role == UserRole.PlatformAdmin)
+            return Unauthorized(new { error = "invalid_credentials" });
+        if (!User.GetUserId().HasValue && (ReadTenantSelectionChallenge(request.SelectionToken) != userId
+            || !ChallengeMatches(request.SelectionToken, user)))
             return Unauthorized(new { error = "invalid_credentials" });
 
-        var membership = await _db.TenantMemberships
-            .Include(m => m.Clinic)
+        var membership = await _db.TenantMemberships.AsNoTracking()
             .FirstOrDefaultAsync(m => m.UserId == user.Id
                 && m.TenantId == request.TenantId
                 && (request.ClinicId == null || m.ClinicId == request.ClinicId)
                 && m.Status == "active", ct);
 
-        if (membership is null && user.TenantId == request.TenantId)
-        {
-            await AuthAudit.LogAsync(_db, HttpContext, AuthEvent.TenantSelected, "success",
-                user.Id, request.TenantId, user.Email, detail: "legacy_primary", ct: ct);
-            return await CheckSubscriptionAndIssueSessionAsync(user, request.TenantId, user.ClinicId, user.Role, ct);
-        }
-
-        if (membership is null)
+        if (membership is null || membership.Role == UserRole.PlatformAdmin || !Enum.IsDefined(membership.Role))
         {
             await AuthAudit.LogAsync(_db, HttpContext, AuthEvent.TenantSelected, "denied",
                 user.Id, request.TenantId, user.Email, detail: "no_membership", ct: ct);
@@ -603,6 +635,9 @@ public class AuthController : ControllerBase
     [HttpPost("revoke-all")]
     [Authorize]
     public async Task<IActionResult> RevokeAllSessions(CancellationToken ct)
+        => await SessionMutation.RunAsync(_db, User.GetUserId() ?? Guid.Empty, () => RevokeAllSessionsLockedAsync(ct), ct);
+
+    private async Task<IActionResult> RevokeAllSessionsLockedAsync(CancellationToken ct)
     {
         var userId = User.GetUserId();
         if (!userId.HasValue)
@@ -639,12 +674,21 @@ public class AuthController : ControllerBase
             // never match and leave the row alive after "log out".
             var tokenHash = rawToken.HashToken();
             var storedToken = await _db.RefreshTokens
-                .FirstOrDefaultAsync(t => t.TokenHash == tokenHash && t.RevokedAt == null, ct);
+                .FirstOrDefaultAsync(t => t.TokenHash == tokenHash, ct);
 
             if (storedToken != null)
             {
-                storedToken.RevokedAt = DateTimeOffset.UtcNow;
-                await _db.SaveChangesAsync(ct);
+                await SessionMutation.RunAsync(_db, storedToken.UserId, async () =>
+                {
+                    if (_db.Database.IsRelational()) await _db.Entry(storedToken).ReloadAsync(ct);
+                    var family = await _db.RefreshTokens.Where(t => t.UserId == storedToken.UserId
+                        && t.RevokedAt == null && (t.Id == storedToken.Id
+                            || storedToken.FamilyId != null && t.FamilyId == storedToken.FamilyId)).ToListAsync(ct);
+                    foreach (var token in family)
+                        token.RevokedAt = DateTimeOffset.UtcNow;
+                    await _db.SaveChangesAsync(ct);
+                    return true;
+                }, ct);
             }
         }
 
@@ -663,7 +707,13 @@ public class AuthController : ControllerBase
     [HttpPost("change-password")]
     [Authorize]
     public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest request, CancellationToken ct)
+        => await SessionMutation.RunAsync(_db, User.GetUserId() ?? Guid.Empty, () => ChangePasswordLockedAsync(request, ct), ct);
+
+    private async Task<IActionResult> ChangePasswordLockedAsync(ChangePasswordRequest request, CancellationToken ct)
     {
+        var scope = await CurrentSessionScopeAsync(ct);
+        if (scope is null)
+            return Unauthorized(new { error = "invalid_session" });
         var userId = User.GetUserId();
         if (userId is null)
             return Unauthorized(new { error = "not_authenticated" });
@@ -700,11 +750,31 @@ public class AuthController : ControllerBase
 
         // Keep the clinic the caller is currently scoped to; never snap back to the primary tenant.
         return await IssueSessionAsync(user, ct,
-            User.GetTenantId(), User.GetClinicId(), CurrentTokenRole() ?? user.Role);
+            scope.TenantId, scope.ClinicId, scope.Role);
     }
 
-    private UserRole? CurrentTokenRole() =>
-        Enum.TryParse<UserRole>(User.GetUserRole(), ignoreCase: true, out var role) ? role : null;
+    private async Task<ScopeResolution?> CurrentSessionScopeAsync(CancellationToken ct)
+    {
+        if (User.HasClaim(c => c.Type is "impersonated_by" or "impersonation_id")
+            || User.GetUserId() is not { } userId
+            || User.FindAll("session_id").Count() != 1
+            || !Guid.TryParse(User.FindFirst("session_id")?.Value, out var familyId) || familyId == Guid.Empty)
+            return null;
+
+        var now = DateTimeOffset.UtcNow;
+        var user = await _db.Users.FindAsync([userId], ct);
+        if (user is null || user.LockedUntil > now
+            || user.MfaEnabled && !User.HasClaim("mfa_enabled", "true"))
+            return null;
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        var token = await _db.RefreshTokens.AsNoTracking().FirstOrDefaultAsync(t => t.UserId == userId
+            && t.FamilyId == familyId && t.TenantId == tenantId && t.ClinicId == clinicId
+            && t.RevokedAt == null && t.ExpiresAt > now, ct);
+        if (token is null) return null;
+        var scope = await ResolveStoredScopeAsync(token, user, ct);
+        return scope.Allowed ? scope : null;
+    }
 
     /// <summary>Current second-factor state for the signed-in user.</summary>
     [HttpGet("mfa/status")]
@@ -734,7 +804,12 @@ public class AuthController : ControllerBase
     [Authorize]
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> StartMfaSetup([FromBody] MfaSetupRequest? request, CancellationToken ct)
+        => await SessionMutation.RunAsync(_db, User.GetUserId() ?? Guid.Empty, () => StartMfaSetupLockedAsync(request, ct), ct);
+
+    private async Task<IActionResult> StartMfaSetupLockedAsync(MfaSetupRequest? request, CancellationToken ct)
     {
+        if (await CurrentSessionScopeAsync(ct) is null)
+            return Unauthorized(new { error = "invalid_session" });
         var userId = User.GetUserId();
         if (userId is null)
             return Unauthorized(new { error = "not_authenticated" });
@@ -793,7 +868,13 @@ public class AuthController : ControllerBase
     [Authorize]
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> EnableMfa([FromBody] MfaEnableRequest request, CancellationToken ct)
+        => await SessionMutation.RunAsync(_db, User.GetUserId() ?? Guid.Empty, () => EnableMfaLockedAsync(request, ct), ct);
+
+    private async Task<IActionResult> EnableMfaLockedAsync(MfaEnableRequest request, CancellationToken ct)
     {
+        var scope = await CurrentSessionScopeAsync(ct);
+        if (scope is null)
+            return Unauthorized(new { error = "invalid_session" });
         var userId = User.GetUserId();
         if (userId is null)
             return Unauthorized(new { error = "not_authenticated" });
@@ -815,20 +896,29 @@ public class AuthController : ControllerBase
 
         user.MfaEnabled = true;
         user.MfaMethod = method;
+        var liveTokens = await _db.RefreshTokens.Where(t => t.UserId == user.Id && t.RevokedAt == null).ToListAsync(ct);
+        foreach (var token in liveTokens)
+            token.RevokedAt = DateTimeOffset.UtcNow;
 
         await AuthAudit.LogAsync(_db, HttpContext, AuthEvent.MfaEnabled, "success",
             user.Id, User.GetTenantId(), user.Email, method, ct);
 
         // A fresh session so the mfa_enabled claim is current. Keep the selected clinic.
         return await IssueSessionAsync(user, ct,
-            User.GetTenantId(), User.GetClinicId(), CurrentTokenRole() ?? user.Role);
+            scope.TenantId, scope.ClinicId, scope.Role);
     }
 
     [HttpPost("mfa/disable")]
     [Authorize]
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> DisableMfa([FromBody] MfaDisableRequest request, CancellationToken ct)
+        => await SessionMutation.RunAsync(_db, User.GetUserId() ?? Guid.Empty, () => DisableMfaLockedAsync(request, ct), ct);
+
+    private async Task<IActionResult> DisableMfaLockedAsync(MfaDisableRequest request, CancellationToken ct)
     {
+        var scope = await CurrentSessionScopeAsync(ct);
+        if (scope is null)
+            return Unauthorized(new { error = "invalid_session" });
         var userId = User.GetUserId();
         if (userId is null)
             return Unauthorized(new { error = "not_authenticated" });
@@ -843,7 +933,10 @@ public class AuthController : ControllerBase
         // Mandatory for money/clinical/platform roles; self-service disable would defeat it.
         // Check the scoped role as well as the account's primary role: a multi-clinic user
         // must not be able to strip MFA from a nurse-scoped session.
-        if (MfaGateOn && (MfaPolicy.RequiresEnrolment(user.Role) || MfaPolicy.RequiresEnrolment(CurrentTokenRole() ?? user.Role)))
+        var membershipRoles = await _db.TenantMemberships.Where(m => m.UserId == user.Id && m.Status == "active")
+            .Select(m => m.Role).ToListAsync(ct);
+        if (MfaGateOn && (MfaPolicy.RequiresEnrolment(user.Role) || MfaPolicy.RequiresEnrolment(scope.Role)
+            || membershipRoles.Any(MfaPolicy.RequiresEnrolment)))
             return BadRequest(new
             {
                 error = "mfa_required_for_role",
@@ -877,7 +970,8 @@ public class AuthController : ControllerBase
             return Unauthorized(new { error = "invalid_challenge" });
 
         var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user is null || !user.MfaEnabled || NormalizeMethod(user.MfaMethod) != "email")
+        if (user is null || !user.MfaEnabled || NormalizeMethod(user.MfaMethod) != "email"
+            || !ChallengeMatches(request.ChallengeToken, user))
             return Unauthorized(new { error = "invalid_challenge" });
 
         if (!await SendEmailCodeAsync(user, ct))
@@ -896,8 +990,14 @@ public class AuthController : ControllerBase
         if (userId is null)
             return Unauthorized(new { error = "invalid_challenge" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user is null || !user.MfaEnabled)
+        return await SessionMutation.RunAsync(_db, userId.Value, () => VerifyMfaLockedAsync(userId.Value, request, ct), ct);
+    }
+
+    private async Task<IActionResult> VerifyMfaLockedAsync(Guid userId, MfaVerifyRequest request, CancellationToken ct)
+    {
+        var user = await _db.Users.FindAsync([userId], ct);
+        if (user is null || !user.MfaEnabled || ReadMfaChallenge(request.ChallengeToken) != userId
+            || !ChallengeMatches(request.ChallengeToken, user))
             return Unauthorized(new { error = "invalid_challenge" });
 
         if (user.LockedUntil.HasValue && user.LockedUntil.Value > DateTimeOffset.UtcNow)
@@ -954,7 +1054,14 @@ public class AuthController : ControllerBase
     }
 
     private string CreateMfaChallenge(User user) =>
-        _secretProtector.Protect($"mfa|{user.Id}|{DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds()}");
+        _secretProtector.Protect($"mfa|{user.Id}|{DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds()}|{CredentialVersion(user)}");
+
+    private static string CredentialVersion(User user) =>
+        $"{user.PasswordHash}|{user.MfaSecret}|{user.MfaEnabled}".HashToken();
+
+    private bool ChallengeMatches(string? challenge, User user) =>
+        _secretProtector.Unprotect(challenge)?.Split('|') is { Length: 4 } parts
+        && parts[3] == CredentialVersion(user);
 
     private Guid? ReadMfaChallenge(string? challengeToken)
     {
@@ -966,7 +1073,7 @@ public class AuthController : ControllerBase
             return null;
 
         var parts = raw.Split('|');
-        if (parts.Length != 3 || parts[0] != "mfa")
+        if (parts.Length != 4 || parts[0] != "mfa")
             return null;
 
         if (!long.TryParse(parts[2], out var expiresAt) ||
@@ -979,7 +1086,7 @@ public class AuthController : ControllerBase
     }
 
     private string CreateTenantSelectionChallenge(User user) =>
-        _secretProtector.Protect($"tsel|{user.Id}|{DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds()}");
+        _secretProtector.Protect($"tsel|{user.Id}|{DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds()}|{CredentialVersion(user)}");
 
     private Guid? ReadTenantSelectionChallenge(string? selectionToken)
     {
@@ -991,7 +1098,7 @@ public class AuthController : ControllerBase
             return null;
 
         var parts = raw.Split('|');
-        if (parts.Length != 3 || parts[0] != "tsel")
+        if (parts.Length != 4 || parts[0] != "tsel")
             return null;
 
         if (!long.TryParse(parts[2], out var expiresAt) ||

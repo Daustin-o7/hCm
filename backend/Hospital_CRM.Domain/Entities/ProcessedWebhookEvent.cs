@@ -2,7 +2,7 @@ namespace Hospital_CRM.Domain.Entities;
 
 /// <summary>
 /// B2: one row per accepted PSP webhook. Doubles as the dedupe key
-/// (unique provider + event id) and as the "needs review" queue when no open
+/// (unique tenant + provider + event id) and as the "needs review" queue when no open
 /// invoice could be matched — a payment is never silently dropped.
 /// </summary>
 public class ProcessedWebhookEvent : ITenantScoped

@@ -88,7 +88,7 @@ export default function Intake() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
             </svg>
           </div>
-          <h2 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'Outfit, sans-serif' }}>
+          <h2 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'var(--font-heading)' }}>
             {phase === 'already' ? 'Already submitted' : 'All set — thank you!'}
           </h2>
           <p className="text-sm text-slate-600">
@@ -106,7 +106,7 @@ export default function Intake() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86a2 2 0 001.74-3L13.74 4a2 2 0 00-3.48 0L3.34 16a2 2 0 001.73 3z" />
             </svg>
           </div>
-          <h2 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'Outfit, sans-serif' }}>
+          <h2 className="text-lg font-bold text-slate-800" style={{ fontFamily: 'var(--font-heading)' }}>
             {phase === 'expired' ? 'Link expired' : 'Link not valid'}
           </h2>
           <p className="text-sm text-slate-600">

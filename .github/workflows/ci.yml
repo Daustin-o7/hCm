@@ -45,6 +45,20 @@ jobs:
   backend-ci:
     name: Backend CI (.NET 10)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: part2_tenant_boundary_${{ github.run_id }}_${{ github.run_attempt }}
+          # Synthetic GitHub-hosted fixture only; the app_user test opens without a password.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55439:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PART2_BOUNDARY_TEST_OWNER: Host=127.0.0.1;Port=55439;Database=part2_tenant_boundary_${{ github.run_id }}_${{ github.run_attempt }};Username=postgres
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -54,6 +68,9 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Install prescription renderer native dependency
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1
+
       - name: Restore dependencies
         run: |
           dotnet restore backend/Hospital_CRM.Api/Hospital_CRM.Api.csproj
@@ -61,8 +78,17 @@ jobs:
 
       - name: Vulnerable Package Audit
         run: |
-          dotnet list backend/Hospital_CRM.Api/Hospital_CRM.Api.csproj package --vulnerable
-          dotnet list backend/Hospital_CRM.Infrastructure/Hospital_CRM.Infrastructure.csproj package --vulnerable
+          dotnet list backend/Hospital_CRM.Api/Hospital_CRM.Api.csproj package --vulnerable --include-transitive --format json > backend-audit.json
+          python3 - <<'PY'
+          import json
+          report = json.load(open('backend-audit.json'))
+          findings = [v for p in report['projects'] for f in p.get('frameworks', []) for kind in ('topLevelPackages', 'transitivePackages') for package in f.get(kind, []) for v in package.get('vulnerabilities', [])]
+          assert not findings, 'Backend dependency advisory findings require remediation or release review.'
+          PY
+
+      - name: Recovery script safety checks (synthetic files only)
+        shell: pwsh
+        run: ./scripts/test-recovery-safety.ps1 -ArtifactsPath $env:RUNNER_TEMP
 
       - name: Code Formatting Check (dotnet format)
         run: dotnet format backend/Hospital_CRM.Api/Hospital_CRM.Api.csproj --verify-no-changes
@@ -72,8 +98,42 @@ jobs:
           dotnet build backend/Hospital_CRM.Api/Hospital_CRM.Api.csproj -c Release --no-restore
           dotnet build tests/Hospital_CRM.Tests/Hospital_CRM.Tests.csproj -c Release --no-restore
 
+      - name: Provision roles in this job's disposable PostgreSQL fixture
+        run: >-
+          docker exec ${{ job.services.postgres.id }} psql -X -U postgres -d postgres -v ON_ERROR_STOP=1
+          -c "CREATE ROLE app_user LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; CREATE ROLE public_token_router NOLOGIN NOSUPERUSER NOBYPASSRLS;"
+
       - name: Run Automated Test Suite
-        run: dotnet test tests/Hospital_CRM.Tests/Hospital_CRM.Tests.csproj -c Release --no-build --verbosity normal
+        run: dotnet test tests/Hospital_CRM.Tests/Hospital_CRM.Tests.csproj -c Release --no-build --verbosity normal --logger trx --results-directory test-results
+
+      - name: Require executed PostgreSQL boundary tests and record exact counts
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, xml.etree.ElementTree as ET
+          documents = [ET.parse(path) for path in glob.glob('test-results/*.trx')]
+          ns = {'t': 'http://microsoft.com/schemas/VisualStudio/TeamTest/2010'}
+          results = [r.attrib for doc in documents for r in doc.findall('.//t:UnitTestResult', ns)]
+          boundary = [r for r in results if 'Part2TenantBoundaryPostgresTests.' in r['testName']]
+          counts = {outcome: sum(r['outcome'] == outcome for r in results) for outcome in sorted({r['outcome'] for r in results})}
+          summary = {'outcomes': counts, 'postgresBoundaryResults': len(boundary), 'postgresBoundaryExecuted': sum(r['outcome'] in ('Passed', 'Failed') for r in boundary)}
+          os.makedirs('test-results', exist_ok=True)
+          open('test-results/counts.json', 'w').write(json.dumps(summary, indent=2))
+          print(json.dumps(summary))
+          assert boundary and all(r['outcome'] == 'Passed' for r in boundary), 'Real app_user PostgreSQL tests must execute and pass.'
+          PY
+
+      - name: Upload backend test counts and audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-checks
+          path: |
+            test-results/*.trx
+            test-results/counts.json
+            backend-audit.json
+            ${{ runner.temp }}/part2-recovery-selfcheck.json
+          retention-days: 7
 
   # =========================================================================
   # 3. Frontend CI (React 19 + TypeScript: Lint & Build)
@@ -98,6 +158,12 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Dependency high/critical gate
+        run: npm audit --audit-level=high
+
+      - name: Disposable target policy self-check
+        run: node ../scripts/check-e2e-target.mjs --self-test
+
       - name: Static Code Lint (Oxlint)
         run: npm run lint
 
@@ -113,6 +179,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [backend-ci, frontend-ci]
     timeout-minutes: 30
+    env:
+      COMPOSE_FILE: docker-compose.ci.yml
+      COMPOSE_PROJECT_NAME: hospital-crm-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      E2E_DATABASE: hospital_crm_ci_${{ github.run_id }}_${{ github.run_attempt }}
+      HOSPITAL_CRM_E2E_DISPOSABLE: 'true'
+      E2E_BASE_URL: http://localhost:5173
+      E2E_API_BASE_URL: http://localhost:8080/api/v1
+      VITE_API_BASE_URL: http://localhost:8080/api/v1
     defaults:
       run:
         working-directory: frontend
@@ -123,14 +197,17 @@ jobs:
       - name: Start application stack (Postgres + API + Vite)
         working-directory: .
         run: |
-          cp .env.example .env
           docker compose up -d --build
+
+      - name: Verify run-owned containers before health/login/mutation
+        working-directory: .
+        run: node scripts/check-e2e-target.mjs
 
       - name: Wait for API and frontend health
         working-directory: .
         run: |
           for attempt in $(seq 1 60); do
-            if curl -fsS http://localhost:8080/health >/dev/null \
+            if curl -fsS http://localhost:8080/health/ready >/dev/null \
                && curl -fsS http://localhost:5173 >/dev/null; then
               echo "Stack is healthy."
               exit 0
@@ -138,7 +215,7 @@ jobs:
             sleep 5
           done
           echo "ERROR: the stack did not become healthy within 300s." >&2
-          docker compose logs --no-color | tail -n 200
+          docker compose ps
           exit 1
 
       - name: Setup Node.js 22
@@ -159,10 +236,10 @@ jobs:
         env:
           CI: true
 
-      - name: Dump stack logs on failure
+      - name: Show sanitized container status on failure
         if: failure()
         working-directory: .
-        run: docker compose logs --no-color | tail -n 300
+        run: docker compose ps
 
       - name: Upload Playwright Report
         uses: actions/upload-artifact@v4

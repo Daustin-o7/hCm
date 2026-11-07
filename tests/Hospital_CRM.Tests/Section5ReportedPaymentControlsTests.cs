@@ -21,7 +21,7 @@ public class Section5ReportedPaymentControlsTests
             .UseInMemoryDatabase(databaseName: dbName ?? Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static PaymentsController CreateController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "Receptionist")
@@ -178,6 +178,8 @@ public class Section5ReportedPaymentControlsTests
         var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var receptionistId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId, Name = "City Clinic" });
 
         // Seed Primary payee account with DailyLimit = ₹5,000
         var primaryAccount = new PayeeAccount
@@ -187,6 +189,7 @@ public class Section5ReportedPaymentControlsTests
             PriorityOrder = 1,
             Vpa = "primary@okhdfcbank",
             AccountHolderName = "City Clinic Primary",
+            ClinicId = clinicId,
             DailyLimit = 5000m,
             IsActive = true
         };
@@ -199,6 +202,7 @@ public class Section5ReportedPaymentControlsTests
             PriorityOrder = 2,
             Vpa = "backup@okaxisbank",
             AccountHolderName = "City Clinic Backup",
+            ClinicId = clinicId,
             DailyLimit = 25000m,
             IsActive = true
         };
@@ -246,6 +250,8 @@ public class Section5ReportedPaymentControlsTests
         var db = CreateInMemoryDb();
         var tenantId = Guid.NewGuid();
         var receptionistId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId, Name = "City Clinic" });
 
         // Seed primary with limit ₹1,000 already consumed
         var primaryAccount = new PayeeAccount
@@ -255,6 +261,7 @@ public class Section5ReportedPaymentControlsTests
             PriorityOrder = 1,
             Vpa = "primary@okhdfcbank",
             DailyLimit = 1000m,
+            ClinicId = clinicId,
             IsActive = true
         };
         db.PayeeAccounts.Add(primaryAccount);

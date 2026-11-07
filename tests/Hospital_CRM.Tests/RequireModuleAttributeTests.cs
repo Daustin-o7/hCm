@@ -24,7 +24,7 @@ public class RequireModuleAttributeTests
             .UseInMemoryDatabase($"ModuleGate_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        var db = new HospitalCrmDbContext(options);
+        var db = new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
 
         var tenantId = Guid.NewGuid();
         db.Tenants.Add(new Tenant

@@ -48,7 +48,7 @@ public class SubscriptionEnforcementTests
             .UseInMemoryDatabase(databaseName: $"SubEnforceDb_{Guid.NewGuid()}")
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static HttpContext CreateHttpContext(

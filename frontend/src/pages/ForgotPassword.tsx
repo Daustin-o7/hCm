@@ -8,7 +8,6 @@ export default function ForgotPassword() {
   const [email, setEmail] = useState('')
   const [sending, setSending] = useState(false)
   const [sent, setSent] = useState(false)
-  const [devToken, setDevToken] = useState<string | null>(null)
   const [error, setError] = useState('')
 
   const submit = async (e: React.FormEvent) => {
@@ -17,10 +16,8 @@ export default function ForgotPassword() {
     setError('')
     setSending(true)
     try {
-      const res = await api.post('/auth/request-password-reset', { email: email.trim() })
+      await api.post('/auth/request-password-reset', { email: email.trim() })
       setSent(true)
-      // Backend returns the raw token until email delivery is wired (local dev)
-      setDevToken(res.data?.resetToken ?? null)
     } catch (err) {
       setError(friendlyError(err))
     } finally {
@@ -31,47 +28,37 @@ export default function ForgotPassword() {
   return (
     <PublicPage
       title="Forgot your password?"
-      subtitle="We'll issue a reset link for your account email."
+      subtitle="Request a reset link for your account email."
     >
           {sent ? (
-            <div className="space-y-4 text-center">
+            <div className="space-y-4 text-center" role="status">
               <div className="w-14 h-14 mx-auto rounded-full bg-teal-50 border border-teal-200 flex items-center justify-center">
                 <svg className="w-7 h-7 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                 </svg>
               </div>
               <p className="text-sm text-slate-700">
-                If an account exists for <strong>{email}</strong>, a reset link has been issued.
-                It expires in 1 hour.
+                If an account exists for <strong>{email}</strong>, we'll email a reset link.
+                The link expires 30 minutes after this request.
               </p>
-              {devToken && (
-                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-left">
-                  <div className="text-[11px] font-bold uppercase tracking-wide text-amber-700">
-                    Local development
-                  </div>
-                  <div className="text-xs text-amber-800 mt-1">
-                    Email delivery isn't configured, so your reset token is shown here.
-                  </div>
-                  <Link
-                    to={`/reset-password?token=${encodeURIComponent(devToken)}`}
-                    className="btn btn-primary btn-sm w-full justify-center mt-2 cursor-pointer"
-                  >
-                    Continue to reset password
-                  </Link>
-                </div>
-              )}
+              <p className="text-sm text-[var(--color-text-muted)]">
+                Check your spam folder. If the email does not arrive, contact your clinic administrator
+                or request another link after a few minutes.
+              </p>
+              <button type="button" className="btn btn-secondary w-full" onClick={() => setSent(false)}>Request another link</button>
               <Link to="/login" className="text-sm text-teal-700 font-semibold hover:underline">
                 Back to sign in
               </Link>
             </div>
           ) : (
             <form onSubmit={submit} className="space-y-4">
-              {error && <div className="alert alert-error">{error}</div>}
+              {error && <div className="alert alert-error" role="alert">{error}</div>}
               <div>
                 <label className="form-label" htmlFor="fp-email">Account email</label>
                 <input
                   id="fp-email"
                   type="email"
+                  autoComplete="email"
                   required
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}

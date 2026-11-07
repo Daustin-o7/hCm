@@ -1,6 +1,5 @@
 using System.ComponentModel.DataAnnotations;
 using System.Data;
-using System.Security.Cryptography;
 using System.Text;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
@@ -8,6 +7,7 @@ using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
+using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Domain.Utils;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
@@ -23,227 +23,138 @@ public class InvoicesController : ControllerBase
     private readonly HospitalCrmDbContext _db;
     private readonly IConfiguration _config;
     private readonly RazorpayOrderClient _razorpay;
+    private readonly ITenantContext? _tenantContext;
 
-    public InvoicesController(HospitalCrmDbContext db, IConfiguration config, RazorpayOrderClient razorpay)
+    public InvoicesController(HospitalCrmDbContext db, IConfiguration config, RazorpayOrderClient razorpay,
+        ITenantContext? tenantContext = null)
     {
         _db = db;
         _config = config;
         _razorpay = razorpay;
+        _tenantContext = tenantContext;
     }
 
     private Guid TenantId => User.GetTenantId() ?? Guid.Empty;
 
-    /// <summary>
-    /// Finalize postings must balance: Total = Subtotal + GST - invoice discount.
-    /// The discount is a contra-revenue debit, so debits (AR + discount) equal credits.
-    /// </summary>
-    private void PostFinalizeLedger(Invoice invoice, string invoiceRef)
+    private Task<TenantMembership?> SelectedBillingMembershipAsync(CancellationToken ct)
     {
         var userId = User.GetUserId();
-        var now = DateTimeOffset.UtcNow;
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        if (userId is null || tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty
+            || !Enum.TryParse<UserRole>(User.GetUserRole(), true, out var role)
+            || role is not (UserRole.Receptionist or UserRole.Doctor or UserRole.ClinicAdmin or UserRole.Pharmacist))
+            return Task.FromResult<TenantMembership?>(null);
+        return _db.TenantMemberships.AsNoTracking().SingleOrDefaultAsync(m =>
+            m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active" && m.Role == role
+            && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
+    }
 
-        _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
+    private async Task<int> NextPrintCopyAsync(Invoice invoice, CancellationToken ct) =>
+        Math.Max(invoice.PrintCount, await _db.InvoicePrintLogs.Where(l => l.InvoiceId == invoice.Id && l.TenantId == invoice.TenantId)
+            .MaxAsync(l => (int?)l.CopyNumber, ct) ?? 0) + 1;
+
+    private void RecordPrint(Invoice invoice, int copyNumber)
+    {
+        invoice.PrintCount = copyNumber;
+        invoice.LastPrintedAt = DateTimeOffset.UtcNow;
+        invoice.UpdatedAt = invoice.LastPrintedAt > invoice.UpdatedAt ? invoice.LastPrintedAt.Value : invoice.UpdatedAt.AddTicks(10);
+        _db.InvoicePrintLogs.Add(new InvoicePrintLog
         {
             Id = Guid.NewGuid(),
             TenantId = invoice.TenantId,
-            EntryType = FinanceEntryType.InvoiceFinalized,
-            ReferenceType = "Invoice",
-            ReferenceId = invoice.Id,
-            ReferenceNumber = invoiceRef,
-            AccountCategory = "AccountsReceivable",
-            DebitAmount = invoice.Total,
-            Narration = $"Finalized invoice {invoiceRef}",
-            PostedByUserId = userId,
-            CreatedAt = now
+            InvoiceId = invoice.Id,
+            PrintedByUserId = User.GetUserId()!.Value,
+            PrintedAt = invoice.LastPrintedAt.Value,
+            CopyNumber = copyNumber,
+            Watermark = copyNumber > 1 ? "DUPLICATE COPY" : "ORIGINAL",
+            IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
         });
-
-        _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-        {
-            Id = Guid.NewGuid(),
-            TenantId = invoice.TenantId,
-            EntryType = FinanceEntryType.InvoiceFinalized,
-            ReferenceType = "Invoice",
-            ReferenceId = invoice.Id,
-            ReferenceNumber = invoiceRef,
-            AccountCategory = "ConsultationRevenue",
-            CreditAmount = invoice.Subtotal,
-            Narration = $"Revenue recognized from invoice {invoiceRef}",
-            PostedByUserId = userId,
-            CreatedAt = now
-        });
-
-        if (invoice.GstAmount > 0)
-        {
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = invoice.TenantId,
-                EntryType = FinanceEntryType.InvoiceFinalized,
-                ReferenceType = "Invoice",
-                ReferenceId = invoice.Id,
-                ReferenceNumber = invoiceRef,
-                AccountCategory = "GstPayable",
-                CreditAmount = invoice.GstAmount,
-                Narration = $"GST payable on invoice {invoiceRef}",
-                PostedByUserId = userId,
-                CreatedAt = now
-            });
-        }
-
-        if (invoice.DiscountAmount > 0)
-        {
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = invoice.TenantId,
-                EntryType = FinanceEntryType.InvoiceFinalized,
-                ReferenceType = "Invoice",
-                ReferenceId = invoice.Id,
-                ReferenceNumber = invoiceRef,
-                AccountCategory = "DiscountAllowed",
-                DebitAmount = invoice.DiscountAmount,
-                Narration = $"Discount on invoice {invoiceRef}: {invoice.DiscountReason}",
-                PostedByUserId = userId,
-                CreatedAt = now
-            });
-        }
     }
 
     [HttpPost("invoices")]
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin")]
     [RequirePermission(Permissions.InvoiceWrite)]
-    public async Task<IActionResult> GenerateInvoice([FromBody] GenerateInvoiceRequest request, CancellationToken ct)
+    public Task<IActionResult> GenerateInvoice([FromBody] GenerateInvoiceRequest request, CancellationToken ct) =>
+        GenerateInvoiceAsync(request, ct);
+
+    internal async Task<IActionResult> GenerateInvoiceAsync(GenerateInvoiceRequest request, CancellationToken ct, Guid? clientId = null)
     {
         var tenantId = TenantId;
 
-        if (request.LineItems is null || request.LineItems.Count == 0)
+        if (request?.LineItems is null || request.LineItems.Count == 0)
             return BadRequest(new { error = "line_items_required" });
-        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        if (request.IdempotencyKey?.Length > 128)
+            return BadRequest(new { error = "invalid_idempotency_key" });
+        await using var transaction = _db.Database.IsRelational() && _db.Database.CurrentTransaction == null
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            var existing = await _db.Invoices
-                .Include(i => i.LineItems)
-                .FirstOrDefaultAsync(i => i.IdempotencyKey == request.IdempotencyKey && i.TenantId == tenantId, ct);
-            if (existing is not null)
-                return Ok(new
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+            {
+                var existing = await _db.Invoices
+                    .Include(i => i.LineItems)
+                    .FirstOrDefaultAsync(i => i.IdempotencyKey == request.IdempotencyKey && i.TenantId == tenantId, ct);
+                if (existing is not null)
                 {
-                    invoiceId = existing.Id,
-                    invoiceNumber = existing.FormatInvoiceNumber(),
-                    subtotal = existing.Subtotal,
-                    gstAmount = existing.GstAmount,
-                    total = existing.Total,
-                    balanceDue = existing.BalanceDue,
-                    status = existing.Status.ToString().ToLower()
-                });
-        }
-
-        var appointment = await _db.Appointments
-            .Include(a => a.Patient)
-            .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == tenantId, ct);
-
-        if (appointment is null)
-            return NotFound(new { error = "appointment_not_found" });
-
-        // Retrieve tenant tax profile (or fallback to Notification 12/2017 healthcare exemption defaults)
-        var taxProfile = await _db.TenantTaxProfiles
-            .FirstOrDefaultAsync(p => p.TenantId == tenantId, ct);
-
-        var defaultTaxCat = taxProfile?.DefaultOpdTaxCategory ?? TaxCategory.Exempt;
-        var defaultHsnSac = taxProfile?.DefaultOpdHsnSac ?? "999312";
-        var defaultGstRate = taxProfile?.DefaultOpdGstRate ?? 0.0m;
-        var docType = taxProfile?.DocumentType ?? InvoiceDocumentType.BillOfSupply;
-
-        decimal calculatedSubtotal = 0m;
-        decimal calculatedGst = 0m;
-
-        var lineItemsToCreate = new List<InvoiceLineItem>();
-
-        foreach (var item in request.LineItems)
-        {
-            if (item.Quantity <= 0)
-                return BadRequest(new { error = "invalid_line_quantity", description = item.Description });
-
-            var qty = item.Quantity;
-            var unitPrice = item.UnitPrice ?? (item.Amount / qty);
-
-            if (unitPrice <= 0)
-                return BadRequest(new { error = "invalid_line_amount", description = item.Description });
-
-            if (item.DiscountAmount < 0 || item.DiscountAmount > qty * unitPrice)
-                return BadRequest(new { error = "invalid_line_discount", description = item.Description });
-
-            var hsnSac = !string.IsNullOrWhiteSpace(item.HsnSacCode) ? item.HsnSacCode.Trim() : defaultHsnSac;
-
-            // Client input may raise tax, never zero-rate a taxable line by claiming exemption.
-            var taxCat = defaultTaxCat;
-            if (!string.IsNullOrWhiteSpace(item.TaxCategory) && Enum.TryParse<TaxCategory>(item.TaxCategory, true, out var parsedCat))
-            {
-                taxCat = parsedCat;
-            }
-
-            decimal lineGstRate;
-            if (taxCat is TaxCategory.Exempt or TaxCategory.Nil)
-            {
-                // Healthcare SAC 9993xx is the only exempt path when the clinic default is taxable.
-                if (defaultTaxCat == TaxCategory.Taxable && !hsnSac.StartsWith("9993", StringComparison.Ordinal))
-                    return BadRequest(new
+                    if (!InvoiceAccounting.InvoiceRequestAgrees(existing, request))
+                        return Conflict(new { error = "idempotency_key_conflict" });
+                    return Ok(new
                     {
-                        error = "tax_category_not_permitted",
-                        description = item.Description,
-                        message = "This clinic is configured for taxable supplies; exempt lines must use a healthcare SAC (9993xx)."
+                        invoiceId = existing.Id,
+                        invoiceNumber = existing.FormatInvoiceNumber(),
+                        subtotal = existing.Subtotal,
+                        gstAmount = existing.GstAmount,
+                        total = existing.Total,
+                        paidAmount = existing.PaidAmount,
+                        balanceDue = existing.BalanceDue,
+                        status = existing.Status.ToString().ToLowerInvariant(),
+                        idempotentReplay = true
                     });
-
-                lineGstRate = 0.0m;
+                }
             }
-            else
-            {
-                lineGstRate = item.GstRate ?? defaultGstRate;
-                if (lineGstRate <= 0)
-                    return BadRequest(new { error = "taxable_line_requires_gst_rate", description = item.Description });
-            }
+            if (clientId.HasValue && await _db.Invoices.AnyAsync(i => i.Id == clientId, ct))
+                return Conflict(new { error = "invoice_id_conflict" });
 
-            var lineBaseAmount = Math.Max(0m, (qty * unitPrice) - item.DiscountAmount);
-            var lineTaxAmount = lineGstRate > 0 ? Math.Round(lineBaseAmount * (lineGstRate / 100.0m), 2) : 0.0m;
-            var lineTotalAmount = lineBaseAmount + lineTaxAmount;
+            var appointment = await _db.Appointments
+                .Include(a => a.Patient)
+                .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == tenantId, ct);
 
-            calculatedSubtotal += lineBaseAmount;
-            calculatedGst += lineTaxAmount;
+            if (appointment is null)
+                return NotFound(new { error = "appointment_not_found" });
 
-            lineItemsToCreate.Add(new InvoiceLineItem
-            {
-                Id = Guid.NewGuid(),
-                Description = item.Description.Trim(),
-                Quantity = qty,
-                UnitPrice = unitPrice,
-                Amount = lineTotalAmount,
-                TaxCategory = taxCat,
-                HsnSacCode = hsnSac,
-                GstRate = lineGstRate,
-                TaxAmount = lineTaxAmount,
-                DiscountAmount = item.DiscountAmount
-            });
-        }
+            // Retrieve tenant tax profile (or fallback to Notification 12/2017 healthcare exemption defaults)
+            var taxProfile = await _db.TenantTaxProfiles
+                .FirstOrDefaultAsync(p => p.TenantId == tenantId, ct);
 
-        var gross = calculatedSubtotal + calculatedGst;
-        if (request.DiscountAmount < 0 || request.DiscountAmount > gross)
-            return BadRequest(new { error = "invalid_discount_amount", message = $"Discount must be between 0 and ₹{gross:F2}." });
+            var docType = taxProfile?.DocumentType ?? InvoiceDocumentType.BillOfSupply;
+            var (lineItemsToCreate, lineError) = InvoiceAccounting.CalculateLines(request.LineItems, taxProfile);
+            if (lineError != null) return BadRequest(lineError);
+            var calculatedSubtotal = lineItemsToCreate.Sum(i => i.Amount - i.TaxAmount);
+            var calculatedGst = lineItemsToCreate.Sum(i => i.TaxAmount);
 
-        if (request.DiscountAmount > 0 && string.IsNullOrWhiteSpace(request.DiscountReason))
-            return BadRequest(new { error = "discount_reason_required" });
+            var gross = calculatedSubtotal + calculatedGst;
+            if (request.DiscountAmount < 0 || request.DiscountAmount > gross || decimal.Round(request.DiscountAmount, 2) != request.DiscountAmount)
+                return BadRequest(new { error = "invalid_discount_amount", message = $"Discount must be between 0 and ₹{gross:F2}." });
 
-        var total = gross - request.DiscountAmount;
+            if (request.DiscountAmount > 0 && string.IsNullOrWhiteSpace(request.DiscountReason))
+                return BadRequest(new { error = "discount_reason_required" });
+            if (request.DiscountReason?.Length > 255 || request.IdempotencyKey?.Length > 128)
+                return BadRequest(new { error = "invalid_invoice_metadata" });
 
-        // A bill containing any taxable supply is a Tax Invoice, never a Bill of Supply.
-        if (calculatedGst > 0)
-            docType = InvoiceDocumentType.TaxInvoice;
+            var total = gross - request.DiscountAmount;
 
-        var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTimeOffset.UtcNow);
+            // A bill containing any taxable supply is a Tax Invoice, never a Bill of Supply.
+            if (calculatedGst > 0)
+                docType = InvoiceDocumentType.TaxInvoice;
 
-        var executionStrategy = _db.Database.CreateExecutionStrategy();
-        return await executionStrategy.ExecuteAsync<IActionResult>(async () =>
-        {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+            var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTimeOffset.UtcNow);
 
             var linkedPharmacyId = request.LinkedPharmacyInvoiceId;
+            if (linkedPharmacyId.HasValue && !await _db.Invoices.AnyAsync(i => i.Id == linkedPharmacyId && i.TenantId == tenantId
+                && i.InvoiceType == InvoiceType.Pharmacy && i.Status != InvoiceStatus.Cancelled
+                && (i.PatientId == appointment.PatientId || i.AppointmentId == appointment.Id), ct))
+                return BadRequest(new { error = "invalid_linked_pharmacy_invoice" });
             if (!linkedPharmacyId.HasValue && request.AppointmentId != Guid.Empty)
             {
                 linkedPharmacyId = await _db.Invoices
@@ -258,7 +169,7 @@ public class InvoicesController : ControllerBase
 
             var invoice = new Invoice
             {
-                Id = Guid.NewGuid(),
+                Id = clientId ?? Guid.NewGuid(),
                 TenantId = appointment.TenantId,
                 AppointmentId = request.AppointmentId,
                 PatientId = appointment.PatientId,
@@ -288,10 +199,10 @@ public class InvoicesController : ControllerBase
                 invoice.InvoiceNumber = maxNumber + 1;
                 invoice.FinalizedAt = DateTimeOffset.UtcNow;
                 invoice.FinalizedByUserId = User.GetUserId();
+                if (invoice.Total == 0) invoice.Status = InvoiceStatus.Paid;
 
                 // Post append-only ledger entries
-                var invoiceRef = invoice.FormatInvoiceNumber();
-                PostFinalizeLedger(invoice, invoiceRef);
+                InvoiceAccounting.PostFinalization(_db, invoice, User.GetUserId());
             }
 
             foreach (var lineItem in lineItemsToCreate)
@@ -302,7 +213,7 @@ public class InvoicesController : ControllerBase
 
             _db.Invoices.Add(invoice);
             await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
 
             var invoiceNumStr = invoice.InvoiceNumber > 0
                 ? invoice.FormatInvoiceNumber()
@@ -321,7 +232,14 @@ public class InvoicesController : ControllerBase
                 balanceDue = invoice.BalanceDue,
                 status = invoice.Status.ToString().ToLower()
             });
-        });
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex)
+            || ex is DbUpdateException update && (InvoiceAccounting.IsIdempotencyConflict(update) || InvoiceAccounting.IsNumberingConflict(update)))
+        {
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "invoice_changed_concurrently", message = "Retry with the same invoice key." });
+        }
     }
 
     [HttpPost("invoices/{id:guid}/finalize")]
@@ -330,25 +248,22 @@ public class InvoicesController : ControllerBase
     public async Task<IActionResult> FinalizeInvoice(Guid id, CancellationToken ct)
     {
         var tenantId = TenantId;
-        var invoice = await _db.Invoices
-            .Include(i => i.LineItems)
-            .Include(i => i.Appointment).ThenInclude(a => a!.Patient)
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
-
-        if (invoice == null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        if (invoice.Status is InvoiceStatus.Finalized or InvoiceStatus.Paid or InvoiceStatus.Issued
-            or InvoiceStatus.Cancelled or InvoiceStatus.Refunded)
-            return BadRequest(new { error = "invoice_already_finalized" });
-
-        var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTimeOffset.UtcNow);
-        var strategy = _db.Database.CreateExecutionStrategy();
-
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
+        await using var transaction = _db.Database.IsRelational() && _db.Database.CurrentTransaction == null
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+            var invoice = await _db.Invoices
+                .Include(i => i.LineItems)
+                .Include(i => i.Appointment).ThenInclude(a => a!.Patient)
+                .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
 
+            if (invoice == null)
+                return NotFound(new { error = "invoice_not_found" });
+
+            if (invoice.Status != InvoiceStatus.Draft)
+                return BadRequest(new { error = "invoice_already_finalized" });
+
+            var currentFy = IndianFinancialYearUtils.GetFinancialYear(DateTimeOffset.UtcNow);
             var maxNumber = await _db.Invoices
                 .Where(i => i.TenantId == tenantId && i.FinancialYear == currentFy && i.Series == invoice.Series)
                 .MaxAsync(i => (int?)i.InvoiceNumber, ct) ?? 0;
@@ -359,70 +274,72 @@ public class InvoicesController : ControllerBase
             invoice.FinalizedAt = DateTimeOffset.UtcNow;
             invoice.FinalizedByUserId = User.GetUserId();
             invoice.RecalculateBalance();
+            if (invoice.BalanceDue == 0) invoice.Status = InvoiceStatus.Paid;
             invoice.UpdatedAt = DateTimeOffset.UtcNow;
 
             var invoiceRef = invoice.FormatInvoiceNumber();
 
             // Append-only financial ledger entries
-            PostFinalizeLedger(invoice, invoiceRef);
+            InvoiceAccounting.PostFinalization(_db, invoice, User.GetUserId());
 
             await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
 
             return Ok(new
             {
                 invoiceId = invoice.Id,
                 invoiceNumber = invoiceRef,
-                status = "finalized",
+                status = invoice.Status.ToString().ToLowerInvariant(),
                 total = invoice.Total,
                 balanceDue = invoice.BalanceDue,
                 finalizedAt = invoice.FinalizedAt
             });
-        });
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex)
+            || ex is DbUpdateException update && InvoiceAccounting.IsNumberingConflict(update))
+        {
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "invoice_changed_concurrently", message = "Reload the invoice before retrying finalization." });
+        }
     }
 
     [HttpGet("invoices/{id:guid}/print")]
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin")]
     public async Task<IActionResult> PrintInvoice(Guid id, CancellationToken ct)
     {
-        var tenantId = TenantId;
+        var selected = await SelectedBillingMembershipAsync(ct);
+        if (selected is null) return Forbid();
+        var tenantId = selected.TenantId;
         var invoice = await _db.Invoices
             .Include(i => i.LineItems)
             .Include(i => i.Payments)
             .Include(i => i.Appointment).ThenInclude(a => a!.Patient)
             .Include(i => i.Appointment).ThenInclude(a => a!.Doctor)
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
+            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId
+                && (i.AppointmentId == null || i.Appointment != null && i.Appointment.TenantId == tenantId && i.Appointment.ClinicId == selected.ClinicId), ct);
 
         if (invoice == null)
             return NotFound(new { error = "invoice_not_found" });
 
+        if (selected.Role == UserRole.Pharmacist && invoice.InvoiceType != InvoiceType.Pharmacy) return Forbid();
+
         if (invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled)
             return BadRequest(new { error = "invoice_not_finalized", message = "Finalize the invoice before printing a receipt." });
 
-        var clinicId = invoice.Appointment?.ClinicId;
-        var clinic = clinicId.HasValue
-            ? await _db.Clinics.FirstOrDefaultAsync(c => c.Id == clinicId.Value, ct)
-            : await _db.Clinics.FirstOrDefaultAsync(ct);
-        var currentUserId = User.GetUserId() ?? Guid.Empty;
-
-        invoice.PrintCount++;
-        invoice.LastPrintedAt = DateTimeOffset.UtcNow;
+        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.Id == selected.ClinicId && c.TenantId == tenantId, ct);
+        RecordPrint(invoice, await NextPrintCopyAsync(invoice, ct));
         var watermark = invoice.PrintCount > 1 ? "DUPLICATE COPY" : "ORIGINAL";
 
-        // Audit print event in append-only table
-        _db.InvoicePrintLogs.Add(new InvoicePrintLog
+        try
         {
-            Id = Guid.NewGuid(),
-            TenantId = tenantId,
-            InvoiceId = invoice.Id,
-            PrintedByUserId = currentUserId,
-            PrintedAt = DateTimeOffset.UtcNow,
-            CopyNumber = invoice.PrintCount,
-            Watermark = watermark,
-            IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
-        });
-
-        await _db.SaveChangesAsync(ct);
+            await _db.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "invoice_changed_concurrently", message = "Retry printing after reloading the invoice." });
+        }
 
         var invoiceRef = invoice.FormatInvoiceNumber();
 
@@ -459,9 +376,10 @@ public class InvoicesController : ControllerBase
                 taxCategory = li.TaxCategory.ToString(),
                 hsnSacCode = li.HsnSacCode,
                 gstRate = li.GstRate,
-                taxAmount = li.TaxAmount,
+                taxAmount = li.ResolvedTaxAmount(),
                 discountAmount = li.DiscountAmount,
-                totalAmount = li.Amount
+                taxableAmount = li.TaxableAmount(invoice.InvoiceType),
+                totalAmount = li.GrossAmount(invoice.InvoiceType)
             }),
             subtotal = invoice.Subtotal,
             gstAmount = invoice.GstAmount,
@@ -748,202 +666,128 @@ public class InvoicesController : ControllerBase
     [HttpPost("invoices/{id:guid}/refund")]
     [AuthorizeRoles("ClinicAdmin", "Receptionist")]
     [RequirePermission(Permissions.PaymentRecord)]
-    public async Task<IActionResult> ProcessRefund(Guid id, [FromBody] CreateRefundRequest req, CancellationToken ct)
+    public Task<IActionResult> ProcessRefund(Guid id, [FromBody] CreateRefundRequest req, CancellationToken ct) =>
+        ProcessRefundAsync(id, req, false, ct);
+
+    internal Task<IActionResult> ProcessPharmacyReturnAsync(Guid id, ReturnRequest req, CancellationToken ct) =>
+        ProcessRefundAsync(id, new(0m, PaymentMethod.Cash, req.RefundReference, req.Reason ?? "", req.IdempotencyKey, req.SourcePaymentId), true, ct);
+
+    private async Task<IActionResult> ProcessRefundAsync(Guid id, CreateRefundRequest req, bool pharmacyReturn, CancellationToken ct)
     {
         var tenantId = TenantId;
-        var currentUserId = User.GetUserId() ?? Guid.Empty;
+        if (tenantId == Guid.Empty || User.GetUserId() is not { } userId || userId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_token" });
+        if (req == null || string.IsNullOrWhiteSpace(req.IdempotencyKey) || req.IdempotencyKey.Length > 128)
+            return BadRequest(new { error = "refund_key_required", message = "Use one stable key of at most 128 characters for this refund and all its retries." });
+        if (string.IsNullOrWhiteSpace(req.Reason) || req.Reason.Trim().Length > 500)
+            return BadRequest(new { error = "refund_reason_required" });
+        if (req.RefundReference?.Length > 100)
+            return BadRequest(new { error = "invalid_refund_reference" });
+        req = req with { Reason = req.Reason.Trim(), RefundReference = string.IsNullOrWhiteSpace(req.RefundReference) ? null : req.RefundReference.Trim() };
 
-        if (req.Amount <= 0)
-            return BadRequest(new { error = "invalid_refund_amount", message = "Refund amount must be greater than zero." });
-
-        if (string.IsNullOrWhiteSpace(req.RefundReference))
-            return BadRequest(new { error = "refund_reference_required", message = "A valid refund reference (UTR, payment gateway refund ID, or voucher reference) is mandatory." });
-
-        if (string.IsNullOrWhiteSpace(req.Reason))
-            return BadRequest(new { error = "refund_reason_required", message = "Reason for refund is mandatory." });
-
-        var invoice = await _db.Invoices
-            .Include(i => i.Payments)
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
-
-        if (invoice == null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        if (invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled)
-            return BadRequest(new { error = "invoice_not_refundable", message = "Refunds cannot be issued against a draft or cancelled invoice." });
-
-        // Idempotency check
-        if (!string.IsNullOrWhiteSpace(req.IdempotencyKey))
+        Guid refundId;
+        var created = false;
+        await using (var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null)
         {
-            var existingRefund = await _db.Payments
-                .FirstOrDefaultAsync(p => p.InvoiceId == id && p.IdempotencyKey == req.IdempotencyKey, ct);
-            if (existingRefund != null)
+            try
             {
-                return Ok(new
+                var invoice = await _db.Invoices.Include(i => i.Payments).Include(i => i.LineItems)
+                    .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
+                if (invoice == null) return NotFound(new { error = "invoice_not_found" });
+                await _db.Entry(invoice).ReloadAsync(ct);
+                var payments = await _db.Payments.AsNoTracking().Where(p => p.InvoiceId == id && p.TenantId == tenantId).ToListAsync(ct);
+                var existing = await _db.Payments.FirstOrDefaultAsync(p => p.TenantId == tenantId && p.IdempotencyKey == req.IdempotencyKey, ct);
+                if (pharmacyReturn)
                 {
-                    refundId = existingRefund.Id,
-                    amount = Math.Abs(existingRefund.Amount),
-                    method = existingRefund.Method.ToString(),
-                    refundReference = existingRefund.RefundReference,
-                    status = existingRefund.Status.ToString().ToLower(),
-                    verificationStatus = existingRefund.VerificationStatus.ToString().ToLower(),
-                    message = "idempotent_duplicate"
-                });
+                    if (invoice.InvoiceType != InvoiceType.Pharmacy) return BadRequest(new { error = "not_a_pharmacy_invoice" });
+                    var methods = payments.Where(IsCollectedPayment).Select(p => p.Method).Distinct().ToList();
+                    var source = payments.FirstOrDefault(p => p.Id == req.SourcePaymentId && IsCollectedPayment(p));
+                    if (existing?.IsPharmacyReturn == true) req = req with { Amount = -existing.Amount, Method = existing.Method };
+                    else if (req.SourcePaymentId.HasValue && source == null) return BadRequest(new { error = "invalid_refund_source" });
+                    else if (source == null && methods.Count != 1) return BadRequest(new { error = "refund_source_required" });
+                    else req = req with { Amount = invoice.Total, Method = source?.Method ?? methods[0] };
+                }
+                if (req.Amount is <= 0 or > 1000000m || decimal.Round(req.Amount, 2) != req.Amount)
+                    return BadRequest(new { error = "invalid_refund_amount" });
+                if (req.Method is not (PaymentMethod.Cash or PaymentMethod.UPI or PaymentMethod.Card or PaymentMethod.NetBanking or PaymentMethod.Razorpay))
+                    return BadRequest(new { error = "invalid_refund_method" });
+                if (req.Method == PaymentMethod.Razorpay && req.RefundReference != null)
+                    return BadRequest(new { error = "provider_refund_reference_is_server_assigned" });
+                if (req.Method != PaymentMethod.Razorpay && req.RefundReference == null)
+                    return BadRequest(new { error = "refund_reference_required", message = "Record the actual payout UTR or cash voucher, not a generated payment identifier." });
+                if (existing != null)
+                {
+                    if (existing.InvoiceId != id || existing.Amount != -req.Amount || existing.Method != req.Method
+                        || existing.IsPharmacyReturn != pharmacyReturn || existing.RefundReason != req.Reason
+                        || req.Method != PaymentMethod.Razorpay && existing.RefundReference != req.RefundReference
+                        || req.SourcePaymentId.HasValue && existing.RefundSourcePaymentId != req.SourcePaymentId)
+                        return Conflict(new { error = "refund_key_conflict" });
+                    refundId = existing.Id;
+                }
+                else
+                {
+                    if (invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled or InvoiceStatus.Refunded)
+                        return BadRequest(new { error = "invoice_not_refundable" });
+                    if (pharmacyReturn && (invoice.Status != InvoiceStatus.Paid || invoice.PaidAmount != invoice.Total))
+                        return BadRequest(new { error = "invoice_not_paid", message = "A full pharmacy return requires a fully collected invoice." });
+                    if (req.Amount > RefundableBalance(invoice, payments, null, true))
+                        return BadRequest(new { error = "refund_exceeds_paid_balance" });
+                    Payment? source = null;
+                    if (req.SourcePaymentId.HasValue)
+                        source = payments.FirstOrDefault(p => p.Id == req.SourcePaymentId && IsCollectedPayment(p));
+                    else if (req.Method == PaymentMethod.Razorpay)
+                    {
+                        var candidates = payments.Where(p => IsCollectedPayment(p) && p.Method == PaymentMethod.Razorpay
+                            && !string.IsNullOrWhiteSpace(p.RazorpayPaymentId) && SourceRefundableBalance(payments, p, null, true) >= req.Amount).ToList();
+                        if (candidates.Count != 1) return BadRequest(new { error = "captured_refund_source_required" });
+                        source = candidates[0];
+                    }
+                    if (req.SourcePaymentId.HasValue && source == null || source != null && SourceRefundableBalance(payments, source, null, true) < req.Amount)
+                        return BadRequest(new { error = "invalid_or_exhausted_refund_source" });
+                    if (req.Method == PaymentMethod.Razorpay && (source?.Method != PaymentMethod.Razorpay || string.IsNullOrWhiteSpace(source.RazorpayPaymentId)))
+                        return BadRequest(new { error = "captured_refund_source_required" });
+                    if (req.Method == PaymentMethod.Razorpay && !_razorpay.IsConfigured)
+                        return StatusCode(503, new { error = "razorpay_not_configured" });
+                    if (pharmacyReturn && await ValidateReturnStockAsync(invoice, ct) is { } stockError)
+                        return BadRequest(new { error = stockError.Error, message = stockError.Message });
+                    var threshold = await _db.TenantTaxProfiles.Where(p => p.TenantId == tenantId)
+                        .Select(p => (decimal?)p.ThresholdRefundApproval).FirstOrDefaultAsync(ct) ?? 1000m;
+                    var refund = new Payment
+                    {
+                        Id = Guid.NewGuid(),
+                        TenantId = tenantId,
+                        InvoiceId = id,
+                        Amount = -req.Amount,
+                        Method = req.Method,
+                        Status = PaymentStatus.Pending,
+                        VerificationStatus = req.Amount > threshold ? PaymentVerificationStatus.Pending : PaymentVerificationStatus.Confirmed,
+                        ConfirmedByUserId = userId,
+                        RefundReason = req.Reason,
+                        RefundReference = req.RefundReference,
+                        RefundSourcePaymentId = source?.Id,
+                        RazorpayPaymentId = req.Method == PaymentMethod.Razorpay ? source?.RazorpayPaymentId : null,
+                        IsPharmacyReturn = pharmacyReturn,
+                        IdempotencyKey = req.IdempotencyKey,
+                        CreatedAt = DateTimeOffset.UtcNow
+                    };
+                    _db.Payments.Add(refund);
+                    invoice.UpdatedAt = DateTimeOffset.UtcNow;
+                    await _db.SaveChangesAsync(ct);
+                    refundId = refund.Id;
+                    created = true;
+                }
+                if (transaction != null) await transaction.CommitAsync(ct);
+            }
+            catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex) || ex is DbUpdateException update && InvoiceAccounting.IsIdempotencyConflict(update))
+            {
+                if (transaction != null) await transaction.RollbackAsync(ct);
+                _db.ChangeTracker.Clear();
+                return Conflict(new { error = "refund_changed_concurrently", message = "Reload and retry with the same refund key." });
             }
         }
 
-        // Calculate maximum refundable based on confirmed payments minus prior refunds and pending requests
-        var totalPaid = invoice.Payments
-            .Where(p => p.Status == PaymentStatus.Completed)
-            .Sum(p => p.Amount);
-        var totalRefunded = invoice.Payments
-            .Where(p => p.Status == PaymentStatus.Refunded && p.VerificationStatus == PaymentVerificationStatus.Confirmed)
-            .Sum(p => Math.Abs(p.Amount));
-        // A pending request is money already promised to the patient; ignoring it lets two requests overdraw the invoice.
-        var pendingRefunds = invoice.Payments
-            .Where(p => p.Status == PaymentStatus.Pending && p.VerificationStatus == PaymentVerificationStatus.Pending)
-            .Sum(p => Math.Abs(p.Amount));
-        var maxRefundable = Math.Max(0m, totalPaid - totalRefunded - pendingRefunds);
-
-        if (req.Amount > maxRefundable)
-        {
-            return BadRequest(new
-            {
-                error = "refund_exceeds_paid_balance",
-                message = $"Requested refund of ₹{req.Amount:F2} exceeds refundable paid balance of ₹{maxRefundable:F2}."
-            });
-        }
-
-        // Clinic-set dual approval threshold from TenantTaxProfile (defaults to ₹1,000.00)
-        var taxProfile = await _db.TenantTaxProfiles
-            .FirstOrDefaultAsync(tp => tp.TenantId == tenantId, ct);
-        var threshold = taxProfile?.ThresholdRefundApproval ?? 1000.0m;
-
-        // The approver is the authenticated caller of /refunds/{refundId}/approve; the requester cannot nominate one.
-        bool requiresDualApproval = req.Amount > threshold;
-
-        if (requiresDualApproval)
-        {
-            var pendingRefund = new Payment
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                InvoiceId = id,
-                Method = req.Method,
-                Amount = -req.Amount,
-                Status = PaymentStatus.Pending,
-                VerificationStatus = PaymentVerificationStatus.Pending,
-                ConfirmedByUserId = currentUserId,
-                RefundReference = req.RefundReference.Trim(),
-                RefundReason = req.Reason.Trim(),
-                IdempotencyKey = req.IdempotencyKey,
-                CreatedAt = DateTimeOffset.UtcNow
-            };
-
-            _db.Payments.Add(pendingRefund);
-            await _db.SaveChangesAsync(ct);
-
-            return StatusCode(202, new
-            {
-                refundId = pendingRefund.Id,
-                amount = req.Amount,
-                status = "pending_approval",
-                verificationStatus = "pending",
-                threshold,
-                message = $"Refund amount ₹{req.Amount:F2} exceeds the clinic threshold of ₹{threshold:F2}. Dual approval required before funds are disbursed."
-            });
-        }
-
-        // If approved, execute within serializable transaction with reversal ledger entries
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
-        {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
-
-            var now = DateTimeOffset.UtcNow;
-            var refundPayment = new Payment
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                InvoiceId = id,
-                Method = req.Method,
-                Amount = -req.Amount,
-                Status = PaymentStatus.Refunded,
-                VerificationStatus = PaymentVerificationStatus.Confirmed,
-                ConfirmedByUserId = currentUserId,
-                RefundReference = req.RefundReference.Trim(),
-                RefundReason = req.Reason.Trim(),
-                IdempotencyKey = req.IdempotencyKey,
-                PaidAt = now,
-                ConfirmedAt = now,
-                CreatedAt = now
-            };
-
-            _db.Payments.Add(refundPayment);
-
-            invoice.PaidAmount -= req.Amount;
-            invoice.RecalculateBalance();
-            if (invoice.PaidAmount <= 0m)
-                invoice.Status = InvoiceStatus.Refunded;
-            else
-                invoice.Status = InvoiceStatus.PartiallyPaid;
-            invoice.UpdatedAt = now;
-
-            var invoiceRef = invoice.FormatInvoiceNumber();
-            var cashOrBank = req.Method == PaymentMethod.Cash ? "Cash" : "Bank";
-
-            // Append-only reversal entry 1: Credit Cash/Bank (funds disbursed back)
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                EntryType = FinanceEntryType.RefundProcessed,
-                ReferenceType = "Refund",
-                ReferenceId = refundPayment.Id,
-                ReferenceNumber = req.RefundReference.Trim(),
-                AccountCategory = cashOrBank,
-                DebitAmount = 0.0m,
-                CreditAmount = req.Amount,
-                Narration = $"Refund of ₹{req.Amount:F2} issued for {invoiceRef} via {req.Method}. Ref: {req.RefundReference}. Reason: {req.Reason}",
-                PostedByUserId = currentUserId,
-                CreatedAt = now
-            });
-
-            // Append-only reversal entry 2: Debit AccountsReceivable (offset reversal)
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                EntryType = FinanceEntryType.RefundProcessed,
-                ReferenceType = "Invoice",
-                ReferenceId = invoice.Id,
-                ReferenceNumber = invoiceRef,
-                AccountCategory = "AccountsReceivable",
-                DebitAmount = req.Amount,
-                CreditAmount = 0.0m,
-                Narration = $"Receivable reinstatement from refund {refundPayment.Id:N} on {invoiceRef}",
-                PostedByUserId = currentUserId,
-                CreatedAt = now
-            });
-
-            await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
-
-            return StatusCode(201, new
-            {
-                refundId = refundPayment.Id,
-                invoiceId = invoice.Id,
-                invoiceNumber = invoiceRef,
-                amount = req.Amount,
-                method = req.Method.ToString(),
-                refundReference = req.RefundReference,
-                status = "refunded",
-                verificationStatus = "confirmed",
-                paidAmount = invoice.PaidAmount,
-                balanceDue = invoice.BalanceDue,
-                refundedAt = now
-            });
-        });
+        return await CompleteRefundAsync(id, refundId, created, ct);
     }
 
     [HttpPost("invoices/{id:guid}/refunds/{refundId:guid}/approve")]
@@ -951,126 +795,331 @@ public class InvoicesController : ControllerBase
     [RequirePermission(Permissions.PaymentRecord)]
     public async Task<IActionResult> ApproveRefund(Guid id, Guid refundId, [FromBody] ApproveRefundRequest? req, CancellationToken ct)
     {
-        var tenantId = TenantId;
-        var currentUserId = User.GetUserId() ?? Guid.Empty;
-
-        var refundPayment = await _db.Payments
-            .FirstOrDefaultAsync(p => p.Id == refundId && p.InvoiceId == id && p.TenantId == tenantId, ct);
-
-        if (refundPayment == null)
-            return NotFound(new { error = "refund_not_found" });
-
-        if (refundPayment.Status != PaymentStatus.Pending || refundPayment.VerificationStatus != PaymentVerificationStatus.Pending)
-            return BadRequest(new { error = "refund_not_pending_approval", message = "Refund is not pending approval." });
-
-        if (refundPayment.ConfirmedByUserId == currentUserId)
+        if (TenantId == Guid.Empty || User.GetUserId() is not { } userId || userId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_token" });
+        await using (var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null)
         {
-            return BadRequest(new
+            try
             {
-                error = "dual_approval_self_approval_blocked",
-                message = "The initiating user cannot serve as their own second approver."
-            });
+                var invoice = await _db.Invoices.Include(i => i.Payments)
+                    .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == TenantId, ct);
+                if (invoice == null) return NotFound(new { error = "invoice_not_found" });
+                await _db.Entry(invoice).ReloadAsync(ct);
+                var refund = invoice.Payments.FirstOrDefault(p => p.Id == refundId && p.TenantId == TenantId);
+                if (refund == null) return NotFound(new { error = "refund_not_found" });
+                await _db.Entry(refund).ReloadAsync(ct);
+                if (refund.Amount >= 0 || string.IsNullOrWhiteSpace(refund.RefundReason))
+                    return BadRequest(new { error = "not_a_refund" });
+                if (refund.ConfirmedByUserId == userId)
+                    return RefundResult(refund, invoice, httpStatus: 400, error: "dual_approval_self_approval_blocked");
+                if (refund.SecondApprovedByUserId.HasValue && refund.SecondApprovedByUserId != userId)
+                    return RefundResult(refund, invoice, httpStatus: 409, error: "refund_approval_conflict");
+                if (!refund.SecondApprovedByUserId.HasValue)
+                {
+                    if (refund.Status != PaymentStatus.Pending || refund.VerificationStatus != PaymentVerificationStatus.Pending)
+                        return RefundResult(refund, invoice, httpStatus: 400, error: "refund_not_pending_approval");
+                    var payments = await _db.Payments.AsNoTracking().Where(p => p.InvoiceId == id && p.TenantId == TenantId).ToListAsync(ct);
+                    if (-refund.Amount > RefundableBalance(invoice, payments, refund.Id, false))
+                        return RefundResult(refund, invoice, httpStatus: 400, error: "refund_exceeds_paid_balance");
+                    refund.SecondApprovedByUserId = userId;
+                    refund.VerificationStatus = PaymentVerificationStatus.Confirmed;
+                    invoice.UpdatedAt = DateTimeOffset.UtcNow;
+                    await _db.SaveChangesAsync(ct);
+                }
+                if (transaction != null) await transaction.CommitAsync(ct);
+            }
+            catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex))
+            {
+                if (transaction != null)
+                {
+                    await transaction.RollbackAsync(ct);
+                    await transaction.DisposeAsync();
+                }
+                _db.ChangeTracker.Clear();
+                return await SavedRefundErrorAsync(id, refundId, 409, "refund_changed_concurrently", "Reload and retry the same approval.", ct);
+            }
+        }
+        return await CompleteRefundAsync(id, refundId, false, ct);
+    }
+
+    private static bool IsCollectedPayment(Payment payment) => payment.Amount > 0 && payment.Status == PaymentStatus.Completed
+        && payment.VerificationStatus == PaymentVerificationStatus.Confirmed && payment.Method != PaymentMethod.AdvanceDeposit;
+
+    private static decimal RefundableBalance(Invoice invoice, IEnumerable<Payment> payments, Guid? excludeId, bool includePending)
+    {
+        var available = payments.Where(IsCollectedPayment).Sum(p => p.Amount)
+            + payments.Where(p => p.Amount < 0 && p.Id != excludeId
+                && (p.Status == PaymentStatus.Refunded || includePending && p.Status == PaymentStatus.Pending)).Sum(p => p.Amount);
+        return Math.Max(0m, Math.Min(invoice.PaidAmount, available));
+    }
+
+    private static decimal SourceRefundableBalance(IEnumerable<Payment> payments, Payment source, Guid? excludeId, bool includePending) =>
+        Math.Max(0m, source.Amount + payments.Where(p => p.Amount < 0 && p.Id != excludeId
+            && (p.Status == PaymentStatus.Refunded || includePending && p.Status == PaymentStatus.Pending)
+            && (p.RefundSourcePaymentId == source.Id || !p.RefundSourcePaymentId.HasValue)).Sum(p => p.Amount));
+
+    private static string RefundState(Payment refund) =>
+        refund.Status == PaymentStatus.Refunded && refund.VerificationStatus == PaymentVerificationStatus.Confirmed ? "refunded"
+            : refund.Status == PaymentStatus.Failed ? "failed"
+            : refund.VerificationStatus == PaymentVerificationStatus.Pending ? "pending_approval" : "processing";
+
+    private IActionResult RefundResult(Payment refund, Invoice? invoice, bool created = false,
+        int? httpStatus = null, string? error = null, string? message = null)
+    {
+        var status = RefundState(refund);
+        var data = new
+        {
+            refundId = refund.Id,
+            invoiceId = refund.InvoiceId,
+            invoiceNumber = invoice?.FormatInvoiceNumber(),
+            amount = -refund.Amount,
+            method = refund.Method.ToString(),
+            refundReference = refund.RefundReference,
+            status,
+            verificationStatus = status == "refunded" ? "confirmed" : status == "failed" ? "rejected" : "pending",
+            paidAmount = invoice?.PaidAmount,
+            balanceDue = invoice?.BalanceDue,
+            secondApprovedByUserId = refund.SecondApprovedByUserId,
+            idempotencyKey = refund.IdempotencyKey,
+            refundReason = refund.RefundReason,
+            refundSourcePaymentId = refund.RefundSourcePaymentId,
+            confirmedByUserId = refund.ConfirmedByUserId,
+            isPharmacyReturn = refund.IsPharmacyReturn,
+            refundedAt = refund.PaidAt,
+            stockRestored = refund.IsPharmacyReturn && status == "refunded",
+            error,
+            message
+        };
+        if (httpStatus == 400) return BadRequest(data);
+        if (httpStatus == 409) return Conflict(data);
+        if (httpStatus.HasValue) return StatusCode(httpStatus.Value, data);
+        return status is "pending_approval" or "processing" ? StatusCode(202, data)
+            : status == "failed" ? StatusCode(502, data) : created ? StatusCode(201, data) : Ok(data);
+    }
+
+    private async Task<IActionResult> SavedRefundErrorAsync(Guid invoiceId, Guid refundId, int httpStatus,
+        string error, string? message, CancellationToken ct)
+    {
+        var refund = await _db.Payments.AsNoTracking().FirstOrDefaultAsync(p => p.Id == refundId && p.InvoiceId == invoiceId && p.TenantId == TenantId, ct);
+        if (refund == null) return NotFound(new { error = "refund_not_found" });
+        var invoice = await _db.Invoices.AsNoTracking().FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == TenantId, ct);
+        return RefundResult(refund, invoice, httpStatus: httpStatus, error: error, message: message);
+    }
+
+    private async Task<IActionResult> CompleteRefundAsync(Guid invoiceId, Guid refundId, bool created, CancellationToken ct)
+    {
+        var intent = await _db.Payments.AsNoTracking().FirstOrDefaultAsync(p => p.Id == refundId && p.InvoiceId == invoiceId && p.TenantId == TenantId, ct);
+        if (intent == null) return NotFound(new { error = "refund_not_found" });
+        if (intent.Amount is >= 0 or < -1000000m || decimal.Round(intent.Amount, 2) != intent.Amount
+            || string.IsNullOrWhiteSpace(intent.RefundReason)
+            || intent.Method is not (PaymentMethod.Cash or PaymentMethod.UPI or PaymentMethod.Card or PaymentMethod.NetBanking or PaymentMethod.Razorpay))
+            return BadRequest(new { error = "not_a_valid_refund" });
+        if (intent.Status != PaymentStatus.Pending || intent.VerificationStatus != PaymentVerificationStatus.Confirmed)
+            return RefundResult(intent, await _db.Invoices.AsNoTracking().FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == TenantId, ct));
+
+        RazorpayRefund? providerRefund = null;
+        if (intent.Method == PaymentMethod.Razorpay)
+        {
+            if (!_razorpay.IsConfigured) return await SavedRefundErrorAsync(invoiceId, refundId, 503, "razorpay_not_configured", null, ct);
+            if (intent.RefundSourcePaymentId == null || string.IsNullOrWhiteSpace(intent.RazorpayPaymentId))
+                return await SavedRefundErrorAsync(invoiceId, refundId, 400, "captured_refund_source_required", null, ct);
+            var collected = await _db.Payments.AsNoTracking().Where(p => p.TenantId == TenantId && p.InvoiceId == invoiceId).ToListAsync(ct);
+            var source = collected.FirstOrDefault(p => p.Id == intent.RefundSourcePaymentId && IsCollectedPayment(p));
+            var bill = await _db.Invoices.AsNoTracking().FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == TenantId, ct);
+            if (source?.Method != PaymentMethod.Razorpay || source.RazorpayPaymentId != intent.RazorpayPaymentId
+                || bill == null || bill.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled
+                || -intent.Amount > SourceRefundableBalance(collected, source, intent.Id, false)
+                || -intent.Amount > RefundableBalance(bill, collected, intent.Id, false))
+                return RefundResult(intent, bill, httpStatus: 400, error: "invalid_or_exhausted_refund_source");
+            // External HTTP is outside database retries; a lost response reuses this durable intent's exact key/body.
+            try
+            {
+                providerRefund = intent.RefundReference == null
+                    ? await _razorpay.CreateRefundAsync(intent.RazorpayPaymentId, -intent.Amount, intent.Id, ct)
+                    : await _razorpay.GetRefundAsync(intent.RefundReference, intent.RazorpayPaymentId, -intent.Amount, ct);
+            }
+            catch (Exception ex) when (ex is HttpRequestException || ex is OperationCanceledException && !ct.IsCancellationRequested) { }
+            if (providerRefund == null)
+                return RefundResult(intent, await _db.Invoices.AsNoTracking().FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == TenantId, ct));
         }
 
-        var invoice = await _db.Invoices
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
-        if (invoice == null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        var refundAmount = Math.Abs(refundPayment.Amount);
-
-        // Re-check at approval time: an earlier request may have been approved between creation and now.
-        var totalPaid = await _db.Payments
-            .Where(p => p.InvoiceId == id && p.Status == PaymentStatus.Completed)
-            .SumAsync(p => p.Amount, ct);
-        var totalRefunded = await _db.Payments
-            .Where(p => p.InvoiceId == id && p.Status == PaymentStatus.Refunded && p.VerificationStatus == PaymentVerificationStatus.Confirmed)
-            .SumAsync(p => Math.Abs(p.Amount), ct);
-        var refundableNow = Math.Max(0m, totalPaid - totalRefunded);
-        if (refundAmount > refundableNow)
-            return BadRequest(new
-            {
-                error = "refund_exceeds_paid_balance",
-                message = $"Refund of ₹{refundAmount:F2} exceeds the refundable paid balance of ₹{refundableNow:F2}."
-            });
-
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
+        await using var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
-
+            var invoice = await _db.Invoices.Include(i => i.LineItems)
+                .FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == TenantId, ct);
+            var refund = await _db.Payments.FirstOrDefaultAsync(p => p.Id == refundId && p.InvoiceId == invoiceId && p.TenantId == TenantId, ct);
+            if (invoice == null || refund == null) return NotFound(new { error = "refund_not_found" });
+            await _db.Entry(invoice).ReloadAsync(ct);
+            await _db.Entry(refund).ReloadAsync(ct);
+            if (refund.Status != PaymentStatus.Pending || refund.VerificationStatus != PaymentVerificationStatus.Confirmed)
+                return RefundResult(refund, invoice);
+            if (refund.Amount >= 0 || refund.Method != intent.Method || refund.Amount != intent.Amount
+                || refund.RefundSourcePaymentId != intent.RefundSourcePaymentId || refund.RazorpayPaymentId != intent.RazorpayPaymentId)
+                return RefundResult(refund, invoice, httpStatus: 409, error: "refund_intent_changed");
+            if (providerRefund != null)
+            {
+                if (refund.RefundReference != null && refund.RefundReference != providerRefund.Id)
+                    return RefundResult(refund, invoice, httpStatus: 409, error: "provider_refund_identity_conflict");
+                refund.RefundReference = providerRefund.Id;
+                if (providerRefund.Status == "failed")
+                {
+                    refund.Status = PaymentStatus.Failed;
+                    refund.VerificationStatus = PaymentVerificationStatus.Rejected;
+                }
+                if (providerRefund.Status != "processed")
+                {
+                    invoice.UpdatedAt = DateTimeOffset.UtcNow;
+                    await _db.SaveChangesAsync(ct);
+                    if (transaction != null) await transaction.CommitAsync(ct);
+                    return RefundResult(refund, invoice);
+                }
+            }
+            if (refund.Method != PaymentMethod.Razorpay && string.IsNullOrWhiteSpace(refund.RefundReference))
+                return await SavedRefundErrorAsync(invoiceId, refundId, 400, "refund_reference_required", null, ct);
+            var payments = await _db.Payments.AsNoTracking().Where(p => p.InvoiceId == invoiceId && p.TenantId == TenantId).ToListAsync(ct);
+            if (invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled || -refund.Amount > RefundableBalance(invoice, payments, refund.Id, false))
+                return await SavedRefundErrorAsync(invoiceId, refundId, 400, "refund_exceeds_paid_balance", "Reconcile collected funds before retrying this reserved payout.", ct);
+            if (refund.RefundSourcePaymentId.HasValue)
+            {
+                var source = payments.FirstOrDefault(p => p.Id == refund.RefundSourcePaymentId && IsCollectedPayment(p));
+                if (source == null || -refund.Amount > SourceRefundableBalance(payments, source, refund.Id, false)
+                    || refund.Method == PaymentMethod.Razorpay && (source.Method != PaymentMethod.Razorpay || source.RazorpayPaymentId != refund.RazorpayPaymentId))
+                    return await SavedRefundErrorAsync(invoiceId, refundId, 400, "invalid_or_exhausted_refund_source", null, ct);
+            }
+            if (refund.IsPharmacyReturn)
+            {
+                if (invoice.InvoiceType != InvoiceType.Pharmacy || invoice.Total != -refund.Amount || invoice.PaidAmount != invoice.Total)
+                    return await SavedRefundErrorAsync(invoiceId, refundId, 400, "return_invoice_changed", null, ct);
+                if (await ValidateReturnStockAsync(invoice, ct) is { } stockError)
+                    return await SavedRefundErrorAsync(invoiceId, refundId, 400, stockError.Error, stockError.Message, ct);
+                await RestoreReturnStockAsync(invoice, refund, ct);
+            }
             var now = DateTimeOffset.UtcNow;
-            refundPayment.Status = PaymentStatus.Refunded;
-            refundPayment.VerificationStatus = PaymentVerificationStatus.Confirmed;
-            refundPayment.SecondApprovedByUserId = currentUserId;
-            refundPayment.ConfirmedAt = now;
-            refundPayment.PaidAt = now;
-
-            invoice.PaidAmount -= refundAmount;
+            refund.Status = PaymentStatus.Refunded;
+            refund.VerificationStatus = PaymentVerificationStatus.Confirmed;
+            refund.PaidAt = refund.ConfirmedAt = now;
+            invoice.PaidAmount += refund.Amount;
             invoice.RecalculateBalance();
-            if (invoice.PaidAmount <= 0m)
-                invoice.Status = InvoiceStatus.Refunded;
-            else
-                invoice.Status = InvoiceStatus.PartiallyPaid;
+            invoice.Status = invoice.PaidAmount <= 0 ? InvoiceStatus.Refunded : InvoiceStatus.PartiallyPaid;
             invoice.UpdatedAt = now;
-
+            var userId = User.GetUserId();
             var invoiceRef = invoice.FormatInvoiceNumber();
-            var cashOrBank = refundPayment.Method == PaymentMethod.Cash ? "Cash" : "Bank";
-
-            // Post append-only ledger entries
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                EntryType = FinanceEntryType.RefundProcessed,
-                ReferenceType = "Refund",
-                ReferenceId = refundPayment.Id,
-                ReferenceNumber = refundPayment.RefundReference ?? refundPayment.Id.ToString("N"),
-                AccountCategory = cashOrBank,
-                DebitAmount = 0.0m,
-                CreditAmount = refundAmount,
-                Narration = $"Dual-approved refund of ₹{refundAmount:F2} issued for {invoiceRef} via {refundPayment.Method}. Ref: {refundPayment.RefundReference}",
-                PostedByUserId = currentUserId,
-                CreatedAt = now
-            });
-
-            _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                EntryType = FinanceEntryType.RefundProcessed,
-                ReferenceType = "Invoice",
-                ReferenceId = invoice.Id,
-                ReferenceNumber = invoiceRef,
-                AccountCategory = "AccountsReceivable",
-                DebitAmount = refundAmount,
-                CreditAmount = 0.0m,
-                Narration = $"Receivable reinstatement from approved refund {refundPayment.Id:N} on {invoiceRef}",
-                PostedByUserId = currentUserId,
-                CreatedAt = now
-            });
-
+            _db.FinanceLedgerEntries.AddRange(
+                new FinanceLedgerEntry
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = TenantId,
+                    EntryType = FinanceEntryType.RefundProcessed,
+                    ReferenceType = "Refund",
+                    ReferenceId = refund.Id,
+                    ReferenceNumber = refund.RefundReference!,
+                    AccountCategory = refund.Method == PaymentMethod.Cash ? "Cash" : "Bank",
+                    CreditAmount = -refund.Amount,
+                    Narration = $"Refund for {invoiceRef}: {refund.RefundReason}",
+                    PostedByUserId = userId,
+                    CreatedAt = now
+                },
+                new FinanceLedgerEntry
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = TenantId,
+                    EntryType = FinanceEntryType.RefundProcessed,
+                    ReferenceType = "Invoice",
+                    ReferenceId = invoice.Id,
+                    ReferenceNumber = invoiceRef,
+                    AccountCategory = "AccountsReceivable",
+                    DebitAmount = -refund.Amount,
+                    Narration = $"Receivable reinstatement from refund {refund.Id:N}",
+                    PostedByUserId = userId,
+                    CreatedAt = now
+                });
             await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
-
-            return Ok(new
+            if (transaction != null) await transaction.CommitAsync(ct);
+            return RefundResult(refund, invoice, created);
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex))
+        {
+            if (transaction != null)
             {
-                refundId = refundPayment.Id,
-                invoiceId = invoice.Id,
-                invoiceNumber = invoiceRef,
-                amount = refundAmount,
-                status = "refunded",
-                verificationStatus = "confirmed",
-                paidAmount = invoice.PaidAmount,
-                balanceDue = invoice.BalanceDue,
-                secondApprovedByUserId = currentUserId,
-                approvedAt = now
+                await transaction.RollbackAsync(ct);
+                await transaction.DisposeAsync();
+            }
+            _db.ChangeTracker.Clear();
+            return await SavedRefundErrorAsync(invoiceId, refundId, 409, "refund_changed_concurrently", "Retry the same refund key; do not create another payout.", ct);
+        }
+    }
+
+    private async Task<(string Error, string Message)?> ValidateReturnStockAsync(Invoice invoice, CancellationToken ct)
+    {
+        if (invoice.LineItems.Count == 0 || invoice.LineItems.Any(l => l.Quantity <= 0 || !l.DrugBatchId.HasValue))
+            return ("return_stock_lineage_required", "Reconcile the original sale's batch and quantity before returning stock.");
+        var quantities = invoice.LineItems.GroupBy(l => l.DrugBatchId!.Value).ToDictionary(g => g.Key, g => g.Sum(l => (long)l.Quantity));
+        var batches = await _db.DrugBatches.AsNoTracking().Where(b => b.TenantId == invoice.TenantId
+            && _db.InvoiceLineItems.Any(l => l.InvoiceId == invoice.Id && l.DrugBatchId == b.Id)).ToListAsync(ct);
+        if (batches.Count != quantities.Count || batches.Any(b => b.QuantityRemaining < 0 || b.QuantityRemaining + quantities[b.Id] > b.QuantityReceived))
+            return ("return_stock_reconciliation_required", "Returned quantities exceed the traceable batch allowance or a batch is inaccessible.");
+        return null;
+    }
+
+    private async Task RestoreReturnStockAsync(Invoice invoice, Payment refund, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var userId = User.GetUserId()!.Value;
+        foreach (var group in invoice.LineItems.GroupBy(l => l.DrugBatchId!.Value))
+        {
+            var batch = await _db.DrugBatches.FirstAsync(b => b.Id == group.Key && b.TenantId == invoice.TenantId, ct);
+            await _db.Entry(batch).ReloadAsync(ct);
+            var quantity = group.Sum(l => l.Quantity);
+            if ((long)batch.QuantityRemaining + quantity > batch.QuantityReceived)
+                throw new DbUpdateConcurrencyException("The returned batch changed; retry the same refund.");
+            batch.QuantityRemaining += quantity;
+            batch.UpdatedAt = now;
+            _db.DrugStockMovements.Add(new DrugStockMovement
+            {
+                Id = Guid.NewGuid(),
+                TenantId = invoice.TenantId,
+                DrugId = batch.DrugId,
+                DrugBatchId = batch.Id,
+                Quantity = quantity,
+                Direction = MovementDirection.In,
+                ReferenceType = "Return",
+                ReferenceId = refund.Id,
+                Note = $"Return for {invoice.FormatInvoiceNumber()}: {refund.RefundReason}",
+                RecordedBy = userId,
+                RecordedAt = now
             });
-        });
+        }
+        var registers = await _db.ControlledSubstanceRegisters.AsNoTracking().Where(r => r.TenantId == invoice.TenantId && r.Quantity > 0
+            && (r.InvoiceId == invoice.Id || r.DispenseRecordId.HasValue && _db.DispenseRecords.Any(d =>
+                d.TenantId == invoice.TenantId && d.InvoiceId == invoice.Id && d.Id == r.DispenseRecordId))).ToListAsync(ct);
+        var name = await _db.Users.Where(u => u.Id == userId).Select(u => u.Name).FirstOrDefaultAsync(ct) ?? userId.ToString();
+        foreach (var register in registers)
+            _db.ControlledSubstanceRegisters.Add(new ControlledSubstanceRegister
+            {
+                Id = Guid.NewGuid(),
+                TenantId = invoice.TenantId,
+                InvoiceId = invoice.Id,
+                DispenseRecordId = register.DispenseRecordId,
+                DrugId = register.DrugId,
+                ScheduleClass = register.ScheduleClass,
+                DrugName = register.DrugName,
+                BatchNumber = register.BatchNumber,
+                Quantity = -register.Quantity,
+                PatientName = register.PatientName,
+                PatientAddress = register.PatientAddress,
+                PrescriberName = register.PrescriberName,
+                PrescriberRegNo = register.PrescriberRegNo,
+                DispensedBy = userId,
+                DispenserName = name,
+                DispensedAt = now
+            });
     }
 
     [HttpGet("invoices/{id:guid}")]
-    [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin")]
+    [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Pharmacist")]
     public async Task<IActionResult> GetInvoice(Guid id, CancellationToken ct)
     {
         var tenantId = TenantId;
@@ -1085,7 +1134,12 @@ public class InvoicesController : ControllerBase
         if (invoice == null)
             return NotFound(new { error = "invoice_not_found" });
 
+        if (User.IsInRole("Pharmacist") && invoice.InvoiceType != InvoiceType.Pharmacy)
+            return Forbid();
+
         var invoiceRef = invoice.FormatInvoiceNumber();
+        var refundable = invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled or InvoiceStatus.Refunded
+            ? 0m : RefundableBalance(invoice, invoice.Payments, null, true);
 
         Invoice? linkedPharmacy = null;
         if (invoice.LinkedPharmacyInvoiceId.HasValue)
@@ -1099,6 +1153,7 @@ public class InvoicesController : ControllerBase
             invoiceId = invoice.Id,
             invoiceNumber = invoiceRef,
             documentType = invoice.DocumentType.ToString(),
+            invoiceType = invoice.InvoiceType.ToString(),
             appointmentId = invoice.AppointmentId,
             patient = new
             {
@@ -1121,9 +1176,10 @@ public class InvoicesController : ControllerBase
                 taxCategory = li.TaxCategory.ToString(),
                 hsnSacCode = li.HsnSacCode,
                 gstRate = li.GstRate,
-                taxAmount = li.TaxAmount,
+                taxAmount = li.ResolvedTaxAmount(),
                 discountAmount = li.DiscountAmount,
-                totalAmount = li.Amount
+                taxableAmount = li.TaxableAmount(invoice.InvoiceType),
+                totalAmount = li.GrossAmount(invoice.InvoiceType)
             }),
             payments = invoice.Payments.Select(p => new
             {
@@ -1133,7 +1189,21 @@ public class InvoicesController : ControllerBase
                 utr = p.Utr,
                 status = p.Status.ToString(),
                 verificationStatus = p.VerificationStatus.ToString(),
-                paidAt = p.PaidAt
+                paidAt = p.PaidAt,
+                createdAt = p.CreatedAt,
+                reportedAt = p.ReportedAt,
+                confirmedAt = p.ConfirmedAt,
+                confirmedByUserId = p.ConfirmedByUserId,
+                secondApprovedByUserId = p.SecondApprovedByUserId,
+                idempotencyKey = p.IdempotencyKey,
+                payeeAccountId = p.PayeeAccountId,
+                razorpayPaymentId = p.RazorpayPaymentId,
+                refundableAmount = IsCollectedPayment(p) ? Math.Min(refundable, SourceRefundableBalance(invoice.Payments, p, null, true)) : 0m,
+                refundStatus = p.Amount < 0 ? RefundState(p) : null,
+                refundReason = p.RefundReason,
+                refundReference = p.RefundReference,
+                refundSourcePaymentId = p.RefundSourcePaymentId,
+                isPharmacyReturn = p.IsPharmacyReturn
             }),
             creditNotes = invoice.CreditNotes.Select(cn => new
             {
@@ -1164,6 +1234,7 @@ public class InvoicesController : ControllerBase
             total = invoice.Total,
             paidAmount = invoice.PaidAmount,
             balanceDue = invoice.BalanceDue,
+            refundableAmount = refundable,
             printCount = invoice.PrintCount,
             status = invoice.Status.ToString().ToLower(),
             createdAt = invoice.CreatedAt,
@@ -1262,147 +1333,91 @@ public class InvoicesController : ControllerBase
     public async Task<IActionResult> UpdateInvoiceDraft(Guid id, [FromBody] UpdateInvoiceDraftRequest request, CancellationToken ct)
     {
         var tenantId = TenantId;
-        var invoice = await _db.Invoices
-            .Include(i => i.LineItems)
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
-
-        if (invoice == null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        if (invoice.Status != InvoiceStatus.Draft)
-            return BadRequest(new { error = "invoice_not_draft", message = "Only draft invoices can be updated." });
-
-        // Validate line items if provided
-        if (request.LineItems is not null)
+        await using var transaction = _db.Database.IsRelational() && _db.Database.CurrentTransaction == null
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            if (request.LineItems.Count == 0)
-                return BadRequest(new { error = "line_items_required" });
+            var invoice = await _db.Invoices
+                .Include(i => i.LineItems)
+                .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
 
-            // Retrieve tenant tax profile for validation
-            var taxProfile = await _db.TenantTaxProfiles
-                .FirstOrDefaultAsync(p => p.TenantId == tenantId, ct);
+            if (invoice == null)
+                return NotFound(new { error = "invoice_not_found" });
 
-            var defaultTaxCat = taxProfile?.DefaultOpdTaxCategory ?? TaxCategory.Exempt;
-            var defaultHsnSac = taxProfile?.DefaultOpdHsnSac ?? "999312";
-            var defaultGstRate = taxProfile?.DefaultOpdGstRate ?? 0.0m;
+            if (invoice.Status != InvoiceStatus.Draft)
+                return BadRequest(new { error = "invoice_not_draft", message = "Only draft invoices can be updated." });
 
-            decimal calculatedSubtotal = 0m;
-            decimal calculatedGst = 0m;
-            var newLineItems = new List<InvoiceLineItem>();
-
-            foreach (var item in request.LineItems)
+            List<InvoiceLineItem>? newLineItems = null;
+            var subtotal = invoice.Subtotal;
+            var gst = invoice.GstAmount;
+            if (request.LineItems is not null)
             {
-                if (item.Quantity <= 0)
-                    return BadRequest(new { error = "invalid_line_quantity", description = item.Description });
-
-                var qty = item.Quantity;
-                var unitPrice = item.UnitPrice ?? (item.Amount / qty);
-                if (unitPrice <= 0)
-                    return BadRequest(new { error = "invalid_line_amount", description = item.Description });
-
-                if (item.DiscountAmount < 0 || item.DiscountAmount > qty * unitPrice)
-                    return BadRequest(new { error = "invalid_line_discount", description = item.Description });
-
-                var hsnSac = !string.IsNullOrWhiteSpace(item.HsnSacCode) ? item.HsnSacCode.Trim() : defaultHsnSac;
-
-                var taxCat = defaultTaxCat;
-                if (!string.IsNullOrWhiteSpace(item.TaxCategory) && Enum.TryParse<TaxCategory>(item.TaxCategory, true, out var parsedCat))
-                    taxCat = parsedCat;
-
-                decimal lineGstRate;
-                if (taxCat is TaxCategory.Exempt or TaxCategory.Nil)
-                {
-                    if (defaultTaxCat == TaxCategory.Taxable && !hsnSac.StartsWith("9993", StringComparison.Ordinal))
-                        return BadRequest(new { error = "tax_category_not_permitted", description = item.Description, message = "This clinic is configured for taxable supplies; exempt lines must use a healthcare SAC (9993xx)." });
-                    lineGstRate = 0.0m;
-                }
-                else
-                {
-                    lineGstRate = item.GstRate ?? defaultGstRate;
-                    if (lineGstRate <= 0)
-                        return BadRequest(new { error = "taxable_line_requires_gst_rate", description = item.Description });
-                }
-
-                var unitPriceValue = unitPrice ?? 0m;
-                var lineBaseAmount = qty * unitPriceValue - item.DiscountAmount;
-                var lineGst = Math.Round(lineBaseAmount * lineGstRate / 100m, 2, MidpointRounding.AwayFromZero);
-
-                calculatedSubtotal += lineBaseAmount;
-                calculatedGst += lineGst;
-
-                newLineItems.Add(new InvoiceLineItem
-                {
-                    Id = Guid.NewGuid(),
-                    Description = item.Description.Trim(),
-                    Quantity = qty,
-                    UnitPrice = unitPriceValue,
-                    Amount = lineBaseAmount,
-                    TaxCategory = taxCat,
-                    HsnSacCode = hsnSac,
-                    GstRate = lineGstRate,
-                    TaxAmount = lineGst
-                });
+                var taxProfile = await _db.TenantTaxProfiles
+                    .FirstOrDefaultAsync(p => p.TenantId == tenantId, ct);
+                var (lines, error) = InvoiceAccounting.CalculateLines(request.LineItems.Select(i => new InvoiceLineItemRequest(
+                    i.Description, i.Amount ?? 0m, i.Quantity, i.UnitPrice, i.TaxCategory, i.HsnSacCode, i.GstRate, i.DiscountAmount)).ToList(), taxProfile);
+                if (error != null) return BadRequest(error);
+                newLineItems = lines;
+                subtotal = lines.Sum(i => i.Amount - i.TaxAmount);
+                gst = lines.Sum(i => i.TaxAmount);
             }
 
-            // Replace line items
-            _db.InvoiceLineItems.RemoveRange(invoice.LineItems);
-            invoice.LineItems = newLineItems;
-            // Their ids are pre-assigned, so EF would treat them as existing rows and UPDATE nothing.
-            _db.InvoiceLineItems.AddRange(newLineItems);
-            invoice.Subtotal = calculatedSubtotal;
-            invoice.GstAmount = calculatedGst;
-
-            // Update document type based on GST
-            if (calculatedGst > 0)
-                invoice.DocumentType = InvoiceDocumentType.TaxInvoice;
-            else
-                invoice.DocumentType = InvoiceDocumentType.BillOfSupply;
-        }
-
-        // Update discount if provided
-        if (request.DiscountAmount.HasValue)
-        {
-            var gross = invoice.Subtotal + invoice.GstAmount;
-            if (request.DiscountAmount.Value < 0 || request.DiscountAmount.Value > gross)
-                return BadRequest(new { error = "invalid_discount_amount", message = $"Discount must be between 0 and ₹{gross:F2}." });
-
-            if (request.DiscountAmount.Value > 0 && string.IsNullOrWhiteSpace(request.DiscountReason))
+            var discount = request.DiscountAmount ?? invoice.DiscountAmount;
+            var discountReason = request.DiscountAmount.HasValue ? request.DiscountReason : invoice.DiscountReason;
+            var grossTotal = subtotal + gst;
+            if (discount < 0 || discount > grossTotal || decimal.Round(discount, 2) != discount)
+                return BadRequest(new { error = "invalid_discount_amount", message = $"Discount must be between ₹0 and ₹{grossTotal:F2}." });
+            if (discount > 0 && string.IsNullOrWhiteSpace(discountReason))
                 return BadRequest(new { error = "discount_reason_required" });
+            if (discountReason?.Length > 255 || request.WalkInCustomerName?.Length > 255 || request.WalkInCustomerPhone?.Length > 20)
+                return BadRequest(new { error = "invalid_invoice_metadata" });
 
-            invoice.DiscountAmount = request.DiscountAmount.Value;
-            invoice.DiscountReason = request.DiscountReason;
+            // Validate the whole PATCH before staging any replacement or header change.
+            if (newLineItems != null)
+            {
+                _db.InvoiceLineItems.RemoveRange(invoice.LineItems);
+                foreach (var line in newLineItems) line.InvoiceId = invoice.Id;
+                invoice.LineItems = newLineItems;
+                _db.InvoiceLineItems.AddRange(newLineItems);
+                invoice.DocumentType = gst > 0 ? InvoiceDocumentType.TaxInvoice : InvoiceDocumentType.BillOfSupply;
+            }
+            invoice.Subtotal = subtotal;
+            invoice.GstAmount = gst;
+            invoice.DiscountAmount = discount;
+            invoice.DiscountReason = discountReason;
+            invoice.Total = grossTotal - discount;
+            invoice.RecalculateBalance();
+
+            // Update walk-in customer info if provided
+            if (request.WalkInCustomerName is not null)
+                invoice.WalkInCustomerName = request.WalkInCustomerName;
+            if (request.WalkInCustomerPhone is not null)
+                invoice.WalkInCustomerPhone = request.WalkInCustomerPhone;
+
+            invoice.UpdatedAt = DateTimeOffset.UtcNow;
+            await _db.SaveChangesAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
+
+            var invoiceRef = invoice.FormatInvoiceNumber();
+            return Ok(new
+            {
+                invoiceId = invoice.Id,
+                invoiceNumber = invoiceRef,
+                subtotal = invoice.Subtotal,
+                gstAmount = invoice.GstAmount,
+                discountAmount = invoice.DiscountAmount,
+                total = invoice.Total,
+                balanceDue = invoice.BalanceDue,
+                status = invoice.Status.ToString().ToLower(),
+                updatedAt = invoice.UpdatedAt
+            });
         }
-
-        // Totals always follow the lines: a PATCH may replace items without re-sending the discount.
-        var grossTotal = invoice.Subtotal + invoice.GstAmount;
-        if (invoice.DiscountAmount > grossTotal)
-            return BadRequest(new { error = "invalid_discount_amount", message = $"Discount must be between ₹0 and ₹{grossTotal:F2}." });
-
-        invoice.Total = grossTotal - invoice.DiscountAmount;
-        invoice.RecalculateBalance();
-
-        // Update walk-in customer info if provided
-        if (request.WalkInCustomerName is not null)
-            invoice.WalkInCustomerName = request.WalkInCustomerName;
-        if (request.WalkInCustomerPhone is not null)
-            invoice.WalkInCustomerPhone = request.WalkInCustomerPhone;
-
-        invoice.UpdatedAt = DateTimeOffset.UtcNow;
-        await _db.SaveChangesAsync(ct);
-
-        var invoiceRef = invoice.FormatInvoiceNumber();
-        return Ok(new
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex))
         {
-            invoiceId = invoice.Id,
-            invoiceNumber = invoiceRef,
-            subtotal = invoice.Subtotal,
-            gstAmount = invoice.GstAmount,
-            discountAmount = invoice.DiscountAmount,
-            total = invoice.Total,
-            balanceDue = invoice.BalanceDue,
-            status = invoice.Status.ToString().ToLower(),
-            updatedAt = invoice.UpdatedAt
-        });
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "invoice_changed_concurrently", message = "Reload the draft before saving again." });
+        }
     }
 
     [HttpPost("invoices/{id:guid}/payment")]
@@ -1411,150 +1426,149 @@ public class InvoicesController : ControllerBase
     public async Task<IActionResult> CollectPayment(Guid id, [FromBody] CollectPaymentRequest request, CancellationToken ct)
     {
         var tenantId = TenantId;
-        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        if (string.IsNullOrWhiteSpace(request.Method) || request.Utr?.Length > 64 || request.IdempotencyKey?.Length > 128)
+            return BadRequest(new { error = "invalid_payment_method_or_reference" });
+        await using var transaction = _db.Database.IsRelational() && _db.Database.CurrentTransaction == null
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            var existingPayment = await _db.Payments
-                .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.InvoiceId == id && p.IdempotencyKey == request.IdempotencyKey, ct);
-            if (existingPayment is not null)
-                return Ok(new { status = existingPayment.Status.ToString().ToLower(), paymentId = existingPayment.Id });
-        }
-
-        var invoice = await _db.Invoices
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
-        if (invoice is null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        if (invoice.Status is InvoiceStatus.Draft)
-            return BadRequest(new { error = "invoice_not_finalized", message = "Finalize the invoice before collecting payment." });
-
-        if (invoice.Status is InvoiceStatus.Paid or InvoiceStatus.Cancelled or InvoiceStatus.Refunded)
-            return BadRequest(new { error = "invoice_already_paid" });
-
-        if (request.Amount <= 0 || request.Amount > invoice.BalanceDue)
-            return BadRequest(new
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
             {
-                error = "amount_exceeds_balance",
-                message = $"Payment must be between ₹0.01 and the balance due of ₹{invoice.BalanceDue:F2}."
-            });
+                var existingPayment = await _db.Payments
+                    .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.InvoiceId == id && p.IdempotencyKey == request.IdempotencyKey, ct);
+                if (existingPayment is not null)
+                {
+                    if (!Enum.TryParse<PaymentMethod>(request.Method, true, out var replayMethod)
+                        || !InvoiceAccounting.ReceiptAgrees(existingPayment, replayMethod, request.Amount, request.Utr))
+                        return Conflict(new { error = "idempotency_key_conflict" });
+                    var originalInvoice = await _db.Invoices.FirstAsync(i => i.Id == id && i.TenantId == tenantId, ct);
+                    return Ok(new
+                    {
+                        status = originalInvoice.Status.ToString().ToLowerInvariant(),
+                        paymentStatus = existingPayment.Status.ToString().ToLowerInvariant(),
+                        paymentId = existingPayment.Id,
+                        orderId = existingPayment.RazorpayOrderId,
+                        razorpayKeyId = existingPayment.Method == PaymentMethod.Razorpay ? _razorpay.KeyId : null,
+                        amount = existingPayment.Amount,
+                        currency = "INR",
+                        paidAmount = originalInvoice.PaidAmount,
+                        balanceDue = originalInvoice.BalanceDue,
+                        idempotentReplay = true
+                    });
+                }
+            }
 
-        if (string.Equals(request.Method, "razorpay", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!_razorpay.IsConfigured)
-                return StatusCode(503, new { error = "razorpay_not_configured" });
+            var invoice = await _db.Invoices
+                .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
+            if (invoice is null)
+                return NotFound(new { error = "invoice_not_found" });
 
-            var orderId = await _razorpay.CreateOrderAsync(request.Amount, $"invoice-{invoice.InvoiceNumber}", ct);
-            if (string.IsNullOrWhiteSpace(orderId))
-                return StatusCode(502, new { error = "razorpay_order_failed" });
+            if (invoice.Status is InvoiceStatus.Draft)
+                return BadRequest(new { error = "invoice_not_finalized", message = "Finalize the invoice before collecting payment." });
 
-            var payment = new Payment
+            if (invoice.Status is InvoiceStatus.Paid or InvoiceStatus.Cancelled or InvoiceStatus.Refunded)
+                return BadRequest(new { error = "invoice_already_paid" });
+
+            if (!InvoiceAccounting.CanCollect(invoice, request.Amount))
+                return BadRequest(new
+                {
+                    error = "amount_exceeds_balance",
+                    message = $"Payment must be between ₹0.01 and the balance due of ₹{invoice.BalanceDue:F2}."
+                });
+
+            if (string.Equals(request.Method, "razorpay", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!_razorpay.IsConfigured)
+                    return StatusCode(503, new { error = "razorpay_not_configured" });
+
+                var orderId = await _razorpay.CreateOrderAsync(request.Amount, invoice.FormatInvoiceNumber(), ct);
+                if (string.IsNullOrWhiteSpace(orderId))
+                    return StatusCode(502, new { error = "razorpay_order_failed" });
+
+                var payment = new Payment
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = invoice.TenantId,
+                    InvoiceId = id,
+                    Method = PaymentMethod.Razorpay,
+                    Amount = request.Amount,
+                    RazorpayOrderId = orderId,
+                    Status = PaymentStatus.Pending,
+                    VerificationStatus = PaymentVerificationStatus.Pending,
+                    IdempotencyKey = request.IdempotencyKey,
+                    CreatedAt = DateTimeOffset.UtcNow
+                };
+
+                _db.Payments.Add(payment);
+                await _db.SaveChangesAsync(ct);
+                if (transaction != null) await transaction.CommitAsync(ct);
+
+                return Ok(new
+                {
+                    orderId,
+                    razorpayKeyId = _razorpay.KeyId,
+                    amount = request.Amount,
+                    currency = "INR"
+                });
+            }
+
+            var manualMethod = request.Method.Trim().ToLowerInvariant() switch
+            {
+                "cash" => PaymentMethod.Cash,
+                "upi" => PaymentMethod.UPI,
+                "card" => PaymentMethod.Card,
+                "netbanking" => PaymentMethod.NetBanking,
+                _ => (PaymentMethod?)null
+            };
+
+            if (manualMethod is null)
+                return BadRequest(new { error = "invalid_payment_method" });
+
+            var taxProfile = await _db.TenantTaxProfiles.FirstOrDefaultAsync(p => p.TenantId == tenantId, ct);
+            var utrThreshold = taxProfile?.ThresholdHighValueUtr ?? 2000.0m;
+            if (manualMethod != PaymentMethod.Cash
+                && request.Amount >= utrThreshold
+                && string.IsNullOrWhiteSpace(request.Utr))
+            {
+                return BadRequest(new
+                {
+                    error = "utr_mandatory_above_threshold",
+                    message = $"Bank UTR / Transaction Reference is mandatory for electronic payments of ₹{utrThreshold:N0} and above."
+                });
+            }
+
+            var manualPayment = new Payment
             {
                 Id = Guid.NewGuid(),
                 TenantId = invoice.TenantId,
                 InvoiceId = id,
-                Method = PaymentMethod.Razorpay,
+                Method = manualMethod.Value,
                 Amount = request.Amount,
-                RazorpayOrderId = orderId,
-                Status = PaymentStatus.Pending,
-                VerificationStatus = PaymentVerificationStatus.Pending,
+                Utr = string.IsNullOrWhiteSpace(request.Utr) ? null : request.Utr.Trim(),
+                Status = PaymentStatus.Completed,
+                VerificationStatus = PaymentVerificationStatus.Confirmed,
+                PaidAt = DateTimeOffset.UtcNow,
+                ConfirmedAt = DateTimeOffset.UtcNow,
+                ConfirmedByUserId = User.GetUserId(),
                 IdempotencyKey = request.IdempotencyKey,
                 CreatedAt = DateTimeOffset.UtcNow
             };
 
-            _db.Payments.Add(payment);
+            _db.Payments.Add(manualPayment);
+            InvoiceAccounting.ConfirmPayment(_db, invoice, manualPayment, User.GetUserId());
+
             await _db.SaveChangesAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
 
-            return Ok(new
-            {
-                orderId,
-                razorpayKeyId = _razorpay.KeyId,
-                amount = request.Amount,
-                currency = "INR"
-            });
+            return Ok(new { status = invoice.Status.ToString().ToLower(), paymentId = manualPayment.Id, utr = manualPayment.Utr, paidAmount = invoice.PaidAmount, balanceDue = invoice.BalanceDue });
         }
-
-        var manualMethod = request.Method.Trim().ToLowerInvariant() switch
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex)
+            || ex is DbUpdateException update && InvoiceAccounting.IsIdempotencyConflict(update))
         {
-            "cash" => PaymentMethod.Cash,
-            "upi" => PaymentMethod.UPI,
-            "card" => PaymentMethod.Card,
-            "netbanking" => PaymentMethod.NetBanking,
-            _ => (PaymentMethod?)null
-        };
-
-        if (manualMethod is null)
-            return BadRequest(new { error = "invalid_payment_method" });
-
-        var taxProfile = await _db.TenantTaxProfiles.FirstOrDefaultAsync(p => p.TenantId == tenantId, ct);
-        var utrThreshold = taxProfile?.ThresholdHighValueUtr ?? 2000.0m;
-        if (manualMethod != PaymentMethod.Cash
-            && request.Amount >= utrThreshold
-            && string.IsNullOrWhiteSpace(request.Utr))
-        {
-            return BadRequest(new
-            {
-                error = "utr_mandatory_above_threshold",
-                message = $"Bank UTR / Transaction Reference is mandatory for electronic payments of ₹{utrThreshold:N0} and above."
-            });
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "payment_changed_concurrently", message = "Reload and retry with the same receipt key." });
         }
-
-        var manualPayment = new Payment
-        {
-            Id = Guid.NewGuid(),
-            TenantId = invoice.TenantId,
-            InvoiceId = id,
-            Method = manualMethod.Value,
-            Amount = request.Amount,
-            Utr = string.IsNullOrWhiteSpace(request.Utr) ? null : request.Utr.Trim(),
-            Status = PaymentStatus.Completed,
-            VerificationStatus = PaymentVerificationStatus.Confirmed,
-            PaidAt = DateTimeOffset.UtcNow,
-            ConfirmedAt = DateTimeOffset.UtcNow,
-            ConfirmedByUserId = User.GetUserId(),
-            IdempotencyKey = request.IdempotencyKey,
-            CreatedAt = DateTimeOffset.UtcNow
-        };
-
-        _db.Payments.Add(manualPayment);
-        invoice.PaidAmount += request.Amount;
-        invoice.RecalculateBalance();
-        invoice.Status = invoice.BalanceDue <= 0m ? InvoiceStatus.Paid : InvoiceStatus.PartiallyPaid;
-        invoice.UpdatedAt = DateTimeOffset.UtcNow;
-
-        // Every confirmed payment posts to the append-only ledger, whichever endpoint took it.
-        var invoiceRef = invoice.FormatInvoiceNumber();
-        var cashOrBank = manualMethod == PaymentMethod.Cash ? "Cash" : "Bank";
-        _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-        {
-            Id = Guid.NewGuid(),
-            TenantId = tenantId,
-            EntryType = FinanceEntryType.PaymentConfirmed,
-            ReferenceType = "Payment",
-            ReferenceId = manualPayment.Id,
-            ReferenceNumber = manualPayment.Utr ?? invoiceRef,
-            AccountCategory = cashOrBank,
-            DebitAmount = request.Amount,
-            Narration = $"Payment recorded for {invoiceRef} via {manualMethod}. UTR: {manualPayment.Utr ?? "N/A"}",
-            PostedByUserId = User.GetUserId(),
-            CreatedAt = DateTimeOffset.UtcNow
-        });
-        _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-        {
-            Id = Guid.NewGuid(),
-            TenantId = tenantId,
-            EntryType = FinanceEntryType.PaymentConfirmed,
-            ReferenceType = "Invoice",
-            ReferenceId = invoice.Id,
-            ReferenceNumber = invoiceRef,
-            AccountCategory = "AccountsReceivable",
-            CreditAmount = request.Amount,
-            Narration = $"Receivable offset for {invoiceRef} from payment {manualPayment.Id:N}",
-            PostedByUserId = User.GetUserId(),
-            CreatedAt = DateTimeOffset.UtcNow
-        });
-
-        await _db.SaveChangesAsync(ct);
-
-        return Ok(new { status = "paid", utr = manualPayment.Utr, paidAmount = invoice.PaidAmount, balanceDue = invoice.BalanceDue });
     }
 
     [HttpPost("webhooks/razorpay")]
@@ -1566,123 +1580,80 @@ public class InvoicesController : ControllerBase
 
         var secret = _config["Razorpay:WebhookSecret"];
         if (string.IsNullOrWhiteSpace(secret))
-        {
-            var env = HttpContext.RequestServices.GetRequiredService<IWebHostEnvironment>();
-            if (env.IsDevelopment())
-                secret = "dev_webhook_secret_key";
-            else
-                return StatusCode(503, new { error = "webhook_not_configured" });
-        }
+            return StatusCode(503, new { error = "webhook_not_configured" });
 
         using var reader = new StreamReader(Request.Body);
         var bodyText = await reader.ReadToEndAsync(ct);
 
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-        var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(bodyText));
-        var computedSignature = Convert.ToHexStringLower(computedHash);
-
-        if (!CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(computedSignature),
-            Encoding.UTF8.GetBytes(signatureHeader.ToString().ToLowerInvariant())))
-        {
+        if (!PaymentWebhookCodec.Verify("razorpay", secret, bodyText, signatureHeader.ToString()))
             return BadRequest(new { error = "invalid_webhook_signature" });
-        }
 
-        await using var rlsTransaction = await _db.Database.BeginTransactionAsync(ct);
-        await _db.Database.ExecuteSqlAsync($"SELECT set_config('app.is_platform_admin', 'true', true)", ct);
+        var evt = PaymentWebhookCodec.TryParse("razorpay", bodyText);
+        if (evt is null) return Ok(new { status = "ignored" });
+        if (_tenantContext is null)
+            return StatusCode(503, new { error = "tenant_context_unavailable" });
+        if (string.IsNullOrWhiteSpace(evt.ProviderOrderId))
+            return StatusCode(503, new { error = "payment_order_not_found" });
+        if (evt.ProviderOrderId.Length > 255 || evt.Utr?.Length > 64 || evt.Reference?.Length > 255)
+            return BadRequest(new { error = "invalid_payment_reference" });
+
+        await using var rlsTransaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
 
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(bodyText);
-            if (doc.RootElement.TryGetProperty("event", out var eventProp))
+            // The verified order only routes; all business reads still require the resolved tenant and exact payment.
+            var binding = await _db.Database.SqlQuery<PublicTokenBinding>(
+                $"SELECT \"TenantId\", \"ResourceId\" FROM public.resolve_razorpay_order({evt.ProviderOrderId})")
+                .SingleOrDefaultAsync(ct);
+            if (binding is null || binding.TenantId == Guid.Empty || binding.ResourceId == Guid.Empty)
+                return StatusCode(503, new { error = "payment_order_not_found", message = "Retry after the checkout order has been persisted." });
+            using var tenantScope = _tenantContext.PushTenant(binding.TenantId);
+            var payment = await _db.Payments.FirstOrDefaultAsync(p => p.Id == binding.ResourceId &&
+                p.TenantId == binding.TenantId && p.RazorpayOrderId == evt.ProviderOrderId &&
+                p.Method == PaymentMethod.Razorpay && p.Amount > 0, ct);
+            if (payment is null) return StatusCode(503, new { error = "payment_order_not_found", message = "Retry after the checkout order has been persisted." });
+            var record = await _db.ProcessedWebhookEvents
+                .FirstOrDefaultAsync(e => e.TenantId == payment.TenantId && e.Provider == "razorpay" && e.EventId == evt.EventId, ct);
+            if (record is { Status: ProcessedWebhookEvent.Processed }) return Ok(new { status = "duplicate" });
+            var invoice = await _db.Invoices
+                .FirstOrDefaultAsync(i => i.Id == payment.InvoiceId && i.TenantId == payment.TenantId, ct);
+            if (invoice is null || !InvoiceAccounting.CaptureAgrees(payment, evt) || !InvoiceAccounting.ReferenceAgrees(invoice, evt.Reference))
+                return BadRequest(new { error = "capture_does_not_match_order" });
+            if (payment.Status == PaymentStatus.Completed && payment.VerificationStatus == PaymentVerificationStatus.Confirmed
+                && payment.RazorpayPaymentId == evt.ProviderPaymentId)
             {
-                var eventName = eventProp.GetString();
-                if (string.Equals(eventName, "payment.captured", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(eventName, "order.paid", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (doc.RootElement.TryGetProperty("payload", out var payload) &&
-                        payload.TryGetProperty("payment", out var payObj) &&
-                        payObj.TryGetProperty("entity", out var entity))
-                    {
-                        var razorpayPaymentId = entity.TryGetProperty("id", out var idProp) ? idProp.GetString() : null;
-                        var razorpayOrderId = entity.TryGetProperty("order_id", out var orderProp) ? orderProp.GetString() : null;
-
-                        Payment? payment = null;
-                        if (!string.IsNullOrEmpty(razorpayPaymentId))
-                        {
-                            payment = await _db.Payments.IgnoreQueryFilters()
-                                .FirstOrDefaultAsync(p => p.RazorpayPaymentId == razorpayPaymentId, ct);
-                        }
-
-                        if (payment is null && !string.IsNullOrEmpty(razorpayOrderId))
-                        {
-                            payment = await _db.Payments.IgnoreQueryFilters()
-                                .FirstOrDefaultAsync(p => p.RazorpayOrderId == razorpayOrderId, ct);
-                        }
-
-                        if (payment is not null && payment.Status != PaymentStatus.Completed)
-                        {
-                            payment.Status = PaymentStatus.Completed;
-                            payment.VerificationStatus = PaymentVerificationStatus.Confirmed;
-                            payment.PaidAt = DateTimeOffset.UtcNow;
-                            payment.ConfirmedAt = DateTimeOffset.UtcNow;
-                            if (!string.IsNullOrEmpty(razorpayPaymentId))
-                                payment.RazorpayPaymentId = razorpayPaymentId;
-
-                            var invoice = await _db.Invoices.IgnoreQueryFilters()
-                                .FirstOrDefaultAsync(i => i.Id == payment.InvoiceId, ct);
-                            if (invoice is not null)
-                            {
-                                if (payment.TenantId == Guid.Empty)
-                                    payment.TenantId = invoice.TenantId;
-                                invoice.PaidAmount += payment.Amount;
-                                invoice.RecalculateBalance();
-                                invoice.Status = invoice.BalanceDue <= 0m ? InvoiceStatus.Paid : InvoiceStatus.PartiallyPaid;
-                                invoice.UpdatedAt = DateTimeOffset.UtcNow;
-
-                                var invoiceRef = invoice.InvoiceNumber > 0
-                                    ? invoice.FormatInvoiceNumber()
-                                    : $"RAZORPAY-{razorpayPaymentId ?? razorpayOrderId}";
-                                _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-                                {
-                                    Id = Guid.NewGuid(),
-                                    TenantId = invoice.TenantId,
-                                    EntryType = FinanceEntryType.PaymentConfirmed,
-                                    ReferenceType = "Payment",
-                                    ReferenceId = payment.Id,
-                                    ReferenceNumber = razorpayPaymentId ?? invoiceRef,
-                                    AccountCategory = "Bank",
-                                    DebitAmount = payment.Amount,
-                                    Narration = $"Razorpay capture for {invoiceRef}",
-                                    CreatedAt = DateTimeOffset.UtcNow
-                                });
-                                _db.FinanceLedgerEntries.Add(new FinanceLedgerEntry
-                                {
-                                    Id = Guid.NewGuid(),
-                                    TenantId = invoice.TenantId,
-                                    EntryType = FinanceEntryType.PaymentConfirmed,
-                                    ReferenceType = "Invoice",
-                                    ReferenceId = invoice.Id,
-                                    ReferenceNumber = invoiceRef,
-                                    AccountCategory = "AccountsReceivable",
-                                    CreditAmount = payment.Amount,
-                                    Narration = $"Receivable offset for {invoiceRef} from Razorpay payment {payment.Id:N}",
-                                    CreatedAt = DateTimeOffset.UtcNow
-                                });
-                            }
-                            await _db.SaveChangesAsync(ct);
-                        }
-                    }
-                }
+                // Already credited through the tenant webhook; only record the common dedupe key.
             }
-
+            else
+            {
+                if (payment.Status != PaymentStatus.Pending || payment.VerificationStatus != PaymentVerificationStatus.Pending
+                    || !InvoiceAccounting.CanCollect(invoice, evt.Amount))
+                    return BadRequest(new { error = "invoice_not_payable" });
+                payment.RazorpayPaymentId = evt.ProviderPaymentId;
+                payment.Utr = evt.Utr ?? payment.Utr;
+                InvoiceAccounting.ConfirmPayment(_db, invoice, payment, null);
+            }
+            if (record is null)
+            {
+                record = new ProcessedWebhookEvent { Id = Guid.NewGuid(), TenantId = payment.TenantId, Provider = "razorpay", EventId = evt.EventId, Amount = evt.Amount, Utr = evt.Utr, Reference = evt.Reference, RawPayload = bodyText.Length > 4000 ? bodyText[..4000] : bodyText };
+                _db.ProcessedWebhookEvents.Add(record);
+            }
+            record.Status = ProcessedWebhookEvent.Processed;
+            record.PaymentId = payment.Id;
+            await _db.SaveChangesAsync(ct);
             await rlsTransaction.CommitAsync(ct);
         }
-        catch
+        catch (DbUpdateException ex) when (InvoiceAccounting.IsWebhookDuplicate(ex))
         {
             await rlsTransaction.RollbackAsync(ct);
-            // Non-2xx so Razorpay retries; returning 200 here silently loses the capture.
-            return StatusCode(500, new { error = "webhook_processing_failed" });
+            _db.ChangeTracker.Clear();
+            return Ok(new { status = "duplicate" });
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex))
+        {
+            await rlsTransaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return StatusCode(503, new { error = "payment_changed_concurrently" });
         }
 
         return Ok(new { status = "ok" });
@@ -1752,18 +1723,23 @@ public class InvoicesController : ControllerBase
     /// Every print event is logged to the append-only InvoicePrintLogs table.
     /// </summary>
     [HttpGet("invoices/{id:guid}/pdf")]
-    [Authorize]
+    [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Pharmacist")]
     public async Task<IActionResult> GetInvoicePdf(Guid id, [FromServices] IPdfService pdfService, CancellationToken ct)
     {
+        var selected = await SelectedBillingMembershipAsync(ct);
+        if (selected is null) return Forbid();
         var invoice = await _db.Invoices
             .Include(i => i.LineItems)
             .Include(i => i.Payments)
             .Include(i => i.Appointment)
                 .ThenInclude(a => a!.Patient)
-            .FirstOrDefaultAsync(i => i.Id == id, ct);
+            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == selected.TenantId
+                && (i.AppointmentId == null || i.Appointment != null && i.Appointment.TenantId == selected.TenantId && i.Appointment.ClinicId == selected.ClinicId), ct);
 
         if (invoice is null)
             return NotFound(new { error = "invoice_not_found" });
+
+        if (selected.Role == UserRole.Pharmacist && invoice.InvoiceType != InvoiceType.Pharmacy) return Forbid();
 
         if (invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled)
         {
@@ -1774,33 +1750,28 @@ public class InvoicesController : ControllerBase
             });
         }
 
-        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.TenantId == invoice.TenantId, ct);
+        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.Id == selected.ClinicId && c.TenantId == selected.TenantId, ct);
         var taxProfile = await _db.TenantTaxProfiles.AsNoTracking()
             .FirstOrDefaultAsync(p => p.TenantId == invoice.TenantId, ct);
         var supplierGstin = invoice.InvoiceType == InvoiceType.Pharmacy
             ? clinic?.PharmacyGstNumber
             : taxProfile?.Gstin;
 
-        var priorPrints = await _db.InvoicePrintLogs
-            .CountAsync(l => l.InvoiceId == id, ct);
-
-        bool isDuplicate = priorPrints > 0;
-
-        var printLog = new InvoicePrintLog
+        var copyNumber = await NextPrintCopyAsync(invoice, ct);
+        bool isDuplicate = copyNumber > 1;
+        byte[] pdfBytes;
+        try { pdfBytes = pdfService.GenerateInvoicePdf(invoice, clinic, isDuplicate, supplierGstin); }
+        catch (EncoderFallbackException)
         {
-            Id = Guid.NewGuid(),
-            TenantId = invoice.TenantId,
-            InvoiceId = invoice.Id,
-            PrintedByUserId = User.GetUserId() ?? Guid.Empty,
-            PrintedAt = DateTimeOffset.UtcNow,
-            CopyNumber = priorPrints + 1,
-            Watermark = isDuplicate ? "DUPLICATE COPY" : "ORIGINAL",
-            IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
-        };
-        _db.InvoicePrintLogs.Add(printLog);
-        await _db.SaveChangesAsync(ct);
-
-        var pdfBytes = pdfService.GenerateInvoicePdf(invoice, clinic, isDuplicate, supplierGstin);
+            return UnprocessableEntity(new { error = "invoice_pdf_font_unsupported", message = "The PDF font cannot represent this invoice's text. No print was recorded." });
+        }
+        RecordPrint(invoice, copyNumber);
+        try { await _db.SaveChangesAsync(ct); }
+        catch (DbUpdateConcurrencyException)
+        {
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "invoice_changed_concurrently", message = "Retry printing after reloading the invoice." });
+        }
         var invoiceRef = invoice.FormatInvoiceNumber();
         var filename = $"{invoiceRef}_{(isDuplicate ? "DUPLICATE" : "ORIGINAL")}.pdf";
 
@@ -1812,19 +1783,25 @@ public class InvoicesController : ControllerBase
     /// Pending approval or Rejected credit notes cannot be printed.
     /// </summary>
     [HttpGet("credit-notes/{id:guid}/pdf")]
-    [Authorize]
+    [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Pharmacist")]
     public async Task<IActionResult> GetCreditNotePdf(Guid id, [FromServices] IPdfService pdfService, CancellationToken ct)
     {
+        var selected = await SelectedBillingMembershipAsync(ct);
+        if (selected is null) return Forbid();
         var creditNote = await _db.CreditNotes
             .Include(cn => cn.Invoice)
                 .ThenInclude(i => i.LineItems)
             .Include(cn => cn.Invoice)
                 .ThenInclude(i => i.Appointment)
                     .ThenInclude(a => a!.Patient)
-            .FirstOrDefaultAsync(cn => cn.Id == id, ct);
+            .FirstOrDefaultAsync(cn => cn.Id == id && cn.TenantId == selected.TenantId && cn.Invoice.TenantId == selected.TenantId
+                && (cn.Invoice.AppointmentId == null || cn.Invoice.Appointment != null
+                    && cn.Invoice.Appointment.TenantId == selected.TenantId && cn.Invoice.Appointment.ClinicId == selected.ClinicId), ct);
 
         if (creditNote is null)
             return NotFound(new { error = "credit_note_not_found" });
+
+        if (selected.Role == UserRole.Pharmacist && creditNote.Invoice.InvoiceType != InvoiceType.Pharmacy) return Forbid();
 
         if (creditNote.Status != CreditNoteStatus.Approved)
         {
@@ -1835,14 +1812,19 @@ public class InvoicesController : ControllerBase
             });
         }
 
-        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.TenantId == creditNote.TenantId, ct);
+        var clinic = await _db.Clinics.FirstOrDefaultAsync(c => c.Id == selected.ClinicId && c.TenantId == selected.TenantId, ct);
         var taxProfile = await _db.TenantTaxProfiles.AsNoTracking()
             .FirstOrDefaultAsync(p => p.TenantId == creditNote.TenantId, ct);
         var supplierGstin = creditNote.Invoice.InvoiceType == InvoiceType.Pharmacy
             ? clinic?.PharmacyGstNumber
             : taxProfile?.Gstin;
 
-        var pdfBytes = pdfService.GenerateCreditNotePdf(creditNote, creditNote.Invoice, clinic, supplierGstin);
+        byte[] pdfBytes;
+        try { pdfBytes = pdfService.GenerateCreditNotePdf(creditNote, creditNote.Invoice, clinic, supplierGstin); }
+        catch (EncoderFallbackException)
+        {
+            return UnprocessableEntity(new { error = "credit_note_pdf_font_unsupported", message = "The PDF font cannot represent this credit note's text." });
+        }
         var cnRef = creditNote.FormatCreditNoteNumber();
         var filename = $"{cnRef}.pdf";
 
@@ -1907,14 +1889,15 @@ public record CreateRefundRequest(
 
     PaymentMethod Method,
 
-    [Required(ErrorMessage = "Refund reference (UTR / Gateway refund id / voucher) is required"), MaxLength(100)]
-    string RefundReference,
+    [MaxLength(100)]
+    string? RefundReference,
 
     [Required(ErrorMessage = "Reason is required"), MinLength(3), MaxLength(500)]
     string Reason,
 
-    [RegularExpression(@"^IDEMP-REF-[a-zA-Z0-9\-]+$", ErrorMessage = "IdempotencyKey must follow format IDEMP-REF-{UUID}")]
-    string? IdempotencyKey = null);
+    [Required, MaxLength(128), RegularExpression(@"^IDEMP-REF-[a-zA-Z0-9\-]+$", ErrorMessage = "IdempotencyKey must follow format IDEMP-REF-{UUID}")]
+    string? IdempotencyKey = null,
+    Guid? SourcePaymentId = null);
 
 public record ApproveRefundRequest(
     [MaxLength(500)]

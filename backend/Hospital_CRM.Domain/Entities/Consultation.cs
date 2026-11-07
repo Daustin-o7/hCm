@@ -41,6 +41,9 @@ public class Consultation : ITenantScoped
     // Core investigations list (independent of lab module)
     public string? AdvisedInvestigations { get; set; }
 
+    // Pending selections only; finalization creates LabOrders and clears this field.
+    public string[]? DraftLabTests { get; set; }
+
     // Diagnosis coding (ICD-10)
     [MaxLength(20)]
     public string? IcdCode { get; set; }

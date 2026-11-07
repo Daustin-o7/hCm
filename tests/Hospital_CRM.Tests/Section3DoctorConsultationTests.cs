@@ -1,11 +1,13 @@
 using System.Security.Claims;
 using Hospital_CRM.Api.Controllers;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace Hospital_CRM.Tests;
@@ -18,17 +20,18 @@ public class Section3DoctorConsultationTests
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
-    private ConsultationsController CreateController(HospitalCrmDbContext db, Guid doctorId, Guid tenantId)
+    private ConsultationsController CreateController(HospitalCrmDbContext db, Guid doctorId, Guid tenantId, Guid clinicId)
     {
-        var controller = new ConsultationsController(db);
+        var controller = new ConsultationsController(db, NullLogger<ConsultationsController>.Instance, tenantContext: new TenantContext());
         var claims = new[]
         {
             new Claim("sub", doctorId.ToString()),
             new Claim("role", "Doctor"),
-            new Claim("tenant_id", tenantId.ToString())
+            new Claim("tenant_id", tenantId.ToString()),
+            new Claim("clinicId", clinicId.ToString())
         };
         var identity = new ClaimsIdentity(claims, "TestAuth");
         controller.ControllerContext = new ControllerContext
@@ -133,7 +136,7 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, _, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         var result = await controller.ClaimAppointment(appointment.Id, CancellationToken.None);
         var okResult = Assert.IsType<OkObjectResult>(result);
@@ -148,10 +151,10 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, _, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         // First claim
-        await controller.ClaimAppointment(appointment.Id, CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.ClaimAppointment(appointment.Id, CancellationToken.None));
 
         // Park patient (e.g. sent for external test or vitals)
         var parkResult = await controller.ParkAppointment(appointment.Id, CancellationToken.None);
@@ -173,7 +176,7 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, _, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         var draftRequest = new SaveConsultationDraftRequest(
             ChiefComplaint: "Intermittent headaches and fever",
@@ -208,7 +211,7 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, patient, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         var rxItems = new List<StructuredPrescriptionItemRequest>
         {
@@ -284,7 +287,7 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, patient, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         // Set patient to child (< 12 years)
         patient.ApproxAge = 5;
@@ -356,7 +359,7 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, _, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         var rxItems = new List<StructuredPrescriptionItemRequest>
         {
@@ -404,7 +407,7 @@ public class Section3DoctorConsultationTests
     {
         var db = CreateInMemoryDb();
         var (doctor, _, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         // Finalize v1
         var finalizeRequest = new FinalizeConsultationRequest(
@@ -422,7 +425,7 @@ public class Section3DoctorConsultationTests
             PrescriptionItems: null,
             OrderedLabTests: null
         );
-        await controller.FinalizeConsultation(appointment.Id, finalizeRequest, CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(appointment.Id, finalizeRequest, CancellationToken.None));
 
         var v1 = await db.Consultations.FirstAsync(c => c.AppointmentId == appointment.Id);
 
@@ -473,19 +476,22 @@ public class Section3DoctorConsultationTests
         Assert.Equal(2, allVersions.Count);
         Assert.Equal(1, allVersions[0].Version);
         Assert.Equal(ConsultationStatus.Finalized, allVersions[0].Status);
+        Assert.Equal("Bronchitis", allVersions[0].Diagnosis);
+        Assert.Equal("Cough and mild shortness of breath", allVersions[0].ChiefComplaint);
 
         Assert.Equal(2, allVersions[1].Version);
         Assert.Equal(ConsultationStatus.Amended, allVersions[1].Status);
+        Assert.Equal("Acute Asthmatic Bronchitis", allVersions[1].Diagnosis);
         Assert.Equal(allVersions[0].Id, allVersions[1].PreviousVersionId);
         Assert.Equal("Spirometry result reviewed; patient has acute bronchial hyperreactivity", allVersions[1].AmendmentReason);
     }
 
     [Fact]
-    public async Task VerifyPrescription_ReturnsPublicSafeVerificationDetails()
+    public async Task VerifyBoundPrescription_ReturnsPublicSafeVerificationDetails()
     {
         var db = CreateInMemoryDb();
         var (doctor, patient, appointment, tenant) = SetupBasicClinic(db);
-        var controller = CreateController(db, doctor.Id, tenant.Id);
+        var controller = CreateController(db, doctor.Id, tenant.Id, appointment.ClinicId);
 
         var finalizeRequest = new FinalizeConsultationRequest(
             ChiefComplaint: "Acid peptic disease",
@@ -505,15 +511,35 @@ public class Section3DoctorConsultationTests
             },
             OrderedLabTests: null
         );
-        await controller.FinalizeConsultation(appointment.Id, finalizeRequest, CancellationToken.None);
+        Assert.IsType<OkObjectResult>(await controller.FinalizeConsultation(appointment.Id, finalizeRequest, CancellationToken.None));
 
         var finalized = await db.Consultations.FirstAsync(c => c.AppointmentId == appointment.Id);
         var verifyCode = finalized.VerificationQrCode;
         Assert.NotNull(verifyCode);
+        Assert.True(PublicTokenRouting.IsWellFormed(PublicTokenPurpose.Prescription, verifyCode));
 
-        // Verify with public chemist verification endpoint
-        var verifyResult = await controller.VerifyPrescription(verifyCode, CancellationToken.None);
+        // SQL token routing is covered by Part2TenantBoundaryPostgresTests; no authenticated caller is needed after binding.
+        controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity());
+        var verifyResult = await Part1SaleReadinessTests.VerifyBound(controller, new(tenant.Id, finalized.Id), verifyCode);
         var okResult = Assert.IsType<OkObjectResult>(verifyResult);
         Assert.NotNull(okResult.Value);
+        var body = Part1SaleReadinessTests.Json(okResult.Value);
+        Assert.True(body.GetProperty("verified").GetBoolean());
+        Assert.True(body.GetProperty("signatureValid").GetBoolean());
+        Assert.Equal("full_content", body.GetProperty("contentIntegrity").GetString());
+        Assert.Equal("valid", body.GetProperty("status").GetString());
+        Assert.Equal(verifyCode, body.GetProperty("verificationCode").GetString());
+        Assert.Equal("Ra***", body.GetProperty("patientInitials").GetString());
+        Assert.Equal(patient.ApproxAge, body.GetProperty("patientAge").GetInt32());
+        Assert.Equal(doctor.Name, body.GetProperty("doctorName").GetString());
+        Assert.Equal("MCI-2015-88941", body.GetProperty("doctorRegistrationNumber").GetString());
+        var medicine = Assert.Single(body.GetProperty("medicines").EnumerateArray());
+        Assert.Equal("Pantoprazole", medicine.GetProperty("genericName").GetString());
+        Assert.Equal("40mg", medicine.GetProperty("strength").GetString());
+        foreach (var privateField in new[] { "patientName", "patientId", "phone", "uhid", "chiefComplaint", "observations", "diagnosis" })
+            Assert.False(body.TryGetProperty(privateField, out _), $"Public verification exposes {privateField}.");
+        Assert.DoesNotContain(patient.Name, body.GetRawText());
+        Assert.DoesNotContain(patient.Phone, body.GetRawText());
+        Assert.DoesNotContain(patient.Uhid!, body.GetRawText());
     }
 }

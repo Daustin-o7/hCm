@@ -9,6 +9,7 @@ public class PatientDepositAllocation : ITenantScoped
     public Guid TenantId { get; set; }
     public Guid PatientDepositId { get; set; }
     public Guid InvoiceId { get; set; }
+    public Guid? PaymentId { get; set; }
 
     [Column(TypeName = "decimal(18,2)")]
     public decimal AllocatedAmount { get; set; }

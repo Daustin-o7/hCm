@@ -35,13 +35,11 @@ public class NurseController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Receptionist, UserRole.Doctor);
+        if (scope is null)
             return Forbid();
 
-        var tenantId = User.GetTenantId();
-        var nurses = await _db.NurseProfiles
-            .Where(n => (tenantId == null || n.TenantId == tenantId.Value) && n.User.ClinicId == adminUser.ClinicId)
+        var nurses = await NursingScope.Profiles(_db, scope)
             .OrderBy(n => n.User.Name)
             .Select(n => new
             {
@@ -73,13 +71,12 @@ public class NurseController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (scope is null)
             return Forbid();
 
-        var tenantId = User.GetTenantId();
-        var nurse = await _db.NurseProfiles
-            .Where(n => n.Id == id && (tenantId == null || n.TenantId == tenantId.Value) && n.User.ClinicId == adminUser.ClinicId)
+        var nurse = await NursingScope.Profiles(_db, scope)
+            .Where(n => n.Id == id && (scope.Role != UserRole.Nurse || n.UserId == scope.UserId))
             .Select(n => new
             {
                 id = n.Id,
@@ -127,13 +124,12 @@ public class NurseController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var user = await _db.Users.FindAsync([userId.Value], ct);
-        if (user?.ClinicId is null)
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.Nurse);
+        if (scope is null)
             return Forbid();
 
-        var tenantId = User.GetTenantId();
-        var peers = await _db.NurseProfiles
-            .Where(n => (tenantId == null || n.TenantId == tenantId.Value) && n.User.ClinicId == user.ClinicId && n.UserId != userId.Value)
+        var peers = await NursingScope.Profiles(_db, scope)
+            .Where(n => n.UserId != userId.Value)
             .OrderBy(n => n.User.Name)
             .Select(n => new
             {
@@ -157,17 +153,21 @@ public class NurseController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin);
+        if (scope is null)
             return Forbid();
 
-        var tenantId = User.GetTenantId();
-        var nurse = await _db.NurseProfiles
-            .Include(n => n.User)
-            .FirstOrDefaultAsync(n => n.Id == id && (tenantId == null || n.TenantId == tenantId.Value) && n.User.ClinicId == adminUser.ClinicId, ct);
+        var nurse = await NursingScope.Profiles(_db, scope).FirstOrDefaultAsync(n => n.Id == id, ct);
 
         if (nurse == null)
             return NotFound(new { error = "nurse_not_found" });
+
+        if (request.DepartmentId.HasValue && !await _db.Departments.AnyAsync(d => d.Id == request.DepartmentId &&
+            d.TenantId == scope.TenantId && d.ClinicId == scope.ClinicId, ct))
+            return NotFound(new { error = "department_not_found" });
+        if (request.SupervisorId.HasValue && !await NursingScope.ProxyParties(_db, scope)
+            .AnyAsync(m => m.UserId == request.SupervisorId, ct))
+            return NotFound(new { error = "supervisor_not_found" });
 
         if (!string.IsNullOrWhiteSpace(request.Designation))
             nurse.Designation = request.Designation;
@@ -231,9 +231,10 @@ public class NurseController : ControllerBase
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var tenantId = User.GetTenantId();
-        var nurse = await _db.NurseProfiles
-            .Where(n => n.UserId == userId.Value && (tenantId == null || n.TenantId == tenantId.Value))
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.Nurse);
+        if (scope is null) return Forbid();
+        var nurse = await NursingScope.Profiles(_db, scope)
+            .Where(n => n.UserId == userId.Value)
             .Select(n => new
             {
                 id = n.Id,
@@ -256,9 +257,11 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse")]
     public async Task<IActionResult> GetAvailability(Guid id, CancellationToken ct)
     {
-        var tenantId = User.GetTenantId();
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (scope is null) return Forbid();
+        if (!await CanAccessProfileAsync(scope, id, ct)) return NotFound(new { error = "nurse_not_found" });
         var availabilities = await _db.NurseAvailabilities
-            .Where(a => a.NurseProfileId == id && (tenantId == null || a.TenantId == tenantId.Value))
+            .Where(a => a.NurseProfileId == id && a.TenantId == scope.TenantId)
             .OrderByDescending(a => a.StartDate)
             .Select(a => new
             {
@@ -281,6 +284,16 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse")]
     public async Task<IActionResult> SetAvailability(Guid id, [FromBody] SetAvailabilityRequest request, CancellationToken ct)
     {
+        var userId = User.GetUserId();
+        if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (scope is null) return Forbid();
+
+        var nurse = await NursingScope.Profiles(_db, scope).FirstOrDefaultAsync(n => n.Id == id, ct);
+        if (nurse is null) return NotFound(new { error = "nurse_not_found" });
+
+        if (scope.Role == UserRole.Nurse && nurse.UserId != userId.Value) return Forbid();
+
         if (request.StartDate > request.EndDate)
             return BadRequest(new { error = "start_date_must_be_before_end_date" });
 
@@ -288,7 +301,7 @@ public class NurseController : ControllerBase
         {
             Id = Guid.NewGuid(),
             NurseProfileId = id,
-            TenantId = User.GetTenantId() ?? Guid.Empty,
+            TenantId = nurse.TenantId,
             StartDate = request.StartDate,
             EndDate = request.EndDate,
             PreferredShift = request.PreferredShift,
@@ -311,19 +324,18 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("Nurse")]
     public async Task<IActionResult> RequestLeave(Guid id, [FromBody] CreateLeaveRequest request, CancellationToken ct)
     {
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.Nurse);
+        if (scope is null) return Forbid();
+        if (!await CanAccessProfileAsync(scope, id, ct)) return Forbid();
+
         if (request.StartDate > request.EndDate)
             return BadRequest(new { error = "start_date_must_be_before_end_date" });
-
-        var userId = User.GetUserId();
-        var nurse = await _db.NurseProfiles.FindAsync([id], ct);
-        if (nurse == null || (userId.HasValue && nurse.UserId != userId.Value))
-            return Forbid();
 
         var leave = new LeaveRequest
         {
             Id = Guid.NewGuid(),
             NurseProfileId = id,
-            TenantId = User.GetTenantId() ?? Guid.Empty,
+            TenantId = scope.TenantId,
             StartDate = request.StartDate,
             EndDate = request.EndDate,
             Type = request.Type,
@@ -343,9 +355,11 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse")]
     public async Task<IActionResult> ListLeaves(Guid id, CancellationToken ct)
     {
-        var tenantId = User.GetTenantId();
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (scope is null) return Forbid();
+        if (!await CanAccessProfileAsync(scope, id, ct)) return NotFound(new { error = "nurse_not_found" });
         var leaves = await _db.LeaveRequests
-            .Where(l => l.NurseProfileId == id && (tenantId == null || l.TenantId == tenantId.Value))
+            .Where(l => l.NurseProfileId == id && l.TenantId == scope.TenantId)
             .OrderByDescending(l => l.StartDate)
             .Select(l => new
             {
@@ -367,10 +381,12 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> ListAllLeaveRequests([FromQuery] string? status, CancellationToken ct)
     {
-        var tenantId = User.GetTenantId();
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin);
+        if (scope is null) return Forbid();
+        var profiles = NursingScope.Profiles(_db, scope);
         var query = _db.LeaveRequests
             .Include(l => l.Nurse).ThenInclude(n => n.User)
-            .Where(l => tenantId == null || l.TenantId == tenantId.Value);
+            .Where(l => l.TenantId == scope.TenantId && profiles.Any(n => n.Id == l.NurseProfileId));
 
         if (!string.IsNullOrWhiteSpace(status) && Enum.TryParse<LeaveStatus>(status, true, out var st))
             query = query.Where(l => l.Status == st);
@@ -402,11 +418,13 @@ public class NurseController : ControllerBase
         if (!adminId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
 
-        var adminUser = await _db.Users.FindAsync([adminId.Value], ct);
-        if (adminUser?.ClinicId is null)
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (scope is null)
             return Forbid();
 
-        var leave = await _db.LeaveRequests.FindAsync([id], ct);
+        var profiles = NursingScope.Profiles(_db, scope);
+        var leave = await _db.LeaveRequests.FirstOrDefaultAsync(l => l.Id == id && l.TenantId == scope.TenantId &&
+            profiles.Any(n => n.Id == l.NurseProfileId), ct);
         if (leave == null)
             return NotFound(new { error = "leave_request_not_found" });
 
@@ -414,30 +432,18 @@ public class NurseController : ControllerBase
             return BadRequest(new { error = "invalid_leave_status" });
 
         Guid? approvedOnBehalfOf = null;
-        if (adminUser.Role == UserRole.Nurse)
+        var requesterUserId = await profiles.Where(n => n.Id == leave.NurseProfileId).Select(n => n.UserId).SingleAsync(ct);
+        if (requesterUserId == scope.UserId)
+            return BadRequest(new { error = "cannot_approve_own_leave_request" });
+        if (scope.Role == UserRole.Nurse)
         {
-            var myProfile = await _db.NurseProfiles
-                .FirstOrDefaultAsync(p => p.UserId == adminId.Value && p.User.ClinicId == adminUser.ClinicId, ct);
-
-            if (myProfile != null && myProfile.Id == leave.NurseProfileId)
-                return BadRequest(new { error = "cannot_approve_own_leave_request" });
-
-            var activeProxy = await _db.AuthorityProxies
-                .FirstOrDefaultAsync(p => p.DesigneeUserId == adminId.Value &&
-                    p.ClinicId == adminUser.ClinicId &&
-                    !p.IsRevoked &&
-                    p.ValidFrom <= DateTimeOffset.UtcNow &&
-                    p.ValidUntil >= DateTimeOffset.UtcNow &&
-                    p.Permissions.Contains("leave.approve"), ct);
+            var activeProxy = await NursingScope.ActiveProxyAsync(_db, scope, "leave.approve", ct);
 
             if (activeProxy is null)
                 return Forbid();
 
             // Acting for the person whose leave is being decided is still self-approval.
-            var delegatorProfile = await _db.NurseProfiles
-                .FirstOrDefaultAsync(p => p.UserId == activeProxy.DelegatorUserId, ct);
-
-            if (delegatorProfile != null && delegatorProfile.Id == leave.NurseProfileId)
+            if (activeProxy.DelegatorUserId == requesterUserId)
                 return BadRequest(new { error = "cannot_approve_on_behalf_of_leave_requester" });
 
             approvedOnBehalfOf = activeProxy.DelegatorUserId;
@@ -455,7 +461,7 @@ public class NurseController : ControllerBase
         if (newStatus == LeaveStatus.Approved)
         {
             var conflictingShifts = await _db.NurseShifts.Where(s =>
-                s.NurseProfileId == leave.NurseProfileId &&
+                s.TenantId == scope.TenantId && s.ClinicId == scope.ClinicId && s.NurseProfileId == leave.NurseProfileId &&
                 s.Date >= leave.StartDate && s.Date <= leave.EndDate &&
                 s.Status == ShiftStatus.Assigned).ToListAsync(ct);
 
@@ -493,12 +499,16 @@ public class NurseController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Nurse")]
     public async Task<IActionResult> GetLeaveBalance(Guid id, [FromQuery] int? year, CancellationToken ct)
     {
+        var scope = await NursingScope.SelectedAsync(_db, User, ct, UserRole.ClinicAdmin, UserRole.Nurse);
+        if (scope is null) return Forbid();
+        if (!await CanAccessProfileAsync(scope, id, ct)) return NotFound(new { error = "nurse_not_found" });
         var targetYear = year ?? DateTime.UtcNow.Year;
+        if (targetYear < 1 || targetYear > 9999) return BadRequest(new { error = "invalid_year" });
         var yearStart = new DateOnly(targetYear, 1, 1);
         var yearEnd = new DateOnly(targetYear, 12, 31);
 
         var approved = await _db.LeaveRequests
-            .Where(l => l.NurseProfileId == id && l.Status == LeaveStatus.Approved &&
+            .Where(l => l.TenantId == scope.TenantId && l.NurseProfileId == id && l.Status == LeaveStatus.Approved &&
                         l.StartDate <= yearEnd && l.EndDate >= yearStart)
             .Select(l => new { l.Type, l.StartDate, l.EndDate })
             .ToListAsync(ct);
@@ -514,6 +524,10 @@ public class NurseController : ControllerBase
 
         return Ok(new { year = yearStart.Year, daysTakenByType = byType, totalDays = byType.Values.Sum() });
     }
+
+    private Task<bool> CanAccessProfileAsync(TenantMembership scope, Guid id, CancellationToken ct) =>
+        NursingScope.Profiles(_db, scope).AnyAsync(n => n.Id == id &&
+            (scope.Role != UserRole.Nurse || n.UserId == scope.UserId), ct);
 }
 
 public record UpdateNurseRequest(

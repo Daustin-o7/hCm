@@ -27,7 +27,7 @@ public class PdfService : IPdfService
 
     public byte[] GeneratePrescriptionPdf(Prescription prescription, Consultation consultation, Clinic? clinic, bool isDuplicate)
     {
-        var canvas = new PdfCanvas();
+        using var canvas = new PrescriptionPdfCanvas();
 
         // 1. Watermark if duplicate
         if (isDuplicate)
@@ -35,126 +35,94 @@ public class PdfService : IPdfService
             canvas.DrawWatermark("DUPLICATE COPY");
         }
 
-        // 2. Clinic Header
         float y = 800;
-        var clinicName = clinic?.LegalName ?? clinic?.Name ?? "HOSPITAL CLINIC & MEDICAL CENTRE";
-        canvas.DrawText(clinicName, 40, y, 16, bold: true, r: 0.08f, g: 0.25f, b: 0.45f);
-        y -= 15;
-
-        var clinicSub = $"{clinic?.Address ?? "Clinical Healthcare Services"} | Phone: {clinic?.Phone ?? "N/A"}";
-        canvas.DrawText(clinicSub, 40, y, 9, bold: false, r: 0.35f, g: 0.35f, b: 0.35f);
-        y -= 12;
-
-        if (!string.IsNullOrWhiteSpace(clinic?.PharmacyLicenceNumber20) || !string.IsNullOrWhiteSpace(clinic?.PharmacyLicenceNumber21))
-        {
-            var lic = $"Retail Drug Lic: Form 20: {clinic.PharmacyLicenceNumber20 ?? "N/A"}, Form 21: {clinic.PharmacyLicenceNumber21 ?? "N/A"}";
-            canvas.DrawText(lic, 40, y, 8, bold: false, r: 0.45f, g: 0.45f, b: 0.45f);
-            y -= 12;
-        }
-
-        canvas.DrawLine(40, y, 555, y, 0.2f, 0.4f, 0.6f, 1.5f);
-        y -= 20;
-
-        // 3. Doctor Details (Left) & Document Title (Right)
-        var doctorName = consultation.Doctor?.Name ?? "Treating Doctor";
-        canvas.DrawText($"DR. {doctorName.ToUpperInvariant()}", 40, y, 12, bold: true, r: 0.1f, g: 0.1f, b: 0.1f);
-        canvas.DrawRightAlignedText("ELECTRONIC PRESCRIPTION", 555, y, 12, bold: true, r: 0.08f, g: 0.25f, b: 0.45f);
-        y -= 14;
-
-        var doctorQual = $"{consultation.DoctorQualifications ?? "MBBS"} | Reg No: {consultation.DoctorRegistrationNumber ?? "NMC/SMC Registered"}";
-        canvas.DrawText(doctorQual, 40, y, 9, bold: false, r: 0.3f, g: 0.3f, b: 0.3f);
+        var clinicName = clinic?.LegalName ?? clinic?.Name ?? "Clinic not recorded";
+        var doctorName = consultation.Doctor?.Name ?? "Not recorded";
         var rxDate = (consultation.SignedAt ?? consultation.CreatedAt).ToString("dd-MMM-yyyy HH:mm");
-        canvas.DrawRightAlignedText($"Date: {rxDate} | Version: {consultation.Version}", 555, y, 9, bold: false, r: 0.3f, g: 0.3f, b: 0.3f);
-        y -= 18;
-
-        // 4. Patient Information Box
-        canvas.DrawRect(40, y - 40, 515, 45, 0.95f, 0.97f, 0.99f, fill: true);
-        canvas.DrawRect(40, y - 40, 515, 45, 0.8f, 0.85f, 0.9f, fill: false);
-
         var patient = consultation.Appointment?.Patient;
-        var patientName = patient?.Name ?? "Walk-in Patient";
+        var patientName = patient?.Name ?? "Not recorded";
         var uhid = patient?.Uhid ?? "N/A";
-        var ageGender = $"Age: {patient?.ApproxAge?.ToString() ?? "N/A"} | Gender: {patient?.Gender.ToString() ?? "N/A"}";
-        var phone = $"Phone: {patient?.Phone ?? "N/A"}";
+        int? continuedMedicine = null;
 
-        canvas.DrawText($"Patient Name: {patientName}", 50, y - 14, 9, bold: true);
-        canvas.DrawText($"UHID: {uhid}", 250, y - 14, 9, bold: true);
-        canvas.DrawRightAlignedText(phone, 545, y - 14, 9, bold: false);
-
-        canvas.DrawText(ageGender, 50, y - 30, 9, bold: false);
-        var address = $"Address: {patient?.Address ?? "Local"}";
-        canvas.DrawText(address, 250, y - 30, 9, bold: false);
-        y -= 55;
-
-        // 5. Clinical Diagnosis
-        if (!string.IsNullOrWhiteSpace(consultation.Diagnosis))
+        void Footer()
         {
-            canvas.DrawText("DIAGNOSIS / CLINICAL FINDINGS:", 40, y, 9, bold: true, r: 0.08f, g: 0.25f, b: 0.45f);
-            y -= 14;
-            canvas.DrawText(consultation.Diagnosis, 50, y, 9, bold: false, r: 0.1f, g: 0.1f, b: 0.1f);
-            y -= 20;
+            canvas.DrawLine(40, 140, 555, 140, 0.8f, 0.8f, 0.8f);
+            if (!string.IsNullOrWhiteSpace(consultation.VerificationQrCode))
+                canvas.DrawQrCode(BuildVerificationUrl(_publicBaseUrl, consultation.VerificationQrCode, consultation.Version), 40, 50, 80);
+            canvas.DrawText($"Verify code: {consultation.VerificationQrCode ?? "Not recorded"} | Version {consultation.Version}", 130, 126, 7);
+            canvas.DrawText(consultation.DigitalSignatureHash?.StartsWith("v2:", StringComparison.Ordinal) == true
+                ? "Clinical content seal (SHA-256, v2)" : "Legacy seal - medicine and note content not verified", 130, 112, 8, bold: true);
+            canvas.DrawText(consultation.DigitalSignatureHash ?? "Seal not recorded", 130, 98, 7);
+            canvas.DrawText("Tamper-evidence check; not a certificate-backed digital signature.", 130, 84, 7);
+            canvas.DrawText("Issuer credentials are recorded at the start of this prescription.", 130, 70, 8);
+            canvas.DrawRightAlignedText($"Page {canvas.PageCount}", 555, 32, 8);
         }
 
-        // 6. Rx Medicines Table Header
-        canvas.DrawText("Rx (MEDICATIONS)", 40, y, 12, bold: true, r: 0.08f, g: 0.25f, b: 0.45f);
-        y -= 16;
+        void NextPage()
+        {
+            Footer();
+            canvas.NewPage();
+            if (isDuplicate) canvas.DrawWatermark("DUPLICATE COPY");
+            canvas.DrawText($"Prescription v{consultation.Version} - continued", 40, 800, 10, bold: true);
+            canvas.DrawText($"UHID: {uhid}", 40, 784, 8);
+            canvas.DrawText($"Code: {consultation.VerificationQrCode ?? "Not recorded"}", 40, 770, 8);
+            y = 746;
+            if (continuedMedicine.HasValue)
+            {
+                canvas.DrawText($"Medicine {continuedMedicine.Value} - continued", 40, y, 9, bold: true);
+                y -= 16;
+            }
+        }
 
-        canvas.DrawRect(40, y - 14, 515, 18, 0.12f, 0.30f, 0.50f, fill: true);
-        canvas.DrawText("#", 45, y - 10, 8, bold: true, r: 1f, g: 1f, b: 1f);
-        canvas.DrawText("MEDICINE & STRENGTH", 65, y - 10, 8, bold: true, r: 1f, g: 1f, b: 1f);
-        canvas.DrawText("FORM", 240, y - 10, 8, bold: true, r: 1f, g: 1f, b: 1f);
-        canvas.DrawText("FREQUENCY", 300, y - 10, 8, bold: true, r: 1f, g: 1f, b: 1f);
-        canvas.DrawText("DURATION", 380, y - 10, 8, bold: true, r: 1f, g: 1f, b: 1f);
-        canvas.DrawText("TIMING / INSTRUCTIONS", 450, y - 10, 8, bold: true, r: 1f, g: 1f, b: 1f);
-        y -= 20;
+        void Write(string text)
+        {
+            var block = canvas.Layout(text);
+            try
+            {
+                foreach (var line in block.Lines)
+                {
+                    if (y - line.Height < 150) NextPage();
+                    canvas.DrawTextLine(line, 40, y);
+                    y -= line.Height;
+                }
+            }
+            finally { block.Clear(); }
+        }
 
-        // 7. Rx Items Rows
+        canvas.DrawText("ELECTRONIC PRESCRIPTION", 40, y, 14, bold: true);
+        y -= 22;
+        Write(clinicName);
+        Write($"{clinic?.Address ?? "Address not recorded"} | Phone: {clinic?.Phone ?? "Not recorded"}");
+        Write($"Doctor: {doctorName}");
+        Write($"Qualifications: {consultation.DoctorQualifications ?? "Not recorded"}");
+        Write($"Registration: {consultation.DoctorRegistrationNumber ?? "Not recorded"}");
+        Write($"Date: {rxDate} | Version: {consultation.Version}");
+        y -= 8;
+        Write($"Patient: {patientName} | UHID: {uhid}");
+        Write($"Age: {patient?.ApproxAge?.ToString() ?? "Not recorded"} | Gender: {patient?.Gender.ToString() ?? "Not recorded"} | Phone: {patient?.Phone ?? "Not recorded"}");
+        Write($"Address: {patient?.Address ?? "Not recorded"}");
+        y -= 8;
+        if (!string.IsNullOrWhiteSpace(consultation.Diagnosis)) Write($"Diagnosis: {consultation.Diagnosis}");
+        Write("Rx (MEDICATIONS)");
         int itemIndex = 1;
-        foreach (var item in prescription.Items)
+        var items = consultation.Prescriptions.Count > 0 ? consultation.Prescriptions.SelectMany(p => p.Items) : prescription.Items;
+        foreach (var item in items)
         {
-            var medName = !string.IsNullOrWhiteSpace(item.BrandName)
-                ? $"{item.BrandName} ({item.GenericName})"
-                : item.MedicineText;
-
-            canvas.DrawText(itemIndex.ToString(), 45, y, 8, bold: false);
-            canvas.DrawText(medName, 65, y, 8, bold: true);
-            canvas.DrawText($"{item.DosageForm} {item.Strength}".Trim(), 240, y, 8, bold: false);
-            canvas.DrawText(item.Frequency ?? "1-0-1", 300, y, 8, bold: false);
-            canvas.DrawText($"{item.Duration} {item.DurationUnit}", 380, y, 8, bold: false);
-            var timing = $"{item.Timing} {(string.IsNullOrWhiteSpace(item.SpecialInstructions) ? "" : " - " + item.SpecialInstructions)}".Trim();
-            canvas.DrawText(timing, 450, y, 8, bold: false);
-
-            canvas.DrawLine(40, y - 4, 555, y - 4, 0.9f, 0.9f, 0.9f, 0.5f);
-            y -= 16;
-            itemIndex++;
-
-            if (y < 160) break; // Keep space for signature and QR footer
+            if (y < 220) NextPage();
+            var medName = !string.IsNullOrWhiteSpace(item.BrandName) ? $"{item.BrandName} ({item.GenericName})"
+                : !string.IsNullOrWhiteSpace(item.GenericName) ? item.GenericName : item.MedicineText;
+            continuedMedicine = itemIndex;
+            Write($"{itemIndex++}. {medName}");
+            Write($"Form: {item.DosageForm} | Strength: {(!string.IsNullOrWhiteSpace(item.Strength) ? item.Strength : item.DosageText)} | Route: {item.Route}");
+            Write($"Frequency: {(!string.IsNullOrWhiteSpace(item.Frequency) ? item.Frequency : item.FrequencyText)} | Duration: {(item.Duration > 0 ? $"{item.Duration} {item.DurationUnit}" : item.DurationText)} | Quantity: {item.TotalQuantity}");
+            Write($"Timing: {item.Timing ?? "Not recorded"} | Instructions: {item.SpecialInstructions ?? "Not recorded"}");
+            y -= 8;
+            continuedMedicine = null;
         }
-
-        // 8. Bottom Footer with Digital Signature & Real QR Verification Code
-        float footerY = 130;
-        canvas.DrawLine(40, footerY + 10, 555, footerY + 10, 0.8f, 0.8f, 0.8f, 1f);
-
-        // Verification QR code (absolute URL so a phone camera can open it)
-        var qrCodeValue = consultation.VerificationQrCode ?? prescription.Id.ToString("N");
-        var qrUrl = BuildVerificationUrl(_publicBaseUrl, qrCodeValue, consultation.Version);
-        canvas.DrawQrCode(qrUrl, 40, footerY - 80, 80);
-
-        canvas.DrawText("VERIFY RX AUTHENTICITY", 130, footerY - 5, 9, bold: true, r: 0.08f, g: 0.25f, b: 0.45f);
-        canvas.DrawText($"Code: {qrCodeValue}", 130, footerY - 18, 8, bold: false, mono: true, r: 0.2f, g: 0.2f, b: 0.2f);
-        canvas.DrawText("Scan with any mobile camera to verify signed digital copy on clinic portal.", 130, footerY - 30, 8, bold: false, r: 0.4f, g: 0.4f, b: 0.4f);
-
-        // Digital Signature Hash
-        if (!string.IsNullOrWhiteSpace(consultation.DigitalSignatureHash))
-        {
-            canvas.DrawText("SHA-256 DIGITAL SIGNATURE HASH:", 130, footerY - 48, 7, bold: true, r: 0.3f, g: 0.3f, b: 0.3f);
-            canvas.DrawText(consultation.DigitalSignatureHash, 130, footerY - 58, 6.5f, bold: false, mono: true, r: 0.4f, g: 0.4f, b: 0.4f);
-        }
-
-        // Doctor Signature Block (Right)
-        canvas.DrawRightAlignedText($"Electronically Signed by: DR. {doctorName.ToUpperInvariant()}", 555, footerY - 45, 8, bold: true);
-        canvas.DrawRightAlignedText($"Registration No: {consultation.DoctorRegistrationNumber ?? "NMC/SMC"}", 555, footerY - 58, 8, bold: false);
-        canvas.DrawRightAlignedText("Digitally authorized record", 555, footerY - 70, 7.5f, bold: false, r: 0.5f, g: 0.5f, b: 0.5f);
+        if (!string.IsNullOrWhiteSpace(consultation.AdvisedInvestigations)) Write($"Investigations: {consultation.AdvisedInvestigations}");
+        if (consultation.FollowUpDate.HasValue) Write($"Follow-up date: {consultation.FollowUpDate:dd-MMM-yyyy}");
+        if (!string.IsNullOrWhiteSpace(consultation.FollowUpNotes)) Write($"Follow-up instructions: {consultation.FollowUpNotes}");
+        Footer();
 
         return canvas.ToPdfBytes();
     }
@@ -397,6 +365,14 @@ public class PdfService : IPdfService
 public class PdfCanvas
 {
     private readonly StringBuilder _stream = new();
+    private readonly List<string> _pages = [];
+    public int PageCount => _pages.Count + 1;
+
+    public void NewPage()
+    {
+        _pages.Add(_stream.ToString());
+        _stream.Clear();
+    }
 
     public void DrawWatermark(string text)
     {
@@ -479,8 +455,8 @@ public class PdfCanvas
 
     public byte[] ToPdfBytes()
     {
-        var content = _stream.ToString();
-        var contentBytes = Encoding.UTF8.GetBytes(content);
+        var pages = _pages.Append(_stream.ToString()).ToList();
+        var firstFont = 3 + pages.Count * 2;
 
         using var ms = new MemoryStream();
         using var writer = new StreamWriter(ms, Encoding.ASCII);
@@ -498,35 +474,39 @@ public class PdfCanvas
 
         // Object 2: Pages
         offsets.Add(ms.Position);
-        writer.Write("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        writer.Write($"2 0 obj\n<< /Type /Pages /Kids [{string.Join(" ", Enumerable.Range(0, pages.Count).Select(i => $"{3 + i * 2} 0 R"))}] /Count {pages.Count} >>\nendobj\n");
         writer.Flush();
 
-        // Object 3: Page (A4: 595.28 x 841.89)
-        offsets.Add(ms.Position);
-        writer.Write("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> /Contents 4 0 R >>\nendobj\n");
-        writer.Flush();
-
-        // Object 4: Content Stream
-        offsets.Add(ms.Position);
-        writer.Write($"4 0 obj\n<< /Length {contentBytes.Length} >>\nstream\n");
-        writer.Flush();
-        ms.Write(contentBytes, 0, contentBytes.Length);
-        writer.Write("\nendstream\nendobj\n");
-        writer.Flush();
+        for (var i = 0; i < pages.Count; i++)
+        {
+            var pageId = 3 + i * 2;
+            offsets.Add(ms.Position);
+            writer.Write($"{pageId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 {firstFont} 0 R /F2 {firstFont + 1} 0 R /F3 {firstFont + 2} 0 R >> >> /Contents {pageId + 1} 0 R >>\nendobj\n");
+            writer.Flush();
+            // Reject unsupported glyphs rather than issue a document with missing clinical text.
+            var contentBytes = CodePagesEncodingProvider.Instance.GetEncoding(1252,
+                EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback)!.GetBytes(pages[i]);
+            offsets.Add(ms.Position);
+            writer.Write($"{pageId + 1} 0 obj\n<< /Length {contentBytes.Length} >>\nstream\n");
+            writer.Flush();
+            ms.Write(contentBytes);
+            writer.Write("\nendstream\nendobj\n");
+            writer.Flush();
+        }
 
         // Object 5: Helvetica (regular)
         offsets.Add(ms.Position);
-        writer.Write("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
+        writer.Write($"{firstFont} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
         writer.Flush();
 
         // Object 6: Helvetica-Bold
         offsets.Add(ms.Position);
-        writer.Write("6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n");
+        writer.Write($"{firstFont + 1} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n");
         writer.Flush();
 
         // Object 7: Courier (monospace)
         offsets.Add(ms.Position);
-        writer.Write("7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>\nendobj\n");
+        writer.Write($"{firstFont + 2} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>\nendobj\n");
         writer.Flush();
 
         // Xref table
@@ -556,11 +536,10 @@ public class PdfCanvas
             {
                 sb.Append('\\').Append(ch);
             }
-            else if (ch < 32 || ch > 126)
+            else if (char.IsControl(ch))
             {
-                if (ch is '\n' or '\r') sb.Append(' ');
-                else if (ch > 126 && ch <= 255) sb.Append(ch);
-                else sb.Append(' ');
+                if (ch is '\n' or '\r' or '\t') sb.Append(' ');
+                else throw new EncoderFallbackException("PDF text contains an unsupported control character.");
             }
             else
             {

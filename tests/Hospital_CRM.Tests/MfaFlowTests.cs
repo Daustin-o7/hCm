@@ -164,7 +164,7 @@ public class MfaFlowTests
     private static HospitalCrmDbContext CreateDb() =>
         new(new DbContextOptionsBuilder<HospitalCrmDbContext>()
             .UseInMemoryDatabase($"MfaFlowDb_{Guid.NewGuid()}")
-            .Options);
+            .Options, TestMaintenanceTenantContext.Instance);
 
     private sealed class FakeKeyService : IPersistentKeyService
     {

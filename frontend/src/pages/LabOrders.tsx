@@ -5,6 +5,7 @@ import { Modal } from '../components/ui/Modal'
 import { fmtDate } from '../utils/format'
 import { useAuth } from '../context/AuthContext'
 import api from '../services/api'
+import { downloadLabResult } from '../services/downloadLabResult'
 
 interface LabOrder {
   id: string
@@ -29,6 +30,7 @@ interface LabOrderDetail extends LabOrder {
     version: number
     resultText: string | null
     fileUrl: string | null
+    fileExtension: string | null
     isAbnormal: boolean
     referenceRange: string | null
     units: string | null
@@ -44,9 +46,6 @@ const STATUS_LABEL: Record<string, string> = {
   resulted: 'Result entered',
   reviewedbydoctor: 'Reviewed by doctor',
 }
-
-// Lab files are served from the API origin, not under /api/v1.
-const fileHref = (url: string) => `${(api.defaults.baseURL || '').replace(/\/api\/v1\/?$/, '')}${url}`
 
 export default function LabOrders() {
   const { user } = useAuth()
@@ -70,6 +69,7 @@ export default function LabOrders() {
   const [resultUnits, setResultUnits] = useState('')
   const [resultFile, setResultFile] = useState<File | null>(null)
   const [reviewNotes, setReviewNotes] = useState('')
+  const [downloadError, setDownloadError] = useState<string | null>(null)
 
   const showToast = (msg: string, type: 'success' | 'err' = 'success') => {
     setToast({ msg, type })
@@ -100,6 +100,7 @@ export default function LabOrders() {
   useEffect(() => { fetchOrders() }, [fetchOrders])
 
   const openOrder = async (id: string) => {
+    setDownloadError(null)
     setResultText('')
     setResultAbnormal(false)
     setResultRange('')
@@ -128,6 +129,20 @@ export default function LabOrders() {
       await Promise.all([refreshDetail(id), fetchOrders()])
     } catch (err) {
       showToast(friendlyError(err), 'err')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleDownload = async () => {
+    if (!detail?.latestResult?.fileUrl) return
+    try {
+      setDownloadError(null)
+      setActionLoading('download')
+      const result = detail.latestResult
+      await downloadLabResult(detail.id, result.id, result.version, result.fileExtension)
+    } catch (err) {
+      setDownloadError(friendlyError(err))
     } finally {
       setActionLoading(null)
     }
@@ -359,15 +374,18 @@ export default function LabOrders() {
                   </p>
                 )}
                 {detail.latestResult.fileUrl && (
-                  <a
-                    href={fileHref(detail.latestResult.fileUrl)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline"
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={actionLoading === 'download'}
+                    aria-busy={actionLoading === 'download'}
+                    className="btn btn-secondary btn-sm min-h-11 sm:min-h-6 text-xs"
                   >
-                    Open attached report
-                  </a>
+                    {actionLoading === 'download' && <span className="spinner" aria-hidden="true" />}
+                    {actionLoading === 'download' ? 'Downloading report…' : 'Download attached report'}
+                  </button>
                 )}
+                {downloadError && <Alert variant="error">{downloadError}</Alert>}
                 {detail.doctorReviewedAt && (
                   <p className="text-[11px] text-emerald-600 dark:text-emerald-400">
                     Reviewed {fmtDate(detail.doctorReviewedAt)}

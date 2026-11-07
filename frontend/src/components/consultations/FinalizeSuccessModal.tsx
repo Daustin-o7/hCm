@@ -1,13 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { CheckIcon } from '../icons/Index'
 import api from '../../services/api'
+import { downloadPdf } from '../../services/downloadPdf'
+import { Alert, friendlyError } from '../ui/Alert'
 
 interface FinalizeSuccessModalProps {
   isOpen: boolean
   onClose: () => void
   data: {
     consultationId: string
-    prescriptionId?: string
+    prescriptionId?: string | null
     version: number
     status: string
     doctorRegistrationNumber?: string
@@ -34,42 +36,46 @@ export default function FinalizeSuccessModal({
   const [downloading, setDownloading] = useState(false)
   const [sharing, setSharing] = useState(false)
   const [feedback, setFeedback] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const request = useRef(new AbortController())
+  useEffect(() => {
+    request.current = new AbortController()
+    setFeedback(null)
+    setError(null)
+    setDownloading(false)
+    setSharing(false)
+    return () => request.current.abort()
+  }, [isOpen, data])
 
   if (!isOpen || !data) return null
 
   const handleDownloadPdf = async () => {
-    if (!data.consultationId) return
+    if (!data.consultationId || !data.prescriptionId) return
     setDownloading(true)
     setFeedback(null)
+    setError(null)
+    const { signal } = request.current
     try {
-      const res = await api.get(`/consultations/${data.consultationId}/prescription/pdf`, {
-        responseType: 'blob'
-      })
-      const blob = new Blob([res.data], { type: 'application/pdf' })
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `Prescription_${(patientName || 'Patient').replace(/\s+/g, '_')}_v${data.version}.pdf`
-      document.body.appendChild(a)
-      a.click()
-      window.URL.revokeObjectURL(url)
-      document.body.removeChild(a)
-      setFeedback('PDF downloaded successfully')
-    } catch {
-      window.open(`/api/v1/consultations/${data.consultationId}/prescription/pdf`, '_blank')
+      await downloadPdf(`/consultations/${data.consultationId}/prescription/pdf`, `Prescription_v${data.version}.pdf`, signal)
+      if (!signal.aborted) setFeedback('PDF download started')
+    } catch (err) {
+      if (!signal.aborted) setError(friendlyError(err))
     } finally {
-      setDownloading(false)
+      if (!signal.aborted) setDownloading(false)
     }
   }
 
   const handleShareWhatsApp = async () => {
-    if (!data.consultationId) return
+    if (!data.prescriptionId) { setError('No prescription is available to share.'); return }
     setSharing(true)
     setFeedback(null)
+    setError(null)
+    const { signal } = request.current
     try {
-      const targetId = data.prescriptionId || data.consultationId
-      const res = await api.post(`/prescriptions/${targetId}/share-link`, {})
+      const res = await api.post(`/prescriptions/${data.prescriptionId}/share-link`, {}, { signal })
+      if (signal.aborted) return
       const shareUrl = res.data?.shareUrl
+      if (typeof shareUrl !== 'string' || !shareUrl.startsWith('/rx-verify/') || !shareUrl.includes('sig=')) throw new Error('The server did not return a signed share link.')
       if (shareUrl) {
         const fullLink = `${window.location.origin}${shareUrl}`
         const text = encodeURIComponent(
@@ -77,21 +83,19 @@ export default function FinalizeSuccessModal({
         )
         const phone = (patientPhone || res.data?.patientPhone || '').replace(/\D/g, '')
         const waUrl = phone ? `https://wa.me/${phone}?text=${text}` : `https://wa.me/?text=${text}`
-        window.open(waUrl, '_blank')
+        window.open(waUrl, '_blank', 'noopener,noreferrer')
         setFeedback('Digital prescription link opened in WhatsApp')
       }
-    } catch {
-      const fallbackUrl = `${window.location.origin}/rx-verify/${data.verificationQrCode || data.consultationId}`
-      const text = encodeURIComponent(`Prescription Verification: ${fallbackUrl}`)
-      window.open(`https://wa.me/?text=${text}`, '_blank')
+    } catch (err) {
+      if (!signal.aborted) setError(friendlyError(err))
     } finally {
-      setSharing(false)
+      if (!signal.aborted) setSharing(false)
     }
   }
 
   return (
     <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center z-50 p-4 animate-fadein">
-      <div className="bg-white dark:bg-slate-900 rounded-lg shadow-lg border border-[var(--color-border)] max-w-lg w-full p-6 space-y-5 animate-scalein text-left">
+      <div role="dialog" aria-modal="true" aria-labelledby="finalize-title" className="bg-white dark:bg-slate-900 rounded-lg shadow-lg border border-[var(--color-border)] max-w-lg w-full p-6 space-y-5 animate-scalein text-left">
         {/* Header with success badge */}
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
@@ -99,7 +103,7 @@ export default function FinalizeSuccessModal({
               <CheckIcon />
             </div>
             <div>
-              <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 font-heading">
+              <h3 id="finalize-title" className="text-base font-bold text-slate-900 dark:text-slate-100 font-heading">
                 Consultation Finalized &amp; Signed
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
@@ -108,6 +112,7 @@ export default function FinalizeSuccessModal({
             </div>
           </div>
           <button
+            aria-label="Close finalization summary"
             onClick={onClose}
             className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-sm font-bold p-1 rounded-md"
           >
@@ -115,6 +120,8 @@ export default function FinalizeSuccessModal({
           </button>
         </div>
 
+        {error && <Alert variant="error">{error}</Alert>}
+        {!data.prescriptionId && <p className="text-sm text-slate-600">Consultation saved without a prescription. No prescription PDF or share link is available.</p>}
         {feedback && (
           <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 rounded-xl border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-300 font-semibold flex items-center gap-2">
             <span>✓</span>
@@ -139,16 +146,16 @@ export default function FinalizeSuccessModal({
         {/* Legal & Regulatory Signing Details */}
         <div className="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4 border border-slate-200 dark:border-slate-700/60 space-y-3">
           <div className="flex items-center justify-between text-xs pb-2 border-b border-slate-200 dark:border-slate-700/60">
-            <span className="text-slate-500 dark:text-slate-400">MCI Registration Number:</span>
+            <span className="text-slate-500 dark:text-slate-400">Registration number:</span>
             <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
-              {data.doctorRegistrationNumber || 'MCI-VERIFIED'}
+              {data.doctorRegistrationNumber || 'Not recorded'}
             </span>
           </div>
 
           <div className="flex items-center justify-between text-xs pb-2 border-b border-slate-200 dark:border-slate-700/60">
             <span className="text-slate-500 dark:text-slate-400">Qualifications:</span>
             <span className="font-medium text-slate-800 dark:text-slate-200">
-              {data.doctorQualifications || 'MBBS, MD'}
+              {data.doctorQualifications || 'Not recorded'}
             </span>
           </div>
 
@@ -164,15 +171,16 @@ export default function FinalizeSuccessModal({
           {/* Digital Signature Hash */}
           <div>
             <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-              Cryptographic Digital Signature Hash (SHA-256)
+              {data.digitalSignatureHash?.startsWith('v2:') ? 'Clinical content seal (SHA-256, v2)' : 'Legacy seal — content not verified'}
             </div>
             <div className="font-mono text-[10px] text-slate-600 dark:text-slate-300 break-all bg-white dark:bg-slate-900 p-2 rounded-lg border border-slate-200 dark:border-slate-700">
-              {data.digitalSignatureHash || '0x4f8a...'}
+              {data.digitalSignatureHash || 'Not recorded'}
             </div>
+            <p className="text-xs text-slate-500 mt-2">A content seal is a tamper-evidence check, not a certificate-backed digital signature.</p>
           </div>
 
           {/* QR Verification Link for external pharmacy */}
-          {data.verificationQrCode && (
+          {data.prescriptionId && data.verificationQrCode && (
             <div className="pt-2 flex items-center justify-between">
               <div className="text-xs">
                 <span className="text-slate-500 dark:text-slate-400">Chemist Verification Code:</span>
@@ -181,7 +189,7 @@ export default function FinalizeSuccessModal({
                 </div>
               </div>
               <a
-                href={`/api/prescriptions/verify/${data.verificationQrCode}`}
+                href={`/rx-verify/${encodeURIComponent(data.verificationQrCode)}?v=${data.version}`}
                 target="_blank"
                 rel="noreferrer"
                 className="btn btn-secondary btn-xs text-[11px]"
@@ -198,9 +206,9 @@ export default function FinalizeSuccessModal({
             <button
               type="button"
               onClick={handleDownloadPdf}
-              disabled={downloading}
+              disabled={downloading || !data.prescriptionId}
               className="btn btn-secondary btn-sm flex items-center gap-1.5"
-              title="Download official PDF prescription with digital signing and QR code"
+              title="Download the server prescription PDF with content seal and verification code"
             >
               <span>📄</span>
               <span>{downloading ? 'Downloading…' : 'Download PDF'}</span>
@@ -208,7 +216,7 @@ export default function FinalizeSuccessModal({
             <button
               type="button"
               onClick={handleShareWhatsApp}
-              disabled={sharing}
+              disabled={sharing || !data.prescriptionId}
               className="btn btn-secondary btn-sm flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400"
               title="Share expiring signed prescription link via WhatsApp"
             >
@@ -218,13 +226,6 @@ export default function FinalizeSuccessModal({
           </div>
 
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => window.print()}
-              className="btn btn-ghost btn-sm"
-            >
-              🖨️ Print
-            </button>
             <button
               type="button"
               onClick={onClose}

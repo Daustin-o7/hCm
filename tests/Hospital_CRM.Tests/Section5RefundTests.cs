@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Hospital_CRM.Api.Controllers;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
@@ -19,13 +20,13 @@ public class Section5RefundTests
             .UseInMemoryDatabase(databaseName: dbName ?? Guid.NewGuid().ToString())
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options;
-        return new HospitalCrmDbContext(options);
+        return new HospitalCrmDbContext(options, TestMaintenanceTenantContext.Instance);
     }
 
     private static InvoicesController CreateController(HospitalCrmDbContext db, Guid tenantId, Guid userId, string role = "ClinicAdmin")
     {
         var config = new ConfigurationBuilder().AddInMemoryCollection().Build();
-        var controller = new InvoicesController(db, config, null!);
+        var controller = new InvoicesController(db, config, new RazorpayOrderClient(new HttpClient(), config));
 
         var identity = new ClaimsIdentity(new[]
         {
@@ -122,7 +123,7 @@ public class Section5RefundTests
             Amount: 500m,
             Method: PaymentMethod.UPI,
             RefundReference: "UPI-REF-001234",
-            Reason: "Partial cancellation of lab test"
+            Reason: "Partial cancellation of lab test", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);
@@ -164,7 +165,7 @@ public class Section5RefundTests
             Amount: 2500m,
             Method: PaymentMethod.NetBanking,
             RefundReference: "NEFT-REF-998877",
-            Reason: "Surgery cancellation fee refund"
+            Reason: "Surgery cancellation fee refund", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);
@@ -210,7 +211,7 @@ public class Section5RefundTests
             Amount: 2000m,
             Method: PaymentMethod.Cash,
             RefundReference: "CASH-REF-01",
-            Reason: "Refund attempt"
+            Reason: "Refund attempt", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);
@@ -243,7 +244,7 @@ public class Section5RefundTests
             Amount: 2000m,
             Method: PaymentMethod.UPI,
             RefundReference: "UPI-DUAL-REF-1",
-            Reason: "Procedure cancellation"
+            Reason: "Procedure cancellation", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
         );
         var res1 = await controller1.ProcessRefund(invoice.Id, req, CancellationToken.None);
         var accepted = Assert.IsType<ObjectResult>(res1);
@@ -289,12 +290,12 @@ public class Section5RefundTests
         var controller = CreateController(db, tenantId, admin1.Id);
 
         var first = await controller.ProcessRefund(invoice.Id, new CreateRefundRequest(
-            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-A", Reason: "First request"), CancellationToken.None);
+            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-A", Reason: "First request", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"), CancellationToken.None);
         Assert.Equal(202, Assert.IsType<ObjectResult>(first).StatusCode);
 
         // Only ₹1,000 is still uncommitted, so a second ₹2,000 request must not be accepted as pending too.
         var second = await controller.ProcessRefund(invoice.Id, new CreateRefundRequest(
-            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-B", Reason: "Second request"), CancellationToken.None);
+            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-B", Reason: "Second request", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"), CancellationToken.None);
 
         var bad = Assert.IsType<BadRequestObjectResult>(second);
         Assert.Contains("refund_exceeds_paid_balance", bad.Value?.ToString() ?? "");
@@ -367,7 +368,7 @@ public class Section5RefundTests
             Amount: 1500m,
             Method: PaymentMethod.Cash,
             RefundReference: "CASH-REF-02",
-            Reason: "Excessive refund"
+            Reason: "Excessive refund", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);

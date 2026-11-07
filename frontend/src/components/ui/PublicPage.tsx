@@ -33,7 +33,7 @@ export function PublicPage({
               </div>
             )}
             {title && (
-              <h1 className="text-white text-xl font-bold mt-4" style={{ fontFamily: 'Outfit, sans-serif' }}>
+              <h1 className="text-white text-xl font-bold mt-4" style={{ fontFamily: 'var(--font-heading)' }}>
                 {title}
               </h1>
             )}
@@ -45,7 +45,7 @@ export function PublicPage({
           </div>
         )}
 
-        <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xl">
+        <div className="bg-[var(--color-surface)] rounded-xl border border-[var(--color-border)] p-6 shadow-xl">
           {children}
         </div>
 

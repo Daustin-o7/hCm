@@ -3,7 +3,7 @@ using Hangfire.Dashboard;
 namespace Hospital_CRM.Api.Authorization;
 
 /// <summary>
-/// Restricts /hangfire dashboard to ClinicAdmin role only.
+/// The shared job store is available only to non-impersonating platform operators.
 /// The existing JWT auth middleware has already populated the user principal.
 /// </summary>
 public class HangfireAdminAuthorizationFilter : IDashboardAuthorizationFilter
@@ -13,6 +13,6 @@ public class HangfireAdminAuthorizationFilter : IDashboardAuthorizationFilter
         var http = context.GetHttpContext();
         var user = http.User;
         if (user?.Identity?.IsAuthenticated != true) return false;
-        return user.IsInRole("ClinicAdmin") || user.IsInRole("PlatformAdmin");
+        return user.IsInRole("PlatformAdmin") && !user.HasClaim(c => c.Type is "impersonated_by" or "impersonation_id");
     }
 }

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import api from '../services/api'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import api, { getSessionGeneration } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import { friendlyError } from './ui/Alert'
 import { Skeleton } from './ui/Skeleton'
@@ -18,7 +18,7 @@ interface Status {
  * or a 6-digit code by email.
  */
 export default function TwoFactorSettings() {
-  const { adoptSession, user, mfaRequiredForRole } = useAuth()
+  const { adoptSession, user, mfaRequiredForRole, sessionGeneration } = useAuth()
   const [status, setStatus] = useState<Status | null>(null)
   const [method, setMethod] = useState<Method>('totp')
   const [pending, setPending] = useState<{ secret: string; otpauthUri: string | null } | null>(null)
@@ -27,28 +27,49 @@ export default function TwoFactorSettings() {
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [msg, setMsg] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null)
+  const [statusAttempt, setStatusAttempt] = useState(0)
+  const lifetime = useRef(0)
 
-  useEffect(() => {
-    api.get('/auth/mfa/status')
-      .then(res => setStatus({ enabled: res.data.enabled, method: res.data.method }))
-      .catch(() => setStatus({ enabled: false, method: null }))
+  const captureCurrent = useCallback(() => {
+    const instance = lifetime.current
+    const generation = getSessionGeneration()
+    return () => instance === lifetime.current && generation === getSessionGeneration()
   }, [])
 
+  useEffect(() => {
+    const current = captureCurrent()
+    setStatus(null)
+    setPending(null)
+    setCode('')
+    setPassword('')
+    setCopied(false)
+    setBusy(false)
+    setMsg(null)
+    api.get('/auth/mfa/status')
+      .then(res => { if (current()) setStatus({ enabled: res.data.enabled, method: res.data.method }) })
+      .catch(() => { if (current()) setMsg({ text: 'Could not load two-factor status. Please retry.', kind: 'err' }) })
+    return () => { lifetime.current++ }
+  }, [sessionGeneration, statusAttempt, captureCurrent])
+
   const copyKey = async (secret: string) => {
+    const current = captureCurrent()
     try {
       await navigator.clipboard.writeText(secret)
+      if (!current()) return
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      setTimeout(() => { if (current()) setCopied(false) }, 2000)
     } catch {
       // Fallback
     }
   }
 
   const start = async (next: Method) => {
+    const current = captureCurrent()
     setBusy(true)
     setMsg(null)
     try {
       const res = await api.post('/auth/mfa/setup', { method: next })
+      if (!current()) return
       setMethod(next)
       setCode('')
       setPending({ secret: res.data.secret, otpauthUri: res.data.otpauthUri })
@@ -58,13 +79,14 @@ export default function TwoFactorSettings() {
           : { text: 'Add the key below to your authenticator app, then enter the code it shows.', kind: 'ok' },
       )
     } catch (err) {
-      setMsg({ text: friendlyError(err), kind: 'err' })
+      if (current()) setMsg({ text: friendlyError(err), kind: 'err' })
     } finally {
-      setBusy(false)
+      if (current()) setBusy(false)
     }
   }
 
   const enable = async (e?: React.FormEvent) => {
+    const current = captureCurrent()
     if (e) e.preventDefault()
     if (!/^\d{6}$/.test(code.trim())) {
       setMsg({ text: 'Enter the 6-digit code.', kind: 'err' })
@@ -74,19 +96,22 @@ export default function TwoFactorSettings() {
     setMsg(null)
     try {
       const res = await api.post('/auth/mfa/enable', { code: code.trim(), method })
+      if (!current()) return
       adoptSession(res.data)
+      setBusy(false)
       setStatus({ enabled: true, method })
       setPending(null)
       setCode('')
       setMsg({ text: 'Two-factor authentication is on.', kind: 'ok' })
     } catch (err) {
-      setMsg({ text: friendlyError(err), kind: 'err' })
+      if (current()) setMsg({ text: friendlyError(err), kind: 'err' })
     } finally {
-      setBusy(false)
+      if (current()) setBusy(false)
     }
   }
 
   const disable = async (e?: React.FormEvent) => {
+    const current = captureCurrent()
     if (e) e.preventDefault()
     if (!password) {
       setMsg({ text: 'Enter your password to turn two-factor authentication off.', kind: 'err' })
@@ -96,13 +121,14 @@ export default function TwoFactorSettings() {
     setMsg(null)
     try {
       await api.post('/auth/mfa/disable', { password })
+      if (!current()) return
       setStatus({ enabled: false, method: null })
       setPassword('')
       setMsg({ text: 'Two-factor authentication is off.', kind: 'ok' })
     } catch (err) {
-      setMsg({ text: friendlyError(err), kind: 'err' })
+      if (current()) setMsg({ text: friendlyError(err), kind: 'err' })
     } finally {
-      setBusy(false)
+      if (current()) setBusy(false)
     }
   }
 
@@ -131,7 +157,9 @@ export default function TwoFactorSettings() {
       )}
 
       {!status ? (
-        <Skeleton height={72} />
+        msg?.kind === 'err'
+          ? <button type="button" className="btn btn-secondary" onClick={() => setStatusAttempt(n => n + 1)}>Retry status</button>
+          : <Skeleton height={72} />
       ) : status.enabled ? (
         mfaRequiredForRole ? (
           // The API rejects this for mandatory-MFA roles, so do not offer the control at all.

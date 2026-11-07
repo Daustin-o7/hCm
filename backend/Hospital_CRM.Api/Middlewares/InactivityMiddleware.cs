@@ -1,4 +1,5 @@
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -66,35 +67,42 @@ public class InactivityMiddleware
         using var scope = context.RequestServices.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
 
-        var latestToken = await db.RefreshTokens
-            .Where(t => t.UserId == userId.Value && t.RevokedAt == null)
-            .OrderByDescending(t => t.LastUsedAt ?? t.IssuedAt)
-            .FirstOrDefaultAsync();
-
-        if (latestToken is not null)
+        var expired = await SessionMutation.RunAsync(db, userId.Value, async () =>
         {
-            var lastActivity = latestToken.LastUsedAt ?? latestToken.IssuedAt;
-            if (DateTimeOffset.UtcNow - lastActivity > TimeSpan.FromMinutes(InactivityTimeoutMinutes))
+            var latestToken = await db.RefreshTokens
+                .Where(t => t.UserId == userId.Value && t.RevokedAt == null)
+                .OrderByDescending(t => t.LastUsedAt ?? t.IssuedAt)
+                .FirstOrDefaultAsync(context.RequestAborted);
+
+            if (latestToken is not null)
             {
-                var activeTokens = await db.RefreshTokens
-                    .Where(t => t.UserId == userId.Value && t.RevokedAt == null)
-                    .ToListAsync();
+                var lastActivity = latestToken.LastUsedAt ?? latestToken.IssuedAt;
+                if (DateTimeOffset.UtcNow - lastActivity > TimeSpan.FromMinutes(InactivityTimeoutMinutes))
+                {
+                    var activeTokens = await db.RefreshTokens
+                        .Where(t => t.UserId == userId.Value && t.RevokedAt == null)
+                        .ToListAsync(context.RequestAborted);
 
-                foreach (var token in activeTokens)
-                    token.RevokedAt = DateTimeOffset.UtcNow;
+                    foreach (var token in activeTokens)
+                        token.RevokedAt = DateTimeOffset.UtcNow;
 
-                await db.SaveChangesAsync();
+                    await db.SaveChangesAsync(context.RequestAborted);
+                    return true;
+                }
 
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                context.Response.ContentType = "application/json";
-                await context.Response.WriteAsJsonAsync(new { error = "session_expired_due_to_inactivity" });
-                return;
+                // Update timestamp & set cache entry
+                latestToken.LastUsedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(context.RequestAborted);
+                cache.Set(cacheKey, DateTimeOffset.UtcNow, TimeSpan.FromMinutes(2));
             }
+            return false;
+        }, context.RequestAborted);
 
-            // Update timestamp & set cache entry
-            latestToken.LastUsedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync();
-            cache.Set(cacheKey, DateTimeOffset.UtcNow, TimeSpan.FromMinutes(2));
+        if (expired)
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new { error = "session_expired_due_to_inactivity" }, context.RequestAborted);
+            return;
         }
 
         await _next(context);

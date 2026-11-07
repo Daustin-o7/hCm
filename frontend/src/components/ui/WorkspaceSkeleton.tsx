@@ -35,7 +35,7 @@ export function WorkspaceSkeleton() {
       {/* ── Main Content Area ── */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Topbar Silhouette */}
-        <header className="h-14 border-b border-[var(--color-border,#C7CBB8)] bg-[var(--color-surface,#FFFFFF)] px-6 flex items-center justify-between shrink-0">
+        <header className="h-14 border-b border-[var(--color-border)] bg-[var(--color-surface,#FFFFFF)] px-6 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
             <div className="w-28 h-4 rounded bg-slate-200 dark:bg-slate-700 animate-pulse" />
             <div className="w-2 h-2 rounded-full bg-slate-300 dark:bg-slate-600" />
@@ -63,7 +63,7 @@ export function WorkspaceSkeleton() {
             {[...Array(3)].map((_, i) => (
               <div
                 key={i}
-                className="p-4 rounded-lg border border-[var(--color-border,#C7CBB8)] bg-[var(--color-surface,#FFFFFF)] space-y-3"
+                className="p-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface,#FFFFFF)] space-y-3"
               >
                 <div className="w-24 h-3 rounded bg-slate-100 dark:bg-slate-800 animate-pulse" />
                 <div className="w-36 h-7 rounded bg-slate-200 dark:bg-slate-700 animate-pulse" />
@@ -73,7 +73,7 @@ export function WorkspaceSkeleton() {
           </div>
 
           {/* Table Outline */}
-          <div className="rounded-lg border border-[var(--color-border,#C7CBB8)] bg-[var(--color-surface,#FFFFFF)] p-4 space-y-3">
+          <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface,#FFFFFF)] p-4 space-y-3">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
               <div className="w-36 h-4 rounded bg-slate-200 dark:bg-slate-700 animate-pulse" />
               <div className="w-24 h-7 rounded-md bg-slate-100 dark:bg-slate-800 animate-pulse" />

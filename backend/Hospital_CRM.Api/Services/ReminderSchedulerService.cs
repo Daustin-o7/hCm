@@ -1,85 +1,68 @@
 using Hospital_CRM.Domain.Enums;
+using Hospital_CRM.Domain.Services;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 
 namespace Hospital_CRM.Api.Services;
 
-public class ReminderSchedulerService : BackgroundService
+// Owns AppointmentReminder defaults; the rules worker owns only custom N-days rules.
+public sealed class ReminderSchedulerService(IServiceProvider services, ILogger<ReminderSchedulerService> logger) : BackgroundService
 {
-    private readonly IServiceProvider _serviceProvider;
-    private readonly ILogger<ReminderSchedulerService> _logger;
-    private readonly PeriodicTimer _timer;
-
-    public ReminderSchedulerService(IServiceProvider serviceProvider, ILogger<ReminderSchedulerService> logger)
-    {
-        _serviceProvider = serviceProvider;
-        _logger = logger;
-        _timer = new PeriodicTimer(TimeSpan.FromHours(1));
-    }
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var timer = new PeriodicTimer(TimeSpan.FromHours(1));
         try
         {
-            while (await _timer.WaitForNextTickAsync(stoppingToken))
+            while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                try
-                {
-                    await SendRemindersAsync(stoppingToken);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error sending reminders");
-                }
+                try { await SendRemindersAsync(stoppingToken); }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { throw; }
+                catch (Exception ex) { logger.LogError("Reminder cycle failed: {FailureType}", ex.GetType().Name); }
             }
         }
-        catch (OperationCanceledException)
-        {
-            // Normal shutdown: PeriodicTimer.WaitForNextTickAsync throws on cancellation.
-        }
-        finally
-        {
-            _timer.Dispose();
-        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
     }
 
-    private async Task SendRemindersAsync(CancellationToken ct)
+    public async Task SendRemindersAsync(CancellationToken ct)
     {
-        using var scope = _serviceProvider.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
-        var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
-        var precheckService = scope.ServiceProvider.GetRequiredService<PrecheckService>();
-
-        var tomorrow = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(1));
-
-        var appointments = await db.Appointments
-            .Include(a => a.Patient).ThenInclude(p => p.Consents)
-            .Include(a => a.Clinic)
-            .Where(a => a.Date == tomorrow && a.Status == AppointmentStatus.Booked)
-            // DPDP: no WhatsApp message without a live opt-in for that purpose.
-            .Where(a => a.Patient.Consents.Any(c => c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null))
-            .ToListAsync(ct);
-
-        foreach (var appointment in appointments)
+        List<Guid> tenantIds;
+        using (var inventory = services.CreateScope())
         {
-            _logger.LogInformation("[STUB] Reminder would be sent for appointment {Id}", appointment.Id);
-
-            string? precheckLink = null;
-            var existingPrecheck = await db.PrecheckSubmissions
-                .FirstOrDefaultAsync(s => s.AppointmentId == appointment.Id, ct);
-            if (existingPrecheck is { SubmittedAt: null } && DateTimeOffset.UtcNow < existingPrecheck.ExpiresAt)
+            var context = inventory.ServiceProvider.GetRequiredService<ITenantContext>();
+            using var maintenance = context.PushMaintenance();
+            var db = inventory.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
+            tenantIds = await db.Tenants.AsNoTracking().Select(t => t.Id).ToListAsync(ct);
+        }
+        foreach (var tenantId in tenantIds)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var scope = services.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+            using var tenantScope = context.PushTenant(tenantId);
+            var db = scope.ServiceProvider.GetRequiredService<HospitalCrmDbContext>();
+            var notifier = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            var timezones = scope.ServiceProvider.GetRequiredService<ITimezoneService>();
+            try
             {
-                // The plaintext token was discarded after creation — we can't send a working link
-                // without an out-of-band recovery channel. For now, the booking-time link is the
-                // canonical one. Reminder includes a generic "fill the pre-visit form" prompt.
+                var clinics = await db.Clinics.AsNoTracking().Where(c => c.TenantId == tenantId).ToListAsync(ct);
+                foreach (var clinic in clinics)
+                {
+                    var tomorrow = timezones.GetClinicToday(clinic.Timezone).AddDays(1);
+                    var appointments = await db.Appointments.AsNoTracking().Include(a => a.Patient)
+                        .Where(a => a.TenantId == tenantId && a.ClinicId == clinic.Id && a.Date == tomorrow &&
+                            a.Status == AppointmentStatus.Booked && a.Patient.TenantId == tenantId &&
+                            a.Patient.Consents.Any(c => c.TenantId == tenantId && c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null))
+                        .ToListAsync(ct);
+                    foreach (var appointment in appointments)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        await notifier.SendAppointmentReminderAsync(appointment.Id, appointment.Patient.Phone, clinic.Name,
+                            appointment.Date.ToDateTime(TimeOnly.Parse(appointment.TimeSlot)));
+                    }
+                }
             }
-
-            await notificationService.SendAppointmentReminderAsync(
-                appointment.Id,
-                appointment.Patient.Phone,
-                appointment.Clinic.Name,
-                appointment.Date.ToDateTime(TimeOnly.Parse(appointment.TimeSlot)),
-                precheckLink);
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { logger.LogError("Reminders failed for tenant {TenantId}: {FailureType}", tenantId, ex.GetType().Name); }
         }
     }
 }

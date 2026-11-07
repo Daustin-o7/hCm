@@ -2,6 +2,7 @@ using System.ComponentModel.DataAnnotations;
 using System.Data;
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
@@ -30,39 +31,38 @@ public class PatientDepositsController : ControllerBase
         var tenantId = TenantId;
         var currentUserId = User.GetUserId() ?? Guid.Empty;
 
-        if (req.Amount <= 0)
-            return BadRequest(new { error = "invalid_amount", message = "Deposit amount must be greater than zero." });
+        if (req.Amount <= 0 || req.Amount > 10000000m || decimal.Round(req.Amount, 2) != req.Amount)
+            return BadRequest(new { error = "invalid_amount", message = "Deposit amount must be positive, within the limit and have at most two decimal places." });
+        if (req.Method is not (PaymentMethod.Cash or PaymentMethod.UPI or PaymentMethod.Card or PaymentMethod.NetBanking))
+            return BadRequest(new { error = "invalid_payment_method" });
+        if (req.ReferenceNumber?.Length > 100 || req.Notes?.Length > 500
+            || req.Method != PaymentMethod.Cash && string.IsNullOrWhiteSpace(req.ReferenceNumber))
+            return BadRequest(new { error = "payment_reference_required", message = "Record the actual bank or card receipt reference before confirming an electronic deposit." });
+        if (string.IsNullOrWhiteSpace(req.IdempotencyKey) || req.IdempotencyKey.Length > 128)
+            return BadRequest(new { error = "idempotency_key_required", message = "Use one stable key for this deposit, including retries." });
 
-        var patient = await _db.Patients
-            .FirstOrDefaultAsync(p => p.Id == patientId && p.TenantId == tenantId, ct);
-        if (patient == null)
-            return NotFound(new { error = "patient_not_found" });
-
-        if (!string.IsNullOrWhiteSpace(req.IdempotencyKey))
+        await using var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            var existing = await _db.PatientDeposits
-                .FirstOrDefaultAsync(d => d.TenantId == tenantId && d.PatientId == patientId && d.IdempotencyKey == req.IdempotencyKey, ct);
-            if (existing != null)
+            var patient = await _db.Patients
+                .FirstOrDefaultAsync(p => p.Id == patientId && p.TenantId == tenantId, ct);
+            if (patient == null)
+                return NotFound(new { error = "patient_not_found" });
+
+            if (!string.IsNullOrWhiteSpace(req.IdempotencyKey))
             {
-                return Ok(new
+                var existing = await _db.PatientDeposits
+                    .FirstOrDefaultAsync(d => d.TenantId == tenantId && d.IdempotencyKey == req.IdempotencyKey, ct);
+                if (existing != null)
                 {
-                    depositId = existing.Id,
-                    receiptNumber = existing.ReceiptNumber,
-                    patientId = existing.PatientId,
-                    amount = existing.Amount,
-                    balance = existing.Balance,
-                    method = existing.Method.ToString(),
-                    status = existing.Status.ToString().ToLower(),
-                    createdAt = existing.CreatedAt,
-                    idempotentDuplicate = true
-                });
+                    if (existing.PatientId != patientId || existing.Amount != req.Amount || existing.Method != req.Method
+                        || existing.ReferenceNumber != (string.IsNullOrWhiteSpace(req.ReferenceNumber) ? null : req.ReferenceNumber.Trim())
+                        || existing.Notes != (string.IsNullOrWhiteSpace(req.Notes) ? null : req.Notes.Trim()))
+                        return Conflict(new { error = "idempotency_key_conflict" });
+                    return Ok(DepositResult(existing, true));
+                }
             }
-        }
-
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
-        {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
 
             var now = DateTimeOffset.UtcNow;
             var financialYear = IndianFinancialYearUtils.GetFinancialYear(now);
@@ -139,24 +139,17 @@ public class PatientDepositsController : ControllerBase
             });
 
             await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
 
-            return StatusCode(201, new
-            {
-                depositId = deposit.Id,
-                receiptNumber = deposit.ReceiptNumber,
-                financialYear = deposit.FinancialYear,
-                sequenceNumber = deposit.SequenceNumber,
-                patientId = deposit.PatientId,
-                amount = deposit.Amount,
-                balance = deposit.Balance,
-                method = deposit.Method.ToString(),
-                referenceNumber = deposit.ReferenceNumber,
-                notes = deposit.Notes,
-                status = deposit.Status.ToString().ToLower(),
-                createdAt = deposit.CreatedAt
-            });
-        });
+            return StatusCode(201, DepositResult(deposit, false));
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex)
+            || ex is DbUpdateException update && (InvoiceAccounting.IsIdempotencyConflict(update) || InvoiceAccounting.IsNumberingConflict(update)))
+        {
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "deposit_changed_concurrently", message = "Retry with the same deposit key." });
+        }
     }
 
     [HttpGet("patients/{patientId:guid}/deposits")]
@@ -213,46 +206,66 @@ public class PatientDepositsController : ControllerBase
         var tenantId = TenantId;
         var currentUserId = User.GetUserId() ?? Guid.Empty;
 
-        var invoice = await _db.Invoices
-            .Include(i => i.Payments)
-            .Include(i => i.Appointment)
-            .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
-
-        if (invoice == null)
-            return NotFound(new { error = "invoice_not_found" });
-
-        if (invoice.Status != InvoiceStatus.Finalized && invoice.Status != InvoiceStatus.PartiallyPaid)
-            return BadRequest(new { error = "invoice_not_finalized", message = "Advance can only be applied to finalized invoices with an outstanding balance." });
-
-        if (invoice.BalanceDue <= 0m)
-            return BadRequest(new { error = "invoice_already_paid", message = "Invoice has no balance due." });
-
-        var patientId = invoice.Appointment?.PatientId;
-        if (!patientId.HasValue)
-            return BadRequest(new { error = "patient_not_linked", message = "Invoice must be linked to an appointment with a patient to apply advances." });
-
-        var strategy = _db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IActionResult>(async () =>
+        if (req?.Amount is { } amount && (amount <= 0 || amount > 10000000m || decimal.Round(amount, 2) != amount))
+            return BadRequest(new { error = "invalid_advance_amount" });
+        if (req is null || string.IsNullOrWhiteSpace(req.IdempotencyKey) || req.IdempotencyKey.Length > 128)
+            return BadRequest(new { error = "idempotency_key_required", message = "Use one stable key for this advance application, including retries." });
+        await using var transaction = _db.Database.IsRelational()
+            ? await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct) : null;
+        try
         {
-            await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+            var invoice = await _db.Invoices
+                .Include(i => i.Payments)
+                .Include(i => i.Appointment)
+                .FirstOrDefaultAsync(i => i.Id == id && i.TenantId == tenantId, ct);
+
+            if (invoice == null)
+                return NotFound(new { error = "invoice_not_found" });
+
+            var existing = await _db.Payments.FirstOrDefaultAsync(p => p.TenantId == tenantId && p.IdempotencyKey == req.IdempotencyKey, ct);
+            if (existing != null)
+            {
+                var allocations = await _db.PatientDepositAllocations.Include(a => a.PatientDeposit)
+                    .Where(a => a.TenantId == tenantId && a.PaymentId == existing.Id).ToListAsync(ct);
+                if (existing.InvoiceId != id || existing.Method != PaymentMethod.AdvanceDeposit || existing.Status != PaymentStatus.Completed
+                    || existing.VerificationStatus != PaymentVerificationStatus.Confirmed || allocations.Count == 0
+                    || req.Amount.HasValue && req.Amount != existing.Amount
+                    || req.DepositId.HasValue && allocations.Any(a => a.PatientDepositId != req.DepositId))
+                    return Conflict(new { error = "idempotency_key_conflict" });
+                return Ok(AdvanceResult(invoice, existing, allocations, true));
+            }
+
+            if (invoice.Status is not (InvoiceStatus.Issued or InvoiceStatus.Finalized or InvoiceStatus.PartiallyPaid))
+                return BadRequest(new { error = "invoice_not_finalized", message = "Advance can only be applied to finalized invoices with an outstanding balance." });
+
+            if (invoice.BalanceDue <= 0m)
+                return BadRequest(new { error = "invoice_already_paid", message = "Invoice has no balance due." });
+
+            var patientId = invoice.PatientId ?? invoice.Appointment?.PatientId;
+            if (!patientId.HasValue)
+                return BadRequest(new { error = "patient_not_linked", message = "Invoice must be linked to an appointment with a patient to apply advances." });
 
             // Fetch active deposits for this patient
             var depositsQuery = _db.PatientDeposits
                 .Where(d => d.TenantId == tenantId && d.PatientId == patientId.Value && d.Status == PatientDepositStatus.Active && d.Balance > 0);
 
-            if (req?.DepositId.HasValue == true)
+            if (req.DepositId.HasValue)
                 depositsQuery = depositsQuery.Where(d => d.Id == req.DepositId.Value);
 
             var activeDeposits = await depositsQuery
                 .OrderBy(d => d.CreatedAt)
+                .ThenBy(d => d.Id)
                 .ToListAsync(ct);
+
+            if (activeDeposits.Any(d => d.Balance != d.Amount - d.AllocatedAmount - d.RefundedAmount || d.AllocatedAmount < 0 || d.RefundedAmount < 0))
+                return Conflict(new { error = "deposit_reconciliation_required", message = "The recorded deposit balances must be reconciled before applying an advance." });
 
             var availableAdvance = activeDeposits.Sum(d => d.Balance);
             if (availableAdvance <= 0m)
                 return BadRequest(new { error = "no_advance_available", message = "Patient has no available advance deposit balance." });
 
             var maxApplicable = Math.Min(invoice.BalanceDue, availableAdvance);
-            var requestedAmount = req?.Amount.HasValue == true ? req.Amount.Value : maxApplicable;
+            var requestedAmount = req.Amount ?? maxApplicable;
 
             if (requestedAmount <= 0m)
                 return BadRequest(new { error = "invalid_advance_amount", message = "Requested advance amount must be greater than zero." });
@@ -266,7 +279,8 @@ public class PatientDepositsController : ControllerBase
             var remainingToAllocate = requestedAmount;
             var now = DateTimeOffset.UtcNow;
             var invoiceRef = invoice.FormatInvoiceNumber();
-            var allocationsSummary = new List<object>();
+            var allocationsSummary = new List<PatientDepositAllocation>();
+            var paymentId = Guid.NewGuid();
 
             foreach (var deposit in activeDeposits)
             {
@@ -285,21 +299,15 @@ public class PatientDepositsController : ControllerBase
                     TenantId = tenantId,
                     PatientDepositId = deposit.Id,
                     InvoiceId = invoice.Id,
+                    PaymentId = paymentId,
                     AllocatedAmount = allocAmount,
                     AllocatedByUserId = currentUserId,
                     AllocatedAt = now,
                     Notes = $"Applied to {invoiceRef}"
                 };
                 _db.PatientDepositAllocations.Add(allocation);
-
-                allocationsSummary.Add(new
-                {
-                    allocationId = allocation.Id,
-                    depositId = deposit.Id,
-                    receiptNumber = deposit.ReceiptNumber,
-                    amount = allocAmount,
-                    depositRemainingBalance = deposit.Balance
-                });
+                allocation.PatientDeposit = deposit;
+                allocationsSummary.Add(allocation);
 
                 remainingToAllocate -= allocAmount;
             }
@@ -307,7 +315,7 @@ public class PatientDepositsController : ControllerBase
             // Record Payment row on Invoice
             var payment = new Payment
             {
-                Id = Guid.NewGuid(),
+                Id = paymentId,
                 TenantId = tenantId,
                 InvoiceId = invoice.Id,
                 Method = PaymentMethod.AdvanceDeposit,
@@ -320,6 +328,7 @@ public class PatientDepositsController : ControllerBase
                 ConfirmedAt = now,
                 CreatedAt = now
             };
+            payment.IdempotencyKey = req.IdempotencyKey;
             _db.Payments.Add(payment);
 
             // Update Invoice balance
@@ -364,20 +373,63 @@ public class PatientDepositsController : ControllerBase
             });
 
             await _db.SaveChangesAsync(ct);
-            await transaction.CommitAsync(ct);
+            if (transaction != null) await transaction.CommitAsync(ct);
 
-            return Ok(new
-            {
-                invoiceId = invoice.Id,
-                invoiceNumber = invoiceRef,
-                allocatedAdvanceAmount = requestedAmount,
-                paidAmount = invoice.PaidAmount,
-                balanceDue = invoice.BalanceDue,
-                status = invoice.Status.ToString().ToLower(),
-                allocations = allocationsSummary
-            });
-        });
+            return Ok(AdvanceResult(invoice, payment, allocationsSummary, false));
+        }
+        catch (Exception ex) when (InvoiceAccounting.IsReceiptConflict(ex)
+            || ex is DbUpdateException update && InvoiceAccounting.IsIdempotencyConflict(update))
+        {
+            if (transaction != null) await transaction.RollbackAsync(ct);
+            _db.ChangeTracker.Clear();
+            return Conflict(new { error = "advance_changed_concurrently", message = "Reload and retry with the same advance key." });
+        }
     }
+
+    private static object DepositResult(PatientDeposit deposit, bool replay) => new
+    {
+        depositId = deposit.Id,
+        receiptNumber = deposit.ReceiptNumber,
+        financialYear = deposit.FinancialYear,
+        sequenceNumber = deposit.SequenceNumber,
+        patientId = deposit.PatientId,
+        amount = deposit.Amount,
+        balance = deposit.Balance,
+        method = deposit.Method.ToString(),
+        referenceNumber = deposit.ReferenceNumber,
+        notes = deposit.Notes,
+        status = deposit.Status.ToString().ToLowerInvariant(),
+        createdAt = deposit.CreatedAt,
+        idempotencyKey = deposit.IdempotencyKey,
+        idempotentDuplicate = replay,
+        idempotentReplay = replay
+    };
+
+    private static object AdvanceResult(Invoice invoice, Payment payment, IEnumerable<PatientDepositAllocation> allocations, bool replay) => new
+    {
+        invoiceId = invoice.Id,
+        invoiceNumber = invoice.FormatInvoiceNumber(),
+        paymentId = payment.Id,
+        amount = payment.Amount,
+        method = payment.Method.ToString(),
+        paymentStatus = payment.Status.ToString().ToLowerInvariant(),
+        verificationStatus = payment.VerificationStatus.ToString().ToLowerInvariant(),
+        idempotencyKey = payment.IdempotencyKey,
+        confirmedAt = payment.ConfirmedAt,
+        allocatedAdvanceAmount = payment.Amount,
+        paidAmount = invoice.PaidAmount,
+        balanceDue = invoice.BalanceDue,
+        status = invoice.Status.ToString().ToLowerInvariant(),
+        idempotentReplay = replay,
+        allocations = allocations.Select(a => new
+        {
+            allocationId = a.Id,
+            depositId = a.PatientDepositId,
+            receiptNumber = a.PatientDeposit.ReceiptNumber,
+            amount = a.AllocatedAmount,
+            depositRemainingBalance = a.PatientDeposit.Balance
+        })
+    };
 }
 
 public record CreatePatientDepositRequest(
@@ -392,10 +444,12 @@ public record CreatePatientDepositRequest(
     [MaxLength(500)]
     string? Notes = null,
 
-    string? IdempotencyKey = null);
+    [Required, MaxLength(128)] string? IdempotencyKey = null);
 
 public record ApplyAdvanceRequest(
     [Range(0.01, 10000000.00)]
     decimal? Amount = null,
 
-    Guid? DepositId = null);
+    Guid? DepositId = null,
+
+    [Required, MaxLength(128)] string? IdempotencyKey = null);

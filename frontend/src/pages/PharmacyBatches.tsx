@@ -1061,7 +1061,7 @@ export default function PharmacyBatches() {
                 </div>
               ) : (
                 cdciHits.map((hit, idx) => (
-                  <div key={hit.externalCode || idx} className="pt-2 flex items-center justify-between text-xs hover:bg-slate-50 p-2 rounded">
+                  <div key={hit.externalCode || idx} className="pt-2 flex items-center justify-between text-xs hover:bg-[var(--color-surface-hover)] p-2 rounded">
                     <div>
                       <div className="flex items-center gap-2">
                         <span className="font-bold text-slate-800">{hit.name}</span>

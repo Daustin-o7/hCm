@@ -40,8 +40,8 @@ public record MedicineSearchHit(
 
 /// <summary>
 /// Patient and Medicine search via self-hosted Typesense with automatic PostgreSQL fallback.
-/// Write-through is fire-and-forget inside try/catch so a Typesense outage never blocks clinical writes.
-/// Nightly Hangfire reindex is the repair mechanism for silent failures.
+/// Await write-through after the database commit; provider failures are repaired by nightly reconciliation.
+/// PostgreSQL validates ownership and supplies current demographics, including on stale or empty indexes.
 /// </summary>
 public class PatientSearchService : IPatientSearchService
 {
@@ -95,9 +95,9 @@ public class PatientSearchService : IPatientSearchService
             await _ts.CreateCollection(schema);
             _log.LogInformation("Created Typesense collection {Collection}", _opts.PatientsCollection);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense EnsurePatientCollectionAsync failed. Typesense service may be offline or starting up.");
+            _log.LogWarning("Typesense patient collection unavailable ({FailureType})", ex.GetType().Name);
         }
     }
 
@@ -128,230 +128,179 @@ public class PatientSearchService : IPatientSearchService
             await _ts.CreateCollection(schema);
             _log.LogInformation("Created Typesense collection {Collection}", _opts.MedicinesCollection);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense EnsureMedicineCollectionAsync failed. Typesense service may be offline or starting up.");
+            _log.LogWarning("Typesense medicine collection unavailable ({FailureType})", ex.GetType().Name);
         }
     }
 
     public async Task IndexAsync(Patient patient, CancellationToken ct)
     {
+        RequireTenant(patient.TenantId);
+        ct.ThrowIfCancellationRequested();
         var doc = ToDocument(patient);
         try
         {
             await _ts.UpsertDocument<TypesensePatientDocument>(_opts.PatientsCollection, doc);
+            ct.ThrowIfCancellationRequested();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense index failed for patient {Id}; nightly reindex will reconcile", patient.Id);
+            _log.LogWarning("Typesense patient index failed for tenant {TenantId}, record {Id} ({FailureType}); nightly reindex will reconcile",
+                patient.TenantId, patient.Id, ex.GetType().Name);
         }
     }
 
     public async Task IndexManyAsync(IEnumerable<Patient> patients, CancellationToken ct)
     {
-        var docs = patients.Select(ToDocument).ToList();
-        if (docs.Count == 0) return;
-
-        const int batchSize = 1000;
-        for (var i = 0; i < docs.Count; i += batchSize)
+        RequireTenant(_db.CurrentTenantId);
+        ct.ThrowIfCancellationRequested();
+        foreach (var batch in patients.Chunk(1000))
         {
-            var batch = docs.Skip(i).Take(batchSize);
-            try
-            {
-                var importResponse = await _ts.ImportDocuments<TypesensePatientDocument>(
-                    _opts.PatientsCollection,
-                    batch,
-                    batchSize,
-                    ImportType.Upsert);
-
-                var failed = importResponse.Where(r => !r.Success).ToList();
-                if (failed.Count > 0)
-                {
-                    _log.LogWarning("Typesense bulk import: {Failed}/{Total} documents failed",
-                        failed.Count, importResponse.Count);
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Typesense bulk import batch failed");
-            }
+            ct.ThrowIfCancellationRequested();
+            foreach (var patient in batch) RequireTenant(patient.TenantId);
+            var response = await _ts.ImportDocuments(_opts.PatientsCollection, batch.Select(ToDocument), 1000, ImportType.Upsert);
+            ct.ThrowIfCancellationRequested();
+            if (response.Count != batch.Length || response.Any(r => !r.Success))
+                throw new InvalidOperationException("Typesense patient import incomplete; retry reconciliation.");
         }
     }
 
     public async Task IndexMedicineAsync(Drug drug, CancellationToken ct)
     {
+        RequireTenant(drug.TenantId);
+        ct.ThrowIfCancellationRequested();
         var doc = ToMedicineDocument(drug);
         try
         {
             await _ts.UpsertDocument<TypesenseMedicineDocument>(_opts.MedicinesCollection, doc);
+            ct.ThrowIfCancellationRequested();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense index failed for medicine {Id}; nightly reindex will reconcile", drug.Id);
+            _log.LogWarning("Typesense medicine index failed for tenant {TenantId}, record {Id} ({FailureType}); nightly reindex will reconcile",
+                drug.TenantId, drug.Id, ex.GetType().Name);
         }
     }
 
     public async Task IndexManyMedicinesAsync(IEnumerable<Drug> drugs, CancellationToken ct)
     {
-        var docs = drugs.Select(ToMedicineDocument).ToList();
-        if (docs.Count == 0) return;
-
-        const int batchSize = 1000;
-        for (var i = 0; i < docs.Count; i += batchSize)
+        RequireTenant(_db.CurrentTenantId);
+        ct.ThrowIfCancellationRequested();
+        foreach (var batch in drugs.Chunk(1000))
         {
-            var batch = docs.Skip(i).Take(batchSize);
-            try
-            {
-                var importResponse = await _ts.ImportDocuments<TypesenseMedicineDocument>(
-                    _opts.MedicinesCollection,
-                    batch,
-                    batchSize,
-                    ImportType.Upsert);
-
-                var failed = importResponse.Where(r => !r.Success).ToList();
-                if (failed.Count > 0)
-                {
-                    _log.LogWarning("Typesense bulk medicine import: {Failed}/{Total} documents failed",
-                        failed.Count, importResponse.Count);
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Typesense bulk medicine import batch failed");
-            }
+            ct.ThrowIfCancellationRequested();
+            foreach (var drug in batch) RequireTenant(drug.TenantId);
+            var response = await _ts.ImportDocuments(_opts.MedicinesCollection, batch.Select(ToMedicineDocument), 1000, ImportType.Upsert);
+            ct.ThrowIfCancellationRequested();
+            if (response.Count != batch.Length || response.Any(r => !r.Success))
+                throw new InvalidOperationException("Typesense medicine import incomplete; retry reconciliation.");
         }
     }
 
     public async Task DeleteAsync(Guid id, CancellationToken ct)
     {
+        var tenantId = _db.CurrentTenantId;
+        RequireTenant(tenantId);
+        ct.ThrowIfCancellationRequested();
         try
         {
-            await _ts.DeleteDocument<TypesensePatientDocument>(_opts.PatientsCollection, id.ToString());
+            await _ts.DeleteDocuments(_opts.PatientsCollection, $"tenant_id:={tenantId} && id:={id}");
+            ct.ThrowIfCancellationRequested();
         }
         catch (TypesenseApiNotFoundException)
         {
             // already gone — fine
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense delete failed for patient {Id}", id);
+            _log.LogWarning("Typesense patient delete failed for tenant {TenantId}, record {Id} ({FailureType})",
+                tenantId, id, ex.GetType().Name);
         }
     }
 
     public async Task<List<PatientSearchHit>> SearchAsync(string query, Guid tenantId, int limit = 10, CancellationToken ct = default)
     {
+        RequireTenant(tenantId);
+        ct.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(query))
             return new List<PatientSearchHit>();
 
+        limit = Math.Clamp(limit, 1, 50);
         var trimmed = query.Trim();
         var isNumeric = trimmed.All(char.IsDigit) && trimmed.Length >= 3;
         var sp = new SearchParameters(trimmed, isNumeric ? "phone,name" : "name,phone")
         {
             Prefix = true,
-            FilterBy = tenantId != Guid.Empty ? $"tenant_id:={tenantId}" : null,
+            FilterBy = $"tenant_id:={tenantId}",
             PerPage = limit,
             NumberOfTypos = isNumeric ? "0" : "2"
         };
 
+        var candidates = new List<Guid>();
         try
         {
             var result = await _ts.Search<TypesensePatientDocument>(_opts.PatientsCollection, sp, ct);
-            return result.Hits.Select(h => new PatientSearchHit(
-                Guid.Parse(h.Document.Id),
-                h.Document.Name,
-                h.Document.Phone,
-                h.Document.Dob,
-                h.Document.Gender,
-                h.Document.Address,
-                (int)(h.TextMatch ?? 0))).ToList();
+            candidates = result.Hits.Where(h => Guid.TryParse(h.Document.TenantId, out var owner) && owner == tenantId)
+                .Select(h => Guid.TryParse(h.Document.Id, out var id) ? id : Guid.Empty)
+                .Where(id => id != Guid.Empty).Distinct().Take(limit).ToList();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense search unavailable; executing PostgreSQL fallback search for query {Query}", query);
-            return await FallbackSearchDatabaseAsync(trimmed, tenantId, limit, ct);
+            _log.LogWarning("Typesense patient search unavailable for tenant {TenantId} ({FailureType}); using database", tenantId, ex.GetType().Name);
         }
+        return await FallbackSearchDatabaseAsync(trimmed, tenantId, limit, candidates, ct);
     }
 
     public async Task<List<PatientSearchHit>> CheckDuplicatesAsync(string name, string? phone, DateOnly? dob, Guid tenantId, CancellationToken ct = default)
     {
-        var parts = new List<string> { name };
-        if (!string.IsNullOrWhiteSpace(phone)) parts.Add(phone);
-        if (dob.HasValue) parts.Add(dob.Value.ToString("yyyy-MM-dd"));
-
-        var composite = string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
-        if (string.IsNullOrWhiteSpace(composite)) return new List<PatientSearchHit>();
-
-        var sp = new SearchParameters(composite, "name,phone,dob")
-        {
-            Prefix = true,
-            FilterBy = tenantId != Guid.Empty ? $"tenant_id:={tenantId}" : null,
-            PerPage = 5,
-            NumberOfTypos = "1"
-        };
-
-        try
-        {
-            var result = await _ts.Search<TypesensePatientDocument>(_opts.PatientsCollection, sp, ct);
-            return result.Hits
-                .Where(h => (h.TextMatch ?? 0) > 100)
-                .Select(h => new PatientSearchHit(
-                    Guid.Parse(h.Document.Id),
-                    h.Document.Name,
-                    h.Document.Phone,
-                    h.Document.Dob,
-                    h.Document.Gender,
-                    h.Document.Address,
-                    (int)(h.TextMatch ?? 0)))
-                .ToList();
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Typesense duplicate check unavailable; executing PostgreSQL fallback for {Name}", name);
-            return await FallbackDuplicateCheckDatabaseAsync(name, phone, dob, tenantId, ct);
-        }
+        RequireTenant(tenantId);
+        ct.ThrowIfCancellationRequested();
+        // Duplicate clearance must not depend on a derived index's freshness or fuzzy score.
+        return await FallbackDuplicateCheckDatabaseAsync(name, phone, dob, tenantId, ct);
     }
 
     public async Task<List<MedicineSearchHit>> MedicinesSearchAsync(string query, Guid tenantId, int limit = 10, CancellationToken ct = default)
     {
+        RequireTenant(tenantId);
+        ct.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(query))
             return new List<MedicineSearchHit>();
 
+        limit = Math.Clamp(limit, 1, 50);
         var trimmed = query.Trim();
         var sp = new SearchParameters(trimmed, "name,generic_name,common_brands,dosage_form,strength,hsn_code")
         {
-            FilterBy = tenantId != Guid.Empty ? $"tenant_id:={tenantId}" : null,
+            FilterBy = $"tenant_id:={tenantId}",
             PerPage = limit,
             NumberOfTypos = "2"
         };
 
+        var candidates = new List<Guid>();
         try
         {
             var result = await _ts.Search<TypesenseMedicineDocument>(_opts.MedicinesCollection, sp, ct);
-            return result.Hits.Select(h => new MedicineSearchHit(
-                Guid.Parse(h.Document.Id),
-                h.Document.Name,
-                h.Document.GenericName,
-                h.Document.CommonBrands,
-                h.Document.Strength,
-                h.Document.DosageForm,
-                (int)(h.TextMatch ?? 0))).ToList();
+            candidates = result.Hits.Where(h => Guid.TryParse(h.Document.TenantId, out var owner) && owner == tenantId)
+                .Select(h => Guid.TryParse(h.Document.Id, out var id) ? id : Guid.Empty)
+                .Where(id => id != Guid.Empty).Distinct().Take(limit).ToList();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "Typesense medicine search unavailable; executing PostgreSQL fallback for query {Query}", query);
-            return await FallbackMedicinesSearchDatabaseAsync(trimmed, tenantId, limit, ct);
+            _log.LogWarning("Typesense medicine search unavailable for tenant {TenantId} ({FailureType}); using database", tenantId, ex.GetType().Name);
         }
+        return await FallbackMedicinesSearchDatabaseAsync(trimmed, tenantId, limit, candidates, ct);
     }
 
-    private async Task<List<PatientSearchHit>> FallbackSearchDatabaseAsync(string query, Guid tenantId, int limit, CancellationToken ct)
+    private async Task<List<PatientSearchHit>> FallbackSearchDatabaseAsync(string query, Guid tenantId, int limit, List<Guid> candidates, CancellationToken ct)
     {
         try
         {
-            var lowerQuery = query.Trim().ToLower();
+            var lowerQuery = query.Trim().ToLowerInvariant();
             var matches = await _db.Patients.AsNoTracking()
-                .Where(p => (tenantId == Guid.Empty || p.TenantId == tenantId)
-                         && (p.Name.ToLower().Contains(lowerQuery) || p.Phone.Contains(query)))
-                .OrderByDescending(p => p.CreatedAt)
+                .Where(p => p.TenantId == tenantId
+                         && (p.Name.ToLower().Contains(lowerQuery) || p.Phone.Contains(query) || candidates.Contains(p.Id)))
+                .OrderByDescending(p => p.Name.ToLower().Contains(lowerQuery) || p.Phone.Contains(query))
+                .ThenByDescending(p => p.CreatedAt).ThenBy(p => p.Id)
                 .Take(limit)
                 .ToListAsync(ct);
 
@@ -364,10 +313,9 @@ public class PatientSearchService : IPatientSearchService
                 p.Address,
                 100)).ToList();
         }
-        catch (Exception dbEx)
+        catch (Exception dbEx) when (!ct.IsCancellationRequested)
         {
-            _log.LogError(dbEx, "Database fallback search failed for query {Query}", query);
-            return new List<PatientSearchHit>();
+            throw new SearchUnavailableException(dbEx);
         }
     }
 
@@ -375,12 +323,13 @@ public class PatientSearchService : IPatientSearchService
     {
         try
         {
-            var query = _db.Patients.AsNoTracking().Where(p => tenantId == Guid.Empty || p.TenantId == tenantId);
+            var query = _db.Patients.AsNoTracking().Where(p => p.TenantId == tenantId);
 
             if (!string.IsNullOrWhiteSpace(phone))
             {
                 var phoneMatches = await query
-                    .Where(p => p.Phone == phone)
+                    .Where(p => p.Phone == phone.Trim())
+                    .OrderBy(p => p.Id)
                     .Take(5)
                     .ToListAsync(ct);
 
@@ -397,9 +346,11 @@ public class PatientSearchService : IPatientSearchService
                 }
             }
 
-            var lowerName = name.Trim().ToLower();
+            if (string.IsNullOrWhiteSpace(name)) return [];
+            var lowerName = name.Trim().ToLowerInvariant();
             var nameDobMatches = await query
                 .Where(p => p.Name.ToLower().Contains(lowerName) && (dob == null || p.Dob == dob))
+                .OrderBy(p => p.Id)
                 .Take(5)
                 .ToListAsync(ct);
 
@@ -412,25 +363,27 @@ public class PatientSearchService : IPatientSearchService
                 p.Address,
                 110)).ToList();
         }
-        catch (Exception dbEx)
+        catch (Exception dbEx) when (!ct.IsCancellationRequested)
         {
-            _log.LogError(dbEx, "Database fallback duplicate check failed for name {Name}", name);
-            return new List<PatientSearchHit>();
+            throw new SearchUnavailableException(dbEx);
         }
     }
 
-    private async Task<List<MedicineSearchHit>> FallbackMedicinesSearchDatabaseAsync(string query, Guid tenantId, int limit, CancellationToken ct)
+    private async Task<List<MedicineSearchHit>> FallbackMedicinesSearchDatabaseAsync(string query, Guid tenantId, int limit, List<Guid> candidates, CancellationToken ct)
     {
         try
         {
-            var cleanQuery = query.Trim().ToLower();
+            var cleanQuery = query.Trim().ToLowerInvariant();
             var matches = await _db.Drugs.AsNoTracking()
-                .Where(m => (tenantId == Guid.Empty || m.TenantId == tenantId)
+                .Where(m => m.TenantId == tenantId
                          && (m.Name.ToLower().Contains(cleanQuery)
                              || m.GenericName.ToLower().Contains(cleanQuery)
                              || (m.CommonBrands != null && m.CommonBrands.ToLower().Contains(cleanQuery))
                              || (m.DosageForm != null && m.DosageForm.ToLower().Contains(cleanQuery))
-                             || (m.Strength != null && m.Strength.ToLower().Contains(cleanQuery))))
+                             || (m.Strength != null && m.Strength.ToLower().Contains(cleanQuery))
+                             || m.HsnCode.Contains(cleanQuery) || candidates.Contains(m.Id)))
+                .OrderByDescending(m => m.Name.ToLower().Contains(cleanQuery) || m.GenericName.ToLower().Contains(cleanQuery))
+                .ThenBy(m => m.Name).ThenBy(m => m.Id)
                 .Take(limit)
                 .ToListAsync(ct);
 
@@ -443,11 +396,16 @@ public class PatientSearchService : IPatientSearchService
                 m.DosageForm,
                 100)).ToList();
         }
-        catch (Exception dbEx)
+        catch (Exception dbEx) when (!ct.IsCancellationRequested)
         {
-            _log.LogError(dbEx, "Database fallback medicine search failed for query {Query}", query);
-            return new List<MedicineSearchHit>();
+            throw new SearchUnavailableException(dbEx);
         }
+    }
+
+    private void RequireTenant(Guid tenantId)
+    {
+        if (tenantId == Guid.Empty || tenantId != _db.CurrentTenantId)
+            throw new UnauthorizedAccessException("A matching selected tenant is required for search and indexing.");
     }
 
     private static TypesensePatientDocument ToDocument(Patient p) => new()
@@ -458,7 +416,7 @@ public class PatientSearchService : IPatientSearchService
         Phone = p.Phone,
         Dob = p.Dob?.ToString("yyyy-MM-dd"),
         Gender = p.Gender.ToString(),
-        Address = p.Address,
+        Address = null,
         Email = null,
         CreatedAt = p.CreatedAt.ToUnixTimeSeconds()
     };
@@ -478,3 +436,6 @@ public class PatientSearchService : IPatientSearchService
         CreatedAt = d.CreatedAt.ToUnixTimeSeconds()
     };
 }
+
+public sealed class SearchUnavailableException(Exception innerException)
+    : Exception("Database search is temporarily unavailable. Retry the search before proceeding.", innerException);
