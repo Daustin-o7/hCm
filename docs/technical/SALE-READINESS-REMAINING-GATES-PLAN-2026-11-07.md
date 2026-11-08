@@ -166,6 +166,8 @@ Current pre-commit evidence: `C:/Users/derek/AppData/Local/Temp/opencode/sale-re
 
 **Part B — Fix 1 local implementation:** `frontend/src/pages/Billing.tsx` adds `refunds`/`netCollections` to `MonthSummary`, replaces the misleading net formula, displays gross income/refunds/net collections/expenses/**Net cash after expenses**, and moves approved CN amounts to an explicitly informational GST-side line. It documents CN-without-refund behavior and uses a one/two/five-column responsive grid. One test was added to the existing `frontend/e2e/part1-billing-contracts.spec.ts` pattern (the requested test exception to the single-page application scope).
 
+**Fix 1 commit:** `40a01daefe036f88bd5adb7c962993c40aab6a07` — Billing page, its Playwright spec, this plan, the Fix 2 scope note, the Fix 2 approval request, and the two prior-pass financial doc updates. No backend, schema or unrelated frontend file. It follows backend checkpoint `510db70`.
+
 **Resolved discrepancy (2026-11-08, second pass):** the card renders `Ledger.Summary.net`, which the backend computes as **`netCollections − expenses`** and which **never subtracts `gstLiability`**. It therefore is *not* `FinancialSummary.netProfit` (`netCollections − expenses − gstLiability`). Exact label adopted: **“Net cash after expenses”**, with the panel copy stating it is before GST and that net profit is on Reports. The earlier label “Net” and the earlier manual-check wording were the source of the confusion; no backend field was added.
 
 Corrected manual-check arithmetic for gross ₹1,180, refund ₹590, expenses ₹100 in one month:
