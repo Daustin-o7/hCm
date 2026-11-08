@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using System.Text.Json;
 using Hospital_CRM.Api.Controllers;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
@@ -57,7 +58,10 @@ public class Part2SearchReportLedgerTests
         Assert.Equal(7m, summary.GetProperty("reportedPendingIncome").GetDecimal());
         Assert.Equal(5m, summary.GetProperty("creditNotesIssued").GetDecimal());
         Assert.Equal(4m, summary.GetProperty("expenses").GetProperty("total").GetDecimal());
-        Assert.Equal(51m, summary.GetProperty("net").GetDecimal());
+        Assert.Equal(0m, summary.GetProperty("refunds").GetDecimal());
+        Assert.Equal(60m, summary.GetProperty("netCollections").GetDecimal());
+        // Credit notes now adjust GST only; net revenue is collections minus refunds.
+        Assert.Equal(56m, summary.GetProperty("net").GetDecimal());
     }
 
     [Fact]
@@ -181,6 +185,101 @@ public class Part2SearchReportLedgerTests
         Assert.DoesNotContain("foreign-secret", result.ToString());
     }
 
+    [Fact]
+    public async Task Income_AllocatesInvoiceGstCumulativelyAcrossMonths()
+    {
+        using var f = new Fixture();
+        var june = DateTimeOffset.Parse("2026-06-10T10:00:00Z");
+        var july = DateTimeOffset.Parse("2026-07-10T10:00:00Z");
+        var invoice = new Invoice
+        {
+            Id = Guid.NewGuid(),
+            TenantId = f.Tenant,
+            Total = 1180m,
+            GstAmount = 180m,
+            CreatedAt = june,
+            Status = InvoiceStatus.Paid,
+            Appointment = new Appointment { Id = Guid.NewGuid(), TenantId = f.Tenant, ClinicId = f.Clinic, TimeSlot = "10:00" }
+        };
+        f.Db.Payments.AddRange(
+            new Payment { Id = Guid.NewGuid(), TenantId = f.Tenant, Invoice = invoice, Amount = 590m, PaidAt = june, Status = PaymentStatus.Completed, Method = PaymentMethod.Cash },
+            new Payment { Id = Guid.NewGuid(), TenantId = f.Tenant, Invoice = invoice, Amount = 590m, PaidAt = july, Status = PaymentStatus.Completed, Method = PaymentMethod.Cash });
+        await f.Db.SaveChangesAsync();
+
+        Assert.Equal(90m, Json(await f.Controller.Income("2026-06", default)).GetProperty("gstCollected").GetDecimal());
+        Assert.Equal(90m, Json(await f.Controller.Income("2026-07", default)).GetProperty("gstCollected").GetDecimal());
+    }
+
+    [Fact]
+    public async Task IncomeAndDaily_CreditNoteReversesGst_AndRefundsNetRevenue()
+    {
+        using var f = new Fixture();
+        var june = DateTimeOffset.Parse("2026-06-10T10:00:00Z");
+        var july = june.AddMonths(1);
+        var invoice = f.Payment(1180m, june).Invoice;
+        invoice.GstAmount = 180m;
+        f.Note(invoice, 590m, july, CreditNoteStatus.Approved);
+        f.Refund(invoice, 590m, july);
+        await f.Db.SaveChangesAsync();
+
+        var income = Json(await f.Controller.Income("2026-07", default));
+        Assert.Equal(0m, income.GetProperty("totalIncome").GetDecimal());
+        Assert.Equal(590m, income.GetProperty("refunds").GetDecimal());
+        Assert.Equal(-590m, income.GetProperty("netCollections").GetDecimal());
+        Assert.Equal(-90m, income.GetProperty("gstCollected").GetDecimal());
+
+        var daily = Json(await f.Controller.Daily("2026-07-10", default));
+        Assert.Equal(-90m, daily.GetProperty("income").GetProperty("gstCollected").GetDecimal());
+        Assert.Equal(590m, daily.GetProperty("income").GetProperty("refunds").GetDecimal());
+        Assert.Equal(-590m, daily.GetProperty("net").GetDecimal());
+
+        var reports = new ReportsController(f.Db) { ControllerContext = f.Controller.ControllerContext };
+        Assert.Equal(-90m, Json(await reports.FinancialSummary("2026-07", default)).GetProperty("gstLiability").GetDecimal());
+    }
+
+    [Fact]
+    public async Task IncomeAndDaily_RefundWithoutCreditNote_DoesNotReverseGst()
+    {
+        using var f = new Fixture();
+        var june = DateTimeOffset.Parse("2026-06-10T10:00:00Z");
+        var july = june.AddMonths(1);
+        var invoice = f.Payment(1180m, june).Invoice;
+        invoice.GstAmount = 180m;
+        f.Refund(invoice, 590m, july);
+        await f.Db.SaveChangesAsync();
+
+        var income = Json(await f.Controller.Income("2026-07", default));
+        Assert.Equal(0m, income.GetProperty("gstCollected").GetDecimal());
+        Assert.Equal(590m, income.GetProperty("refunds").GetDecimal());
+        Assert.Equal(-590m, income.GetProperty("netCollections").GetDecimal());
+        Assert.Equal(0m, Json(await f.Controller.Daily("2026-07-10", default))
+            .GetProperty("income").GetProperty("gstCollected").GetDecimal());
+    }
+
+    [Theory]
+    [InlineData("own", -90)]
+    [InlineData("walk-in", -90)]
+    [InlineData("foreign-invoice", 0)]
+    [InlineData("foreign-appointment", 0)]
+    [InlineData("sibling-clinic", 0)]
+    public async Task IncomeAndDaily_CreditNoteRequiresOwnedInvoice(string scope, decimal expectedGst)
+    {
+        using var f = new Fixture();
+        var june = DateTimeOffset.Parse("2026-06-10T10:00:00Z");
+        var july = june.AddMonths(1);
+        var invoice = f.Payment(1180m, june, foreign: scope == "foreign-invoice",
+            sibling: scope == "sibling-clinic", walkIn: scope == "walk-in").Invoice;
+        invoice.GstAmount = 180m;
+        if (scope == "foreign-appointment") invoice.Appointment!.TenantId = f.OtherTenant;
+        f.Note(invoice, 590m, july, CreditNoteStatus.Approved);
+        await f.Db.SaveChangesAsync();
+
+        Assert.Equal(expectedGst, Json(await f.Controller.Income("2026-07", default)).GetProperty("gstCollected").GetDecimal());
+        Assert.Equal(expectedGst, Json(await f.Controller.Daily("2026-07-10", default)).GetProperty("income").GetProperty("gstCollected").GetDecimal());
+        var reports = new ReportsController(f.Db) { ControllerContext = f.Controller.ControllerContext };
+        Assert.Equal(expectedGst, Json(await reports.FinancialSummary("2026-07", default)).GetProperty("gstLiability").GetDecimal());
+    }
+
     private static JsonElement Json(IActionResult result) => JsonSerializer.SerializeToElement(Assert.IsType<OkObjectResult>(result).Value);
 
     private sealed class Fixture : IDisposable
@@ -215,6 +314,17 @@ public class Part2SearchReportLedgerTests
         }
         public void Note(Invoice invoice, decimal amount, DateTimeOffset at, CreditNoteStatus status) => Db.CreditNotes.Add(new CreditNote {
             Id = Guid.NewGuid(), TenantId = Tenant, Invoice = invoice, Amount = amount, IssuedAt = at, Status = status, CreditNoteNumber = Guid.NewGuid().ToString() });
+        public void Refund(Invoice invoice, decimal amount, DateTimeOffset at) => Db.Payments.Add(new Payment
+        {
+            Id = Guid.NewGuid(),
+            TenantId = Tenant,
+            Invoice = invoice,
+            Amount = -amount,
+            PaidAt = at,
+            Status = PaymentStatus.Refunded,
+            VerificationStatus = PaymentVerificationStatus.Confirmed,
+            Method = PaymentMethod.Cash
+        });
         public void Expense(decimal amount, DateOnly date, bool foreign = false) => Db.LedgerExpenses.Add(new LedgerExpense {
             Id = Guid.NewGuid(), TenantId = foreign ? OtherTenant : Tenant, Amount = amount, ExpenseDate = date, Category = ExpenseCategory.Rent, CategoryOther = "Rent" });
         public void Dispose() => Db.Dispose();

@@ -2,6 +2,7 @@ using System.Security.Claims;
 using System.Text.Json;
 using Hospital_CRM.Api.Controllers;
 using Hospital_CRM.Api.Extensions;
+using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
@@ -524,5 +525,383 @@ public class ReportsControllerTests
         var unauthorized = Assert.IsAssignableFrom<ObjectResult>(result);
         Assert.Equal(401, unauthorized.StatusCode);
         Assert.Equal("invalid_token", AsJson(unauthorized.Value).GetProperty("error").GetString());
+    }
+
+    private static async Task<Invoice> SeedInstallmentInvoice(
+        HospitalCrmDbContext db, Guid clinicId, decimal total, decimal gst,
+        params (decimal Amount, DateTimeOffset PaidAt)[] installments)
+    {
+        var appointment = new Appointment
+        {
+            Id = Guid.NewGuid(),
+            TenantId = TenantId,
+            DoctorId = Guid.NewGuid(),
+            PatientId = Guid.NewGuid(),
+            ClinicId = clinicId,
+            Date = DateOnly.FromDateTime(InMonth.UtcDateTime),
+            TimeSlot = "10:00",
+            Status = AppointmentStatus.Completed,
+            CreatedAt = InMonth
+        };
+        db.Appointments.Add(appointment);
+        var invoice = new Invoice
+        {
+            Id = Guid.NewGuid(),
+            TenantId = TenantId,
+            InvoiceNumber = Random.Shared.Next(1, 999999),
+            AppointmentId = appointment.Id,
+            Subtotal = total - gst,
+            GstAmount = gst,
+            Total = total,
+            Status = InvoiceStatus.Paid,
+            CreatedAt = InMonth
+        };
+        db.Invoices.Add(invoice);
+        foreach (var (amount, paidAt) in installments)
+        {
+            db.Payments.Add(new Payment
+            {
+                Id = Guid.NewGuid(),
+                TenantId = TenantId,
+                InvoiceId = invoice.Id,
+                Method = PaymentMethod.UPI,
+                Amount = amount,
+                Status = PaymentStatus.Completed,
+                PaidAt = paidAt,
+                CreatedAt = paidAt
+            });
+        }
+        await db.SaveChangesAsync();
+        return invoice;
+    }
+
+    [Fact]
+    public async Task FinancialSummary_AllocatesInvoiceGstAcrossInstallments_WithoutRepeatingIt()
+    {
+        var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        await SeedInstallmentInvoice(db, clinicId, total: 1180m, gst: 180m,
+            (590m, new DateTimeOffset(2026, 6, 10, 10, 0, 0, TimeSpan.Zero)),
+            (590m, new DateTimeOffset(2026, 7, 10, 10, 0, 0, TimeSpan.Zero)));
+
+        var june = AsJson(Assert.IsType<OkObjectResult>(
+            await controller.FinancialSummary("2026-06", CancellationToken.None)).Value);
+        var july = AsJson(Assert.IsType<OkObjectResult>(
+            await controller.FinancialSummary("2026-07", CancellationToken.None)).Value);
+
+        // 590 of 1180 collected in June recognizes half the 180 GST, not all of it.
+        Assert.Equal(590m, june.GetProperty("grossIncome").GetDecimal());
+        Assert.Equal(90m, june.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(500m, june.GetProperty("netProfit").GetDecimal());
+        Assert.Equal(90m, july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(180m, june.GetProperty("gstLiability").GetDecimal()
+                        + july.GetProperty("gstLiability").GetDecimal());
+    }
+
+    [Fact]
+    public async Task FinancialSummary_Overpayment_DoesNotRecognizeMoreThanInvoiceGst()
+    {
+        var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        await SeedInstallmentInvoice(db, clinicId, total: 1180m, gst: 180m,
+            (590m, new DateTimeOffset(2026, 6, 10, 10, 0, 0, TimeSpan.Zero)),
+            (590m, new DateTimeOffset(2026, 7, 10, 10, 0, 0, TimeSpan.Zero)),
+            (590m, new DateTimeOffset(2026, 8, 10, 10, 0, 0, TimeSpan.Zero)));
+
+        async Task<decimal> Gst(string month)
+        {
+            var json = AsJson(Assert.IsType<OkObjectResult>(
+                await controller.FinancialSummary(month, CancellationToken.None)).Value);
+            return json.GetProperty("gstLiability").GetDecimal();
+        }
+
+        Assert.Equal(90m, await Gst("2026-06"));
+        Assert.Equal(90m, await Gst("2026-07"));
+        Assert.Equal(0m, await Gst("2026-08"));
+    }
+
+    [Fact]
+    public async Task FinancialSummary_InstallmentRounding_KeepsInvoiceGstExact()
+    {
+        var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        await SeedInstallmentInvoice(db, clinicId, total: 1000m, gst: 100m,
+            (333.33m, new DateTimeOffset(2026, 6, 10, 10, 0, 0, TimeSpan.Zero)),
+            (333.33m, new DateTimeOffset(2026, 7, 10, 10, 0, 0, TimeSpan.Zero)),
+            (333.34m, new DateTimeOffset(2026, 8, 10, 10, 0, 0, TimeSpan.Zero)));
+
+        var months = new List<decimal>();
+        foreach (var month in new[] { "2026-06", "2026-07", "2026-08" })
+        {
+            var json = AsJson(Assert.IsType<OkObjectResult>(
+                await controller.FinancialSummary(month, CancellationToken.None)).Value);
+            months.Add(json.GetProperty("gstLiability").GetDecimal());
+        }
+
+        Assert.All(months, value => Assert.True(value >= 0m));
+        Assert.Equal(100m, months.Sum());
+    }
+
+    private static Payment AddRefund(HospitalCrmDbContext db, Invoice invoice, decimal amount, DateTimeOffset at)
+    {
+        var refund = new Payment
+        {
+            Id = Guid.NewGuid(),
+            TenantId = invoice.TenantId,
+            InvoiceId = invoice.Id,
+            Amount = -amount,
+            Method = PaymentMethod.Cash,
+            Status = PaymentStatus.Refunded,
+            VerificationStatus = PaymentVerificationStatus.Confirmed,
+            CreatedAt = at,
+            PaidAt = at
+        };
+        db.Payments.Add(refund);
+        return refund;
+    }
+
+    private static CreditNote AddCredit(
+        HospitalCrmDbContext db, Invoice invoice, decimal amount, DateTimeOffset at,
+        CreditNoteStatus status = CreditNoteStatus.Approved)
+    {
+        var credit = new CreditNote
+        {
+            Id = Guid.NewGuid(),
+            TenantId = invoice.TenantId,
+            InvoiceId = invoice.Id,
+            CreditNoteNumber = Guid.NewGuid().ToString(),
+            Amount = amount,
+            Status = status,
+            CreatedAt = InMonth,
+            IssuedAt = at
+        };
+        db.CreditNotes.Add(credit);
+        return credit;
+    }
+
+    private static void AddInstallment(
+        HospitalCrmDbContext db, Invoice invoice, decimal amount, DateTimeOffset at)
+        => db.Payments.Add(new Payment
+        {
+            Id = Guid.NewGuid(),
+            TenantId = invoice.TenantId,
+            InvoiceId = invoice.Id,
+            Method = PaymentMethod.UPI,
+            Amount = amount,
+            Status = PaymentStatus.Completed,
+            PaidAt = at,
+            CreatedAt = at
+        });
+
+    private static async Task<JsonElement> Financial(
+        ReportsController controller, string month)
+        => AsJson(Assert.IsType<OkObjectResult>(
+            await controller.FinancialSummary(month, CancellationToken.None)).Value);
+
+    // Memo case 1: an approved credit note reverses the invoice GST in its issue period.
+    [Fact]
+    public async Task FinancialSummary_CreditNoteReversesGstInIssuePeriod()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddCredit(db, invoice, 1180m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        var june = await Financial(controller, "2026-06");
+        var july = await Financial(controller, "2026-07");
+
+        Assert.Equal(180m, june.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(-180m, july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(0m, june.GetProperty("gstLiability").GetDecimal()
+                        + july.GetProperty("gstLiability").GetDecimal());
+        // The reversal month shows the liability reduction as profit; margin is undefined without revenue.
+        Assert.Equal(180m, july.GetProperty("netProfit").GetDecimal());
+        Assert.Equal(0m, july.GetProperty("netProfitMargin").GetDecimal());
+    }
+
+    // Memo cases 2 and 4: a refund alone never reverses GST, and net revenue follows the refund.
+    [Fact]
+    public async Task FinancialSummary_RefundWithoutCreditNote_DoesNotReverseGst()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddRefund(db, invoice, 1180m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        var june = await Financial(controller, "2026-06");
+        var july = await Financial(controller, "2026-07");
+
+        Assert.Equal(180m, june.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(0m, july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(1180m, july.GetProperty("refunds").GetDecimal());
+        Assert.Equal(-1180m, july.GetProperty("netCollections").GetDecimal());
+        Assert.Equal(-1180m, july.GetProperty("netProfit").GetDecimal());
+        Assert.Equal(0m, july.GetProperty("netProfitMargin").GetDecimal());
+        Assert.Equal(0m, june.GetProperty("netCollections").GetDecimal()
+                        + july.GetProperty("netCollections").GetDecimal());
+    }
+
+    // Memo cases 3 and 9: refund plus matching credit note reverses once, not twice.
+    [Fact]
+    public async Task FinancialSummary_PartialRefundWithMatchingCreditNote_ReversesOnce()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddRefund(db, invoice, 590m, OutOfMonth);
+        AddCredit(db, invoice, 590m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        var july = await Financial(controller, "2026-07");
+
+        Assert.Equal(-90m, july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(590m, july.GetProperty("refunds").GetDecimal());
+        Assert.Equal(-590m, july.GetProperty("netCollections").GetDecimal());
+    }
+
+    // Memo case 4: partial refund without a credit note reverses nothing.
+    [Fact]
+    public async Task FinancialSummary_PartialRefundWithoutCreditNote_DoesNotReverse()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddRefund(db, invoice, 590m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        var july = await Financial(controller, "2026-07");
+
+        Assert.Equal(0m, july.GetProperty("gstLiability").GetDecimal());
+    }
+
+    // Memo case 5: credit note only, pro-rata against the invoice GST.
+    [Fact]
+    public async Task FinancialSummary_CreditNoteOnly_ReversesProRata()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddCredit(db, invoice, 300m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        var june = await Financial(controller, "2026-06");
+        var july = await Financial(controller, "2026-07");
+
+        Assert.Equal(180m, june.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(-45.76m, july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(134.24m, june.GetProperty("gstLiability").GetDecimal()
+                             + july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(0m, july.GetProperty("refunds").GetDecimal());
+        Assert.Equal(0m, july.GetProperty("netCollections").GetDecimal());
+    }
+
+    // Memo case 6: a credit note before any receipt caps the later collection's GST.
+    [Fact]
+    public async Task FinancialSummary_CreditNoteBeforePayment_ReversesThenRecognizesBalance()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m);
+        AddCredit(db, invoice, 590m, OutOfMonth);
+        AddInstallment(db, invoice, 590m, OutOfMonth.AddMonths(1));
+        await db.SaveChangesAsync();
+
+        Assert.Equal(0m, (await Financial(controller, "2026-07")).GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(90m, (await Financial(controller, "2026-08")).GetProperty("gstLiability").GetDecimal());
+    }
+
+    // Memo case 7: overpayment is capped, and a refund without a note still reverses nothing.
+    [Fact]
+    public async Task FinancialSummary_OverpaymentWithRefund_DoesNotReverseWithoutCreditNote()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1500m, InMonth));
+        AddRefund(db, invoice, 320m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(180m, (await Financial(controller, "2026-06")).GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(0m, (await Financial(controller, "2026-07")).GetProperty("gstLiability").GetDecimal());
+    }
+
+    // Memo case 8: credit-note rounding stays exact to the smallest currency unit.
+    [Fact]
+    public async Task FinancialSummary_CreditNoteRounding_ReversesExactly()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1000m, 100m, (1000m, InMonth));
+        AddCredit(db, invoice, 333.33m, OutOfMonth);
+        AddCredit(db, invoice, 333.34m, OutOfMonth.AddMonths(1));
+        AddCredit(db, invoice, 333.33m, OutOfMonth.AddMonths(2));
+        await db.SaveChangesAsync();
+
+        var reversals = new List<decimal>();
+        foreach (var month in new[] { "2026-07", "2026-08", "2026-09" })
+            reversals.Add((await Financial(controller, month)).GetProperty("gstLiability").GetDecimal());
+
+        Assert.Equal(new[] { -33.33m, -33.34m, -33.33m }, reversals);
+        Assert.Equal(-100m, reversals.Sum());
+    }
+
+    // Memo case 10: the refund period is untouched; the note's issue period carries the reversal.
+    [Fact]
+    public async Task FinancialSummary_CreditNoteReversesInIssuePeriod_NotRefundPeriod()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddRefund(db, invoice, 1180m, OutOfMonth);
+        AddCredit(db, invoice, 1180m, OutOfMonth.AddMonths(1));
+        await db.SaveChangesAsync();
+
+        Assert.Equal(180m, (await Financial(controller, "2026-06")).GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(0m, (await Financial(controller, "2026-07")).GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(-180m, (await Financial(controller, "2026-08")).GetProperty("gstLiability").GetDecimal());
+    }
+
+    // Memo case 11: only approved notes count.
+    [Fact]
+    public async Task FinancialSummary_IgnoresPendingAndRejectedCreditNotes()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddCredit(db, invoice, 590m, OutOfMonth, CreditNoteStatus.PendingApproval);
+        AddCredit(db, invoice, 590m, OutOfMonth, CreditNoteStatus.Rejected);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(0m, (await Financial(controller, "2026-07")).GetProperty("gstLiability").GetDecimal());
+    }
+
+    // Memo case 12: another clinic's credit note is outside this report's scope.
+    [Fact]
+    public async Task FinancialSummary_IgnoresCreditNotesOutsideTheSelectedClinic()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        var otherClinicInvoice = await SeedInstallmentInvoice(
+            db, Guid.NewGuid(), 1180m, 180m, (1180m, InMonth));
+        AddCredit(db, otherClinicInvoice, 590m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(0m, (await Financial(controller, "2026-07")).GetProperty("gstLiability").GetDecimal());
     }
 }

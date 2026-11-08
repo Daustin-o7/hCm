@@ -46,17 +46,33 @@ public class LedgerController : ControllerBase
             .ToListAsync(ct);
 
         var totalIncome = payments.Sum(p => p.Amount);
-        // GST is recognized once per invoice, pro-rata to what was actually collected this month.
-        var gstCollected = payments
-            .GroupBy(p => p.Invoice)
-            .Where(g => g.Key is { Total: > 0 })
-            .Sum(g => g.Key!.GstAmount * Math.Min(1m, g.Sum(p => p.Amount) / g.Key!.Total));
+        var refunds = await QueryRefunds(start, end).SumAsync(p => -p.Amount, ct);
+        var netCollections = totalIncome - refunds;
+
+        // GST is recognized once per invoice, pro-rata to collections, cumulatively across periods;
+        // approved credit notes reverse it in the period the note is issued.
+        var invoiceIds = payments.Select(p => p.InvoiceId).Distinct().ToList();
+        var creditedInvoiceIds = await QueryApprovedCreditNotes()
+            .Where(c => c.IssuedAt >= start && c.IssuedAt < end)
+            .Select(c => c.InvoiceId).Distinct().ToListAsync(ct);
+        var scopeIds = invoiceIds.Union(creditedInvoiceIds).ToList();
+        var receiptsToDate = await QueryPayments()
+            .Where(p => p.Status == PaymentStatus.Completed
+                     && scopeIds.Contains(p.InvoiceId) && p.PaidAt < end)
+            .ToListAsync(ct);
+        var creditNotesToDate = await QueryApprovedCreditNotes()
+            .Where(c => scopeIds.Contains(c.InvoiceId) && c.IssuedAt < end)
+            .ToListAsync(ct);
+        var gstCollected = InvoiceGstRecognition.RecognizedInWindow(
+            receiptsToDate, creditNotesToDate, start, end);
         var invoiceCount = payments.Select(p => p.InvoiceId).Distinct().Count();
 
         return Ok(new
         {
             month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             totalIncome,
+            refunds,
+            netCollections,
             gstCollected,
             invoiceCount,
             paymentCount = payments.Count
@@ -323,14 +339,13 @@ public class LedgerController : ControllerBase
 
         var confirmedIncome = payments.Where(p => p.Status == PaymentStatus.Completed).Sum(p => p.Amount);
         var reportedPending = payments.Where(p => p.VerificationStatus == PaymentVerificationStatus.Reported && p.Status != PaymentStatus.Completed).Sum(p => p.Amount);
+        var refunds = await QueryRefunds(start, end).SumAsync(p => -p.Amount, ct);
+        var netCollections = confirmedIncome - refunds;
 
-        var ownedInvoiceIds = QueryInvoices().Select(i => i.Id);
         // Pending/rejected notes have no realized effect; use the approved note's issue period.
-        var creditNotes = await _db.CreditNotes
-            .Where(c => c.TenantId == tenantId
-                     && ownedInvoiceIds.Contains(c.InvoiceId)
-                     && c.Status == CreditNoteStatus.Approved
-                     && c.IssuedAt >= start && c.IssuedAt < end)
+        // Notes adjust GST under rule C, not revenue, so they are informational here.
+        var creditNotes = await QueryApprovedCreditNotes()
+            .Where(c => c.IssuedAt >= start && c.IssuedAt < end)
             .SumAsync(c => c.Amount, ct);
 
         // Expenses (if any)
@@ -350,6 +365,8 @@ public class LedgerController : ControllerBase
         {
             month = monthLabel,
             income = confirmedIncome,
+            refunds,
+            netCollections,
             reportedPendingIncome = reportedPending,
             creditNotesIssued = creditNotes,
             expenses = new
@@ -357,7 +374,7 @@ public class LedgerController : ControllerBase
                 total = totalExpenses,
                 byCategory = expenseByCategory
             },
-            net = confirmedIncome - creditNotes - totalExpenses,
+            net = netCollections - totalExpenses,
             exportFormat = "json"
         });
     }
@@ -382,10 +399,22 @@ public class LedgerController : ControllerBase
             .ToListAsync(ct);
 
         var totalIncome = payments.Sum(p => p.Amount);
-        var gstCollected = payments
-            .GroupBy(p => p.Invoice)
-            .Where(g => g.Key is { Total: > 0 })
-            .Sum(g => g.Key!.GstAmount * Math.Min(1m, g.Sum(p => p.Amount) / g.Key!.Total));
+        var refunds = await QueryRefunds(start, end).SumAsync(p => -p.Amount, ct);
+        var netCollections = totalIncome - refunds;
+        var invoiceIds = payments.Select(p => p.InvoiceId).Distinct().ToList();
+        var creditedInvoiceIds = await QueryApprovedCreditNotes()
+            .Where(c => c.IssuedAt >= start && c.IssuedAt < end)
+            .Select(c => c.InvoiceId).Distinct().ToListAsync(ct);
+        var scopeIds = invoiceIds.Union(creditedInvoiceIds).ToList();
+        var receiptsToDate = await QueryPayments()
+            .Where(p => p.Status == PaymentStatus.Completed
+                     && scopeIds.Contains(p.InvoiceId) && p.PaidAt < end)
+            .ToListAsync(ct);
+        var creditNotesToDate = await QueryApprovedCreditNotes()
+            .Where(c => scopeIds.Contains(c.InvoiceId) && c.IssuedAt < end)
+            .ToListAsync(ct);
+        var gstCollected = InvoiceGstRecognition.RecognizedInWindow(
+            receiptsToDate, creditNotesToDate, start, end);
         var paymentCount = payments.Count;
 
         var expenses = await _db.LedgerExpenses
@@ -404,6 +433,8 @@ public class LedgerController : ControllerBase
             income = new
             {
                 total = totalIncome,
+                refunds,
+                netCollections,
                 gstCollected,
                 paymentCount
             },
@@ -412,7 +443,7 @@ public class LedgerController : ControllerBase
                 total = totalExpenses,
                 byCategory = expenseByCategory
             },
-            net = totalIncome - totalExpenses
+            net = netCollections - totalExpenses
         });
     }
 
@@ -446,6 +477,21 @@ public class LedgerController : ControllerBase
         var ownedInvoiceIds = QueryInvoices().Select(i => i.Id);
         return _db.Payments.AsNoTrackingWithIdentityResolution().Include(p => p.Invoice)
             .Where(p => p.TenantId == tenantId && ownedInvoiceIds.Contains(p.InvoiceId));
+    }
+
+    private IQueryable<Payment> QueryRefunds(DateTime start, DateTime end) => QueryPayments()
+        .Where(p => p.Status == PaymentStatus.Refunded
+                 && p.VerificationStatus == PaymentVerificationStatus.Confirmed
+                 && p.Amount < 0
+                 && p.PaidAt >= start && p.PaidAt < end);
+
+    private IQueryable<CreditNote> QueryApprovedCreditNotes()
+    {
+        var tenantId = TenantId;
+        var ownedInvoiceIds = QueryInvoices().Select(i => i.Id);
+        return _db.CreditNotes.AsNoTracking().Include(c => c.Invoice)
+            .Where(c => c.TenantId == tenantId && ownedInvoiceIds.Contains(c.InvoiceId)
+                     && c.Status == CreditNoteStatus.Approved);
     }
 
     private IQueryable<Payment> QueryCollections(DateTime start, DateTime end) => QueryPayments()

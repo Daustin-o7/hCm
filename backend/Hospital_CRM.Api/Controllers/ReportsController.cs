@@ -48,15 +48,31 @@ public class ReportsController : ControllerBase
         if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
         var tenantId = User.GetTenantId()!.Value;
 
-        // Income from completed payments
+        // Income from completed payments; refunds are reported additively and netted for profit.
         var payments = await QueryPayments(startDt, endDt, clinicId).ToListAsync(ct);
+        var refunds = await QueryRefunds(clinicId)
+            .Where(p => p.PaidAt >= startDt && p.PaidAt < endDt)
+            .SumAsync(p => -p.Amount, ct);
 
         var grossIncome = payments.Sum(p => p.Amount);
-        // GST is per-invoice — group by invoice so partially-paid invoices aren't double-counted
-        var gstLiability = payments
-            .Where(p => p.Invoice != null)
-            .GroupBy(p => new { p.InvoiceId, p.Invoice.GstAmount })
-            .Sum(g => g.Key.GstAmount);
+        var netCollections = grossIncome - refunds;
+
+        // GST is per-invoice and recognized once, pro-rata to collections. Cumulative allocation
+        // stops a later period from reporting tax already recognized; approved credit notes
+        // reverse it in the period the note is issued.
+        var invoiceIds = payments.Select(p => p.InvoiceId).Distinct().ToList();
+        var creditedInvoiceIds = await QueryApprovedCreditNotes(clinicId)
+            .Where(c => c.IssuedAt >= startDt && c.IssuedAt < endDt)
+            .Select(c => c.InvoiceId).Distinct().ToListAsync(ct);
+        var scopeIds = invoiceIds.Union(creditedInvoiceIds).ToList();
+        var receiptsToDate = await QueryCompletedPayments(clinicId)
+            .Where(p => scopeIds.Contains(p.InvoiceId) && p.PaidAt < endDt)
+            .ToListAsync(ct);
+        var creditNotesToDate = await QueryApprovedCreditNotes(clinicId)
+            .Where(c => scopeIds.Contains(c.InvoiceId) && c.IssuedAt < endDt)
+            .ToListAsync(ct);
+        var gstLiability = InvoiceGstRecognition.RecognizedInWindow(
+            receiptsToDate, creditNotesToDate, startDt, endDt);
 
         // Expenses
         var expensesQuery = _db.LedgerExpenses
@@ -69,7 +85,7 @@ public class ReportsController : ControllerBase
             .Select(g => new { category = g.Key.ToString().ToLower(), total = g.Sum(e => e.Amount) })
             .ToList();
 
-        var netProfit = grossIncome - totalExpenses - gstLiability;
+        var netProfit = netCollections - totalExpenses - gstLiability;
 
         // Section 44ADA: 50% deemed profit for medical professionals
         var deemedIncome44ADA = Math.Round(grossIncome * 0.5m, 2);
@@ -79,12 +95,14 @@ public class ReportsController : ControllerBase
         var prevGross = await QueryPayments(prevStartDt, startDt, clinicId).SumAsync(p => p.Amount, ct);
         var grossCollectionsMoMChange = prevGross == 0 ? 0m : Math.Round((grossIncome - prevGross) / prevGross * 100m, 1);
         var expensesPercentage = grossIncome == 0 ? 0m : Math.Round(totalExpenses / grossIncome * 100m, 1);
-        var netProfitMargin = grossIncome == 0 ? 0m : Math.Round(netProfit / grossIncome * 100m, 1);
+        var netProfitMargin = netCollections <= 0 ? 0m : Math.Round(netProfit / netCollections * 100m, 1);
 
         return Ok(new
         {
             month = startDate.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             grossIncome,
+            refunds,
+            netCollections,
             expenses = totalExpenses,
             expensesPercentage,
             gstLiability,
@@ -262,22 +280,39 @@ public class ReportsController : ControllerBase
         }
     }
 
-    private IQueryable<Payment> QueryPayments(DateTime startDt, DateTime endDt, Guid? clinicId)
+    private IQueryable<Payment> QueryOwnedPayments(Guid? clinicId)
     {
         var tenantId = User.GetTenantId()!.Value;
         var query = _db.Payments
             .Include(p => p.Invoice).ThenInclude(inv => inv.Appointment)
-            .Where(p => p.TenantId == tenantId && p.Invoice.TenantId == tenantId
-                     && p.Status == PaymentStatus.Completed
-                     && p.PaidAt >= startDt
-                     && p.PaidAt < endDt);
+            .Where(p => p.TenantId == tenantId && p.Invoice.TenantId == tenantId);
 
         // Walk-ins belong to the tenant's unique clinic; appointment joins must agree too.
-        query = query.Where(p => p.Invoice.AppointmentId == null
+        return query.Where(p => p.Invoice.AppointmentId == null
                               || p.Invoice.Appointment != null && p.Invoice.Appointment.TenantId == tenantId
                                   && p.Invoice.Appointment.ClinicId == clinicId);
+    }
 
-        return query;
+    private IQueryable<Payment> QueryCompletedPayments(Guid? clinicId)
+        => QueryOwnedPayments(clinicId).Where(p => p.Status == PaymentStatus.Completed);
+
+    private IQueryable<Payment> QueryRefunds(Guid? clinicId)
+        => QueryOwnedPayments(clinicId).Where(p => p.Status == PaymentStatus.Refunded
+            && p.VerificationStatus == PaymentVerificationStatus.Confirmed && p.Amount < 0);
+
+    private IQueryable<Payment> QueryPayments(DateTime startDt, DateTime endDt, Guid? clinicId)
+        => QueryCompletedPayments(clinicId).Where(p => p.PaidAt >= startDt && p.PaidAt < endDt);
+
+    private IQueryable<CreditNote> QueryApprovedCreditNotes(Guid? clinicId)
+    {
+        var tenantId = User.GetTenantId()!.Value;
+        return _db.CreditNotes.AsNoTracking()
+            .Include(c => c.Invoice)
+            .Where(c => c.TenantId == tenantId
+                     && c.Invoice.TenantId == tenantId
+                     && (c.Invoice.AppointmentId == null || c.Invoice.Appointment != null
+                         && c.Invoice.Appointment.TenantId == tenantId && c.Invoice.Appointment.ClinicId == clinicId)
+                     && c.Status == CreditNoteStatus.Approved);
     }
 
     private IQueryable<Invoice> QueryInvoices(DateTime startDt, DateTime endDt, Guid? clinicId)
