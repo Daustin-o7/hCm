@@ -2,7 +2,7 @@
 
 **Authorized scope:** On 2026-11-07 the user clarified that Part 3 is the project-completion plan the agent is to create. It is not the Voice Agent roadmap or an expansion beyond the shipped Phase 1/2 requirements.
 
-**Status:** local implementation and current-source verification completed for queue-link D1; integrated acceptance remains open. Full Release now passes **1,209 / 0 failed / 70 skipped of 1,279**. Paid activation remains **NO-GO** pending the deployment runbook's Section 8 sign-offs and applicable clinic/finance/legal gates.
+**Status:** local implementation and current-source verification completed for queue-link D1; integrated acceptance remains open. Full Release now passes **1,209 / 0 failed / 70 skipped of 1,279**. Paid activation remains **NO-GO** pending the deployment runbook's Section 8 sign-offs and applicable clinic/finance/legal gates. The remaining-gate plan and the 2026-11-07 financial-report GST correction are recorded in [SALE-READINESS-REMAINING-GATES-PLAN-2026-11-07.md](SALE-READINESS-REMAINING-GATES-PLAN-2026-11-07.md).
 
 Companions: [Part 1 checklist](SALE-READINESS-TODO-2026-11-06.md), [Part 2 plan](SALE-READINESS-PART-2-PLAN-2026-11-06.md), [deployment runbook](SALE-READINESS-DEPLOYMENT-RUNBOOK-2026-11-07.md).
 

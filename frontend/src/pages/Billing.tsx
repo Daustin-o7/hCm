@@ -218,6 +218,8 @@ interface ExpenseRow {
 interface MonthSummary {
   month: string
   income: number
+  refunds: number
+  netCollections: number
   reportedPendingIncome: number
   creditNotesIssued: number
   expenses: { total: number; byCategory: Array<{ category: string; total: number }> }
@@ -1496,7 +1498,7 @@ export default function Billing() {
                 Clinic Expenses &amp; Month-End Summary
               </h3>
               <p className="text-xs text-[var(--color-text-muted)] font-medium">
-                Every expense is a ledger entry; the month-end figure is income less credit notes and expenses.
+                Cash basis: Net cash after expenses = net collections − expenses, before GST. Refunds reduce revenue; credit notes affect GST, not revenue. Net profit (after GST) is on Reports.
               </p>
             </div>
             <input
@@ -1508,17 +1510,23 @@ export default function Billing() {
           </div>
 
           {monthSummary && (
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
               <div className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
-                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Confirmed income</span>
+                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Confirmed income (gross)</span>
                 <div className="text-base font-bold font-mono text-emerald-600 dark:text-emerald-400 mt-0.5">
                   ₹{Number(monthSummary.income || 0).toLocaleString('en-IN')}
                 </div>
               </div>
               <div className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
-                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Credit notes</span>
+                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Refunds</span>
                 <div className="text-base font-bold font-mono mt-0.5">
-                  ₹{Number(monthSummary.creditNotesIssued || 0).toLocaleString('en-IN')}
+                  ₹{Number(monthSummary.refunds).toLocaleString('en-IN')}
+                </div>
+              </div>
+              <div className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
+                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Net collections</span>
+                <div className="text-base font-bold font-mono mt-0.5">
+                  ₹{Number(monthSummary.netCollections).toLocaleString('en-IN')}
                 </div>
               </div>
               <div className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
@@ -1528,11 +1536,15 @@ export default function Billing() {
                 </div>
               </div>
               <div className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
-                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Net</span>
+                <span className="text-[11px] text-[var(--color-text-muted)] font-bold">Net cash after expenses</span>
                 <div className={`text-base font-bold font-mono mt-0.5 ${monthSummary.net >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
                   ₹{Number(monthSummary.net || 0).toLocaleString('en-IN')}
                 </div>
               </div>
+              <p className="col-span-full text-xs text-[var(--color-text-muted)] font-medium">
+                Approved credit notes (GST-side, informational): ₹{Number(monthSummary.creditNotesIssued || 0).toLocaleString('en-IN')} in note amounts, not GST.
+                {' '}A credit note without a refund does not reduce revenue.
+              </p>
             </div>
           )}
 

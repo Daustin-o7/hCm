@@ -52,6 +52,40 @@ function refund(body: Record<string, unknown>, status: 'processing' | 'refunded'
     isPharmacyReturn: false, stockRestored: false }
 }
 
+test('month-end summary shows cash net after expenses, not GST-adjusted net profit', async ({ page }) => {
+  // Both cases collect 1180, refund 590 and spend 100, so cash net is 590 - 100 = 490.
+  // FinancialSummary.netProfit would be 400 (with a 590 CN reversing 90 GST) or 310 (no CN).
+  const summaries = [
+    { month: '2026-07', income: 1180, refunds: 590, netCollections: 590, creditNotesIssued: 590, net: 490,
+      reportedPendingIncome: 0, expenses: { total: 100, byCategory: [] } },
+    { month: '2026-08', income: 1180, refunds: 590, netCollections: 590, creditNotesIssued: 0, net: 490,
+      reportedPendingIncome: 0, expenses: { total: 100, byCategory: [] } },
+    { month: '2026-09', income: 0, refunds: 590, netCollections: -590, creditNotesIssued: 0, net: -590,
+      reportedPendingIncome: 0, expenses: { total: 0, byCategory: [] } },
+  ]
+  const unexpected = await openBilling(page, (path, request) => {
+    if (request.method() !== 'GET') return undefined
+    if (path === '/ledger/expenses') return { json: [] }
+    if (path === '/ledger/summary') return { json: summaries.find(s => s.month === new URL(request.url()).searchParams.get('month')) ?? summaries[0] }
+    return undefined
+  })
+  await page.getByRole('button', { name: 'Expenses & Month-End', exact: true }).click()
+  await expect(page.getByText(/Cash basis: Net cash after expenses = net collections − expenses, before GST\./)).toBeVisible()
+  await expect(page.getByText('Net', { exact: true })).toHaveCount(0)
+  for (const summary of summaries) {
+    await page.locator('input[type="month"]').fill(summary.month)
+    for (const [label, value] of [
+      ['Confirmed income (gross)', summary.income], ['Refunds', summary.refunds], ['Net collections', summary.netCollections],
+      ['Expenses', summary.expenses.total], ['Net cash after expenses', summary.net],
+    ] as const) {
+      await expect(page.getByText(label, { exact: true }).locator('..')).toContainText(`₹${value.toLocaleString('en-IN')}`)
+    }
+    await expect(page.getByText('Approved credit notes (GST-side, informational):')).toContainText(`₹${summary.creditNotesIssued.toLocaleString('en-IN')} in note amounts, not GST.`)
+    await expect(page.getByText('A credit note without a refund does not reduce revenue.', { exact: false })).toBeVisible()
+  }
+  expect(unexpected).toEqual([])
+})
+
 test('reported payment rejects a different invoice and retries the original key', async ({ page }) => {
   const requests: Record<string, unknown>[] = []
   const unexpected = await openBilling(page, (path, request) => {
