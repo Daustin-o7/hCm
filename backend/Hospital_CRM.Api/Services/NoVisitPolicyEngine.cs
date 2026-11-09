@@ -49,6 +49,7 @@ public static class NoVisitPolicyEngine
 
     /// <summary>
     /// Overload operating directly on domain Appointment entities.
+    /// Evaluates Completed appointments or appointments with Finalized/Amended consultations.
     /// </summary>
     public static bool QualifiesForNoVisitRecall(
         DateOnly referenceToday,
@@ -59,7 +60,8 @@ public static class NoVisitPolicyEngine
         var records = appointments.Select(a => new PatientVisitRecord(
             a.Date,
             a.Status.ToString(),
-            a.Status == AppointmentStatus.Completed
+            a.Status == AppointmentStatus.Completed ||
+            (a.Consultations != null && a.Consultations.Any(c => c.Status is ConsultationStatus.Finalized or ConsultationStatus.Amended))
         ));
         return QualifiesForNoVisitRecall(referenceToday, nMonths, records, out lastQualifyingVisitDate);
     }

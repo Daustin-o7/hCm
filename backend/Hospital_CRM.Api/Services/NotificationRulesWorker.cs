@@ -83,6 +83,7 @@ public sealed class NotificationRulesWorker(
                                 p.Consents.Any(c => c.TenantId == tenantId && c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null) &&
                                 p.Appointments.Any(a => a.TenantId == tenantId && a.ClinicId == clinic.Id))
                             .Include(p => p.Appointments)
+                                .ThenInclude(a => a.Consultations)
                             .ToListAsync(ct);
 
                         foreach (var patient in eligiblePatients)

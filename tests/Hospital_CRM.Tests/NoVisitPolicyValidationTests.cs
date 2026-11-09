@@ -82,6 +82,62 @@ public class NoVisitPolicyValidationTests
         Assert.Equal(new DateOnly(2028, 2, 29), lastDate);
     }
 
+    [Fact]
+    public void AppointmentOverload_RecognizesCompletedAppointments()
+    {
+        var today = new DateOnly(2026, 11, 9);
+        var appointments = new[]
+        {
+            new Hospital_CRM.Domain.Entities.Appointment
+            {
+                Date = new DateOnly(2026, 8, 1),
+                Status = Hospital_CRM.Domain.Enums.AppointmentStatus.Completed
+            }
+        };
+
+        var qualifies = NoVisitPolicyEngine.QualifiesForNoVisitRecall(today, 3, appointments, out var lastDate);
+        Assert.True(qualifies);
+        Assert.Equal(new DateOnly(2026, 8, 1), lastDate);
+    }
+
+    [Fact]
+    public void AppointmentOverload_RecognizesFinalizedConsultations()
+    {
+        var today = new DateOnly(2026, 11, 9);
+        var appt = new Hospital_CRM.Domain.Entities.Appointment
+        {
+            Date = new DateOnly(2026, 8, 1),
+            Status = Hospital_CRM.Domain.Enums.AppointmentStatus.Confirmed,
+            Consultations = new List<Hospital_CRM.Domain.Entities.Consultation>
+            {
+                new() { Status = Hospital_CRM.Domain.Enums.ConsultationStatus.Finalized }
+            }
+        };
+
+        var qualifies = NoVisitPolicyEngine.QualifiesForNoVisitRecall(today, 3, new[] { appt }, out var lastDate);
+        Assert.True(qualifies);
+        Assert.Equal(new DateOnly(2026, 8, 1), lastDate);
+    }
+
+    [Fact]
+    public void AppointmentOverload_IgnoresDraftConsultationsOnIncompleteAppointments()
+    {
+        var today = new DateOnly(2026, 11, 9);
+        var appt = new Hospital_CRM.Domain.Entities.Appointment
+        {
+            Date = new DateOnly(2026, 8, 1),
+            Status = Hospital_CRM.Domain.Enums.AppointmentStatus.Confirmed,
+            Consultations = new List<Hospital_CRM.Domain.Entities.Consultation>
+            {
+                new() { Status = Hospital_CRM.Domain.Enums.ConsultationStatus.Draft }
+            }
+        };
+
+        var qualifies = NoVisitPolicyEngine.QualifiesForNoVisitRecall(today, 3, new[] { appt }, out var lastDate);
+        Assert.False(qualifies);
+        Assert.Null(lastDate);
+    }
+
     [Theory]
     [InlineData("{\"months\": 3}", 3)]
     [InlineData("{\"months\": 1}", 1)]
