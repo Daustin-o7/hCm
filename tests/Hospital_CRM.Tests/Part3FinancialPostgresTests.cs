@@ -424,7 +424,7 @@ public class Part3FinancialPostgresTests(Part3FinancialPostgresFixture fixture, 
     };
 
     private static JsonElement Json(IActionResult result) => JsonSerializer.SerializeToElement(Assert.IsAssignableFrom<ObjectResult>(result).Value);
-    private static ReturnRequest Return(Part3FinancialScenario s) => new("Synthetic return", null, "return-" + s.Invoice, SourcePaymentId: s.Source);
+    private static ReturnRequest Return(Part3FinancialScenario s) => new("Synthetic return", null, "return-" + s.Invoice, SourcePaymentId: s.Source, RefundNonConsiderationReason: "Customer goodwill adjustment");
     private static readonly IConfiguration Config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         { ["Razorpay:KeyId"] = "synthetic-key", ["Razorpay:KeySecret"] = "synthetic-secret" }).Build();
 

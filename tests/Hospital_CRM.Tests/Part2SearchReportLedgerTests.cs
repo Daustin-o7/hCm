@@ -96,6 +96,49 @@ public class Part2SearchReportLedgerTests
         Assert.Equal(56m, daily.GetProperty("net").GetDecimal());
     }
 
+    [Fact]
+    public async Task DailyCollection_ReconcilesTenderRefunds_AndNetCollected()
+    {
+        using var f = new Fixture();
+        var start = new DateTime(2026, 11, 6, 18, 30, 0, DateTimeKind.Utc);
+        var during = start.AddHours(4);
+
+        var p1 = f.Payment(100m, during);
+        p1.Method = PaymentMethod.Cash;
+        p1.Status = PaymentStatus.Completed;
+
+        var p2 = f.Payment(200m, during);
+        p2.Method = PaymentMethod.UPI;
+        p2.Status = PaymentStatus.Completed;
+
+        var r1 = f.Payment(-30m, during);
+        r1.Method = PaymentMethod.Cash;
+        r1.Status = PaymentStatus.Refunded;
+        r1.VerificationStatus = PaymentVerificationStatus.Confirmed;
+
+        await f.Db.SaveChangesAsync();
+
+        var collection = Json(await f.Controller.DailyCollection("2026-11-07", default));
+        Assert.Equal(300m, collection.GetProperty("totalConfirmed").GetDecimal());
+        Assert.Equal(30m, collection.GetProperty("totalRefunded").GetDecimal());
+        Assert.Equal(270m, collection.GetProperty("netCollected").GetDecimal());
+        Assert.Equal(2, collection.GetProperty("confirmedCount").GetInt32());
+        Assert.Equal(1, collection.GetProperty("refundedCount").GetInt32());
+
+        var byMethod = collection.GetProperty("byMethod");
+        var cash = byMethod.EnumerateArray().First(m => m.GetProperty("method").GetString() == "cash");
+        Assert.Equal(100m, cash.GetProperty("amount").GetDecimal());
+        Assert.Equal(30m, cash.GetProperty("refundAmount").GetDecimal());
+        Assert.Equal(70m, cash.GetProperty("netAmount").GetDecimal());
+        Assert.Equal(1, cash.GetProperty("count").GetInt32());
+        Assert.Equal(1, cash.GetProperty("refundCount").GetInt32());
+
+        var upi = byMethod.EnumerateArray().First(m => m.GetProperty("method").GetString() == "upi");
+        Assert.Equal(200m, upi.GetProperty("amount").GetDecimal());
+        Assert.Equal(0m, upi.GetProperty("refundAmount").GetDecimal());
+        Assert.Equal(200m, upi.GetProperty("netAmount").GetDecimal());
+    }
+
     [Theory]
     [InlineData("missing-tenant")]
     [InlineData("empty-tenant")]
@@ -254,6 +297,29 @@ public class Part2SearchReportLedgerTests
         Assert.Equal(-590m, income.GetProperty("netCollections").GetDecimal());
         Assert.Equal(0m, Json(await f.Controller.Daily("2026-07-10", default))
             .GetProperty("income").GetProperty("gstCollected").GetDecimal());
+    }
+
+    [Fact]
+    public async Task Summary_RefundAndCreditNote_NetIsCollectionsMinusExpenses()
+    {
+        using var f = new Fixture();
+        var june = DateTimeOffset.Parse("2026-06-10T10:00:00Z");
+        var july = june.AddMonths(1);
+        var invoice = f.Payment(1180m, june).Invoice;
+        invoice.GstAmount = 180m;
+        f.Note(invoice, 590m, july, CreditNoteStatus.Approved);
+        f.Refund(invoice, 590m, july);
+        f.Expense(100m, new DateOnly(2026, 7, 10));
+        await f.Db.SaveChangesAsync();
+
+        var summary = Json(await f.Controller.Summary("2026-07", default));
+        Assert.Equal(0m, summary.GetProperty("income").GetDecimal());
+        Assert.Equal(590m, summary.GetProperty("refunds").GetDecimal());
+        Assert.Equal(-590m, summary.GetProperty("netCollections").GetDecimal());
+        Assert.Equal(590m, summary.GetProperty("creditNotesIssued").GetDecimal());
+        Assert.Equal(100m, summary.GetProperty("expenses").GetProperty("total").GetDecimal());
+        // Credit notes are informational/GST-side; net is collections minus expenses.
+        Assert.Equal(-690m, summary.GetProperty("net").GetDecimal());
     }
 
     [Theory]

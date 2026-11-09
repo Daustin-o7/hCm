@@ -44,6 +44,11 @@ public class Payment : ITenantScoped
     [MaxLength(500)]
     public string? RefundReason { get; set; }
 
+    public Guid? RefundCreditNoteId { get; set; }
+
+    [MaxLength(500)]
+    public string? RefundNonConsiderationReason { get; set; }
+
     public Guid? PayeeAccountId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -52,4 +57,5 @@ public class Payment : ITenantScoped
     // Navigation
     public virtual Invoice Invoice { get; set; } = null!;
     public virtual PayeeAccount? PayeeAccount { get; set; }
+    public virtual CreditNote? RefundCreditNote { get; set; }
 }

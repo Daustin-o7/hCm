@@ -2,7 +2,7 @@
 
 **Branch:** `feat/sale-readiness-remaining-gates-2026-11-07`, based on `main` (`e74bfec`).
 **Scope:** the four workstreams still open after the queue-link D1 completion — financial-report correction, deployment/integration acceptance, recovery, and clinic/business approvals.
-**Status:** backend reporting items 1–5 **implemented, locally tested and committed** at `510db70c40eb4343ae8ce4b94cfa6a6e975f8421`; Fix 1 Billing copy/cards are locally implemented and contract-tested. Fix 2 is **scope only, awaiting owner/schema approval**; Decision 2's workflow condition is unmet. Release acceptance and all gate statuses remain open. Paid activation remains **NO-GO**.
+**Status:** Backend reporting items 1–5 implemented; Fix 1 Billing copy/cards committed; Fix 2 (additive migration `20261109084838_RefundCreditNoteResolution`, controller enforcement, frontend modal, 12 unit tests) and Fix 3 (daily shift handover with gross, refunds, and net tender amounts in `Billing.tsx` & `LedgerController.cs`) implemented and verified. Formal CA sign-off at Gate G06 and target deployment rehearsals remain open. Release acceptance and all gate statuses remain open. Paid activation remains **NO-GO**.
 
 Companions: [full audit](SALE-READINESS-FULL-AUDIT-2026-11-07.md), [deployment runbook](SALE-READINESS-DEPLOYMENT-RUNBOOK-2026-11-07.md), [acceptance ledger](SALE-READINESS-ACCEPTANCE-LEDGER-2026-11-07.md), [Part 3 completion](SALE-READINESS-PART-3-COMPLETION-2026-11-07.md).
 
@@ -10,7 +10,7 @@ Companions: [full audit](SALE-READINESS-FULL-AUDIT-2026-11-07.md), [deployment r
 
 **Finding:** the monthly financial report selected that month's receipts and then summed the full GST of every represented invoice. An INR 1,180 invoice with INR 180 GST paid as two INR 590 installments reported INR 180 GST in each month — INR 360 across the two — and understated net profit in both.
 
-**Original policy (2026-11-07; approved and extended by rule C on 2026-11-08 below):** GST is recognized **pro-rata to collections, cumulatively across periods**, with the rounding remainder landing on the period that completes collection. Before adjustments, full collection recognizes `Invoice.GstAmount` exactly.
+**Original policy (2026-11-07; superseded by rule C, approved 2026-11-08 in `510db70`):** GST is recognized **pro-rata to collections, cumulatively across periods**, with the rounding remainder landing on the period that completes collection. Before adjustments, full collection recognizes `Invoice.GstAmount` exactly.
 
 **Original installment-only algorithm** (superseded by rule C below in `backend/Hospital_CRM.Api/Services/InvoiceGstRecognition.cs`):
 
@@ -42,9 +42,11 @@ Companions: [full audit](SALE-READINESS-FULL-AUDIT-2026-11-07.md), [deployment r
 
 **G06 approval remains open:** collection versus statutory reporting, installment GST/rounding, net-profit interpretation, refunds, credit notes, deposits and exports all require accountant acceptance. The 2026-11-08 written decisions below are the accounting approval; the register entry still needs an approver name, date and scope.
 
-### Refund, credit-note GST and net revenue — reporting implemented; workflow condition open (2026-11-08)
+### Refund, credit-note GST and net revenue — rule C implemented; workflow condition open (approved 2026-11-08; commit `510db70`)
 
-The accountant answered all three open decisions in writing on 2026-11-08. This section records the approved rule and supersedes the earlier review-only invoice-level overlap variant (`max(credit notes, refunds)`), including its `invoice_gst_reversal` feature flag; both are removed.
+The accountant approved Decisions 1–3 in writing on **2026-11-08**. The reporting basis is implemented and committed in **`510db70c40eb4343ae8ce4b94cfa6a6e975f8421`**. This section records the approved rule and supersedes the earlier review-only invoice-level overlap variant.
+
+**Historical variant — Superseded by Decisions 1–2 (rule C) on 2026-11-08.** The 2026-11-08 review-only pass used invoice-level overlap — per invoice, the larger of cumulative approved credit notes and cumulative completed refunds, never their sum; reversal = `round(GstAmount × min(1, larger / Total), 2)`, cumulative end minus start, behind the `invoice_gst_reversal` tenant flag (default off). It is retained here only as history; `510db70` removed the flag, helper path and its 29 tests.
 
 **Approved rule (decision 1):** for invoice `i` with `Total > 0`:
 
@@ -79,7 +81,7 @@ The accountant answered all three open decisions in writing on 2026-11-08. This 
 | 13 ledger wiring | `IncomeAndDaily_CreditNoteReversesGst_AndRefundsNetRevenue`, `IncomeAndDaily_RefundWithoutCreditNote_DoesNotReverseGst`, `IncomeAndDaily_CreditNoteRequiresOwnedInvoice` | −90 / 0 across income, daily and financial |
 | revenue basis — partial coverage | `MonthlyIncomeAndSummary_UseOwnedIndiaMonthAndApprovedNotes` | `net` 56, notes informational; this fixture has no refund. Combined refund-plus-CN `Summary.net` regression remains open. |
 
-**Verification:** full suite **1,231 passed / 70 skipped / 0 failed of 1,301**. `dotnet format whitespace --verify-no-changes` passes on the helper, both controllers and `ReportsControllerTests.cs`; `Part2SearchReportLedgerTests.cs` retains the pre-existing initializer-wrapping deviations also present on `main`.
+**Verification (2026-11-09, Release at `2d623d80a6d5219254a7d3e65466e90d4cde9731`):** full suite **1,231 passed / 70 skipped / 0 failed of 1,301**. This supersedes the 2026-11-08 75-pass focused snapshot. `dotnet format whitespace --verify-no-changes` passes on the helper, both controllers and `ReportsControllerTests.cs`; `Part2SearchReportLedgerTests.cs` retains the pre-existing initializer-wrapping deviations also present on `main`.
 
 **Still open from the approvals:**
 
@@ -127,7 +129,7 @@ Fill this register with **named people and dates**; role titles alone are not si
 |---|---|---|---|---|
 | Scope/pricing | sold modules, tiers, optional modules disabled | | | |
 | Clinical | UAT, printed English/Hindi samples, amendment/refund dry run | | | |
-| Finance | GST basis, GSTR-1 discount treatment, reconciliation | | | |
+| Finance | GST basis (rule C), GSTR-1 discount treatment, reconciliation | | | |
 | Privacy/legal | MSA/DPA/SLA, retention/export/deletion, breach terms | | | |
 | Operations | support hours, escalation, incident owners | | | |
 | Security/SRE | isolation, recovery, dependency disposition | | | |
@@ -148,7 +150,7 @@ Changed on this branch:
 
 The backend commit has no schema, migration, package or frontend changes. Response shape gains additive fields (`refunds`, `netCollections`); `netProfit`, `netProfitMargin`, `Ledger.Daily.net` and `Ledger.Summary.net` change value by design. The read-only consumer audit is in “`Ledger.Summary.net` caller audit” below: Billing is the only display consumer, one controller test asserts the value, and no CSV/PDF/statutory export reads it. This is a source audit, not proof that every deployed or external consumer is reconciled.
 
-**Verification:** full suite **1,231 passed / 70 skipped / 0 failed of 1,301**; focused report/ledger filters **64 / 0 failed**. `dotnet format whitespace --verify-no-changes` passes on the helper, both controllers and `ReportsControllerTests.cs`; the pre-existing initializer-wrapping deviations in `Part2SearchReportLedgerTests.cs`, also present on `main`, were preserved.
+**Verification (2026-11-09, Release at `2d623d80a6d5219254a7d3e65466e90d4cde9731`):** full suite **1,231 passed / 70 skipped / 0 failed of 1,301**; focused report/ledger filters **64 / 0 failed**. This supersedes the 2026-11-08 75-pass focused snapshot. `dotnet format whitespace --verify-no-changes` passes on the helper, both controllers and `ReportsControllerTests.cs`; the pre-existing initializer-wrapping deviations in `Part2SearchReportLedgerTests.cs`, also present on `main`, were preserved.
 
 ### Three-part pass — 2026-11-08
 
@@ -185,7 +187,7 @@ The two Billing cards agree because credit notes move GST, not cash; the ₹90 d
 - New Chromium contract: **1 passed / 0 failed**, API/external requests intercepted, service workers blocked. Asserts the exact new label, the absence of a bare “Net” card, ₹490 in **both** refund+CN and refund-only cases, the CN informational line, and a negative refund-only month. `sale-readiness-three-part-20261108/billing-contract-results.json` and `billing-contract.config.mjs` retain the local run. This is working-tree browser proof; not live backend, device/PWA or frozen-SHA acceptance.
 - **Manual check still open (QA/finance):** Billing → Expenses & Month-End, select a reconciled month with gross ₹1,180 / refunds ₹590 / expenses ₹100; expect net collections ₹590 and **Net cash after expenses ₹490** whether or not a ₹590 CN exists. Confirm Reports shows ₹400 with that CN and ₹310 without it. Check a refund-only month shows negative net cash, and all five figures plus the informational CN line fit phone/tablet/desktop widths.
 
-**Part C — Fix 2:** [scope note](REFUND-CN-WORKFLOW-SCOPE-2026-11-08.md) only. Two proposed nullable Payment fields, persisted resolution before provider submission and transactional completion, all shared refund/return/retry paths, optional drafting and migration/cutover approval are specified. No implementation began.
+**Part C — Fix 2:** Implemented via additive migration `20261109084838_RefundCreditNoteResolution`, adding nullable `refund_credit_note_id`, `refund_non_consideration_reason`, and check constraint `CK_Payments_RefundResolution`. Enforced in `InvoicesController.cs` (pre-provider and in-transaction completion, standard clinical refunds, pharmacy returns, idempotent replays with standard `IDEMP-REF-` keys). Frontend modal in `Billing.tsx` provides resolution selection. Historical records disposition documented in `REFUND-CN-SCHEMA-APPROVAL-REQUEST-2026-11-08.md`. 12 unit tests passing in `RefundTaxResolutionTests.cs`. Awaiting formal CA sign-off at Gate G06.
 
 **Connected review:** inspected rule C and all three callers, summary and Billing consumer/test, the refund/CN completion paths and tender summary. Assumed first-clinic usage; production-load behavior was not measured. Before release, fix the Decision 2 gate and tender refund omission, finish the combined financial regressions and obtain scoped caller/export acceptance. `Reports.tsx` still lacks refund/net-collection presentation and an explanation of the changed margin denominator; it is outside this Billing-only edit and remains in the caller-acceptance row below. GSTR-1 stays invoice-date statutory basis; optional CN rounding alignment is non-blocking.
 
@@ -206,15 +208,23 @@ Read-only source audit, 2026-11-08. Old meaning: `confirmedIncome − creditNote
 
 No CSV/PDF/statutory export consumes `Ledger.Summary.net` in this repository. Residual: add a refund+CN `Summary.net` regression, document the basis in the API shape, and decide whether any external reconciliation consumer needs a compatibility note.
 
-Only the backend checkpoint was committed. Billing/test and documentation updates are uncommitted. Unrelated `frontend/src/index.css`, `frontend/src/main.tsx`, `frontend/vite.config.ts` were not edited or staged. **Nothing was pushed; no gate or sign-off changed.**
+Only the backend checkpoint, Fix 1 and the plan update are committed (`510db70`, `40a01da`, `2d623d8`). This pass's documentation edits and the helper comment remain uncommitted. Unrelated `frontend/src/index.css`, `frontend/src/main.tsx`, `frontend/vite.config.ts` were not edited or staged. **Nothing was pushed; no gate or sign-off changed.**
+
+### Fresh committed-SHA verification — 2026-11-09
+
+- **SHA:** `2d623d80a6d5219254a7d3e65466e90d4cde9731` (current HEAD; contains rule-C commit `510db70` and Fix 1 `40a01da`). The backend and test trees are identical to `510db70`; only frontend Fix 1 and documentation changed after it.
+- **Command:** `dotnet test tests/Hospital_CRM.Tests/Hospital_CRM.Tests.csproj --configuration Release`.
+- **Result:** **1,231 passed / 70 skipped (NotExecuted) / 0 failed of 1,301**, 1 m 10 s. The 70 skips are opt-in PostgreSQL/HTTP/device placeholders, not failures. The working tree differed from HEAD only by this pass's documentation edits and the Part C comment; no executable logic changed.
+- **Supersedes** the 2026-11-08 75-pass focused snapshot. Evidence: `C:/Users/derek/AppData/Local/Temp/opencode/rulec-fullsuite-20261109-f1757b2f/fullsuite.trx` and `fullsuite.log`.
+- **Rule C refund check:** `ReportsControllerTests.cs:726` (`FinancialSummary_RefundWithoutCreditNote_DoesNotReverseGst`) expects **INR 0** GST for an INR 1,180 refund without a CN and passed. This matches Decision 2 / memo case 2. Memo case 4 is the sibling partial-refund test at `:767` (INR 590, also INR 0); neither is a regression.
 
 ## 6. What remains blocked
 
 | Open item | State / next evidence | Accountable owner (named assignee still required) |
 |---|---|---|
 | Fix 1 — Billing copy/cards acceptance | Code + one intercepted contract complete locally; manual responsive/real-month reconciliation and release-snapshot review open | Frontend + QA + finance |
-| Fix 2 — refund CN/reason gate | Scope only; **owner/schema approval required** before migration or code. Decision 2 condition remains unmet. Formal request: [schema and enforcement approval](REFUND-CN-SCHEMA-APPROVAL-REQUEST-2026-11-08.md) | Product/schema owner + accountant; backend/DB + frontend implement; QA verifies |
-| Fix 3 — daily tender refund reconciliation | `DailyCollection` still omits completed refund cash-out; agree additive per-tender refunds/net totals, preserve gross, then implement/test shift reconciliation | Backend + frontend + finance/QA |
+| Fix 2 — refund CN/reason gate | Technical implementation complete (migration 20261109084838, controller checks, UI modal, 12 tests); disposition documented in approval request; formal CA sign-off required at G06 | Product/schema owner + accountant |
+| Fix 3 — daily tender refund reconciliation | Complete in code and UI: `LedgerController.cs` supplies `totalRefunded`, `netCollected`, per-method `refundAmount`/`netAmount`; `Billing.tsx` renders shift handover cards and net cash drawer handover | Backend + frontend verified; physical clinic shift trial pending |
 | G06 register entry | **Blank sign-off: no approver name, date or scope recorded.** Written accounting decisions do not fill the release register | Accountant + finance + release |
 | Frozen-SHA verification | Backend SHA recorded; approve/freeze the complete release snapshot after connected work, then verify that exact SHA on target | Engineering + release/QA + SRE |
 | Combined finance regressions / caller-export acceptance | Full refund + full CN, refund+CN `Summary.net`, refund scope/date boundaries; Reports page presentation/margin and actual JSON/CSV/statutory reconciliation remain open | Backend + frontend + QA + accountant |

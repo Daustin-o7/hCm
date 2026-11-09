@@ -101,7 +101,8 @@ public sealed class Part3ClinicJourneyTests(ITestOutputHelper output)
             await using (var db = database.AppDb(database.Tenant))
                 Assert.Equal(8, (await db.DrugBatches.SingleAsync()).QuantityRemaining);
             returnRequest = new { reason = "Synthetic full return", idempotencyKey = "SYN-RETURN-" + Guid.NewGuid(),
-                refundReference = "SYNTHETIC-CASH-VOUCHER-55448", sourcePaymentId = salePayment };
+                refundReference = "SYNTHETIC-CASH-VOUCHER-55448", sourcePaymentId = salePayment,
+                refundNonConsiderationReason = "Goodwill pharmacy return" };
             var returned = await host.SendAsync("POST", $"/api/v1/pharmacy/returns/{sale}", UserRole.Pharmacist, returnRequest, 201);
             refund = Id(returned, "refundId");
             Assert.True(returned.GetProperty("stockRestored").GetBoolean());

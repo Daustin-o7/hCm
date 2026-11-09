@@ -1,5 +1,5 @@
-﻿import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { useForm, useFieldArray } from 'react-hook-form'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
+import { useForm, useFieldArray, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import api, { getSessionGeneration } from '../services/api'
@@ -84,10 +84,20 @@ interface TaxProfile {
 interface DailyCollection {
   date: string
   totalConfirmed: number
+  totalRefunded?: number
+  netCollected?: number
   totalReportedPending: number
   confirmedCount: number
+  refundedCount?: number
   reportedCount: number
-  byMethod: Array<{ method: string; amount: number; count: number }>
+  byMethod: Array<{
+    method: string
+    amount: number
+    refundAmount?: number
+    netAmount?: number
+    count: number
+    refundCount?: number
+  }>
 }
 
 interface OutstandingDues {
@@ -128,6 +138,8 @@ interface LedgerPayment {
   refundReason?: string
   refundReference?: string
   refundSourcePaymentId?: string
+  refundCreditNoteId?: string
+  refundNonConsiderationReason?: string
   confirmedByUserId?: string
   secondApprovedByUserId?: string
   isPharmacyReturn?: boolean
@@ -141,6 +153,14 @@ interface InvoiceDetail {
   balanceDue: number
   refundableAmount: number
   payments: LedgerPayment[]
+  creditNotes?: Array<{
+    id: string
+    creditNoteNumber: string
+    amount: number
+    reason: string
+    status?: string
+    issuedAt: string
+  }>
 }
 
 const moneySchema = z.number().finite().nonnegative().max(10000000).multipleOf(0.01)
@@ -158,6 +178,7 @@ const refundOutcomeSchema = z.object({
   status: z.enum(['pending_approval', 'processing', 'refunded', 'failed']),
   verificationStatus: z.enum(['pending', 'confirmed', 'rejected']), idempotencyKey: z.string().min(1).max(128),
   refundReference: z.string().nullable(), refundReason: z.string().min(3), refundSourcePaymentId: z.string().uuid().nullable(),
+  refundCreditNoteId: z.string().uuid().nullable().optional(), refundNonConsiderationReason: z.string().nullable().optional(),
   refundedAt: savedTimeSchema.nullable(), isPharmacyReturn: z.boolean(), stockRestored: z.boolean(),
 }).refine(result => result.status === 'refunded'
   ? result.verificationStatus === 'confirmed' && Boolean(result.refundReference?.trim()) && Boolean(result.refundedAt)
@@ -349,6 +370,9 @@ export default function Billing() {
   const [refundSourceId, setRefundSourceId] = useState('')
   const [refundReference, setRefundReference] = useState('')
   const [refundReason, setRefundReason] = useState('')
+  const [refundResolutionType, setRefundResolutionType] = useState<'non_consideration' | 'credit_note'>('non_consideration')
+  const [refundCreditNoteId, setRefundCreditNoteId] = useState<string>('')
+  const [refundNonConsiderationReason, setRefundNonConsiderationReason] = useState<string>('Goodwill adjustment - statutory GST not reversed')
 
   // Patient advance deposits
   const [depositPatientId, setDepositPatientId] = useState('')
@@ -387,7 +411,7 @@ export default function Billing() {
     setTimeout(() => setToast(null), 4000)
   }
 
-  const { register, handleSubmit, reset, control, watch, setValue, formState: { errors } } = useForm<InvoiceForm>({
+  const { register, handleSubmit, reset, control, setValue, formState: { errors } } = useForm<InvoiceForm>({
     resolver: zodResolver(invoiceSchema),
     defaultValues: {
       patientId: '',
@@ -399,9 +423,9 @@ export default function Billing() {
   })
 
   const { fields, append, remove } = useFieldArray({ control, name: 'lineItems' })
-  const watchedLineItems = watch('lineItems') || []
-  const watchedDiscount = watch('discountAmount') || 0
-  const selectedPatientId = watch('patientId')
+  const watchedLineItems = useWatch({ control, name: 'lineItems' }) || []
+  const watchedDiscount = useWatch({ control, name: 'discountAmount' }) || 0
+  const selectedPatientId = useWatch({ control, name: 'patientId' })
 
   const previewLines = watchedLineItems.map(item => {
     const base = Math.max(0, item.quantity || 0) * Math.round(Math.max(0, item.unitPrice || 0) * 100)
@@ -415,7 +439,6 @@ export default function Billing() {
 
   const fetchData = useCallback(async () => {
     const generation = getSessionGeneration()
-    setLoading(true)
     try {
       const [invRes, taxRes, dailyRes, duesRes, patientRes] = await Promise.allSettled([
         api.get('/invoices'),
@@ -439,7 +462,8 @@ export default function Billing() {
   }, [])
 
   useEffect(() => {
-    fetchData()
+    // oxlint-disable-next-line react/set-state-in-effect
+    void fetchData()
   }, [fetchData])
 
   useEffect(() => {
@@ -794,6 +818,9 @@ export default function Billing() {
     setRefundMethod('upi')
     setRefundReference('')
     setRefundReason('')
+    setRefundResolutionType('non_consideration')
+    setRefundCreditNoteId('')
+    setRefundNonConsiderationReason('Goodwill adjustment - statutory GST not reversed')
     setRefundDetail(null)
     setRefundSourceId('')
     setRefundModalOpen(true)
@@ -816,6 +843,20 @@ export default function Billing() {
       showToast('Reason for the refund is mandatory.', 'err')
       return
     }
+    if (refundResolutionType === 'credit_note' && !refundCreditNoteId) {
+      showToast('Select an approved credit note to link this statutory tax refund.', 'err')
+      return
+    }
+    if (refundResolutionType === 'non_consideration') {
+      if (!refundNonConsiderationReason.trim()) {
+        showToast('Explain why this refund does not adjust statutory GST (non-consideration reason).', 'err')
+        return
+      }
+      if (refundNonConsiderationReason.trim().toLowerCase() === refundReason.trim().toLowerCase()) {
+        showToast('Non-consideration reason must explain tax treatment, not duplicate the refund reason.', 'err')
+        return
+      }
+    }
     const scope = `refund-${refundInvoice.invoiceId}`
     const expected = { invoiceId: refundInvoice.invoiceId, amount: refundAmount, method: refundMethod, sourcePaymentId: refundSourceId,
       idempotencyKey: mutationKeys.current[scope] ??= `IDEMP-REF-${crypto.randomUUID()}` }
@@ -828,6 +869,8 @@ export default function Billing() {
         reason: refundReason.trim(),
         sourcePaymentId: refundSourceId,
         idempotencyKey: expected.idempotencyKey,
+        refundCreditNoteId: refundResolutionType === 'credit_note' ? refundCreditNoteId : undefined,
+        refundNonConsiderationReason: refundResolutionType === 'non_consideration' ? refundNonConsiderationReason.trim() : undefined,
       })
       const result = savedRefund(res.data, expected)
       if (!result) throw new Error('The response does not identify a saved refund. Keep this same refund key and reconcile before retrying.')
@@ -835,6 +878,9 @@ export default function Billing() {
       delete mutationKeys.current[scope]
       setRefundReference('')
       setRefundReason('')
+      setRefundResolutionType('non_consideration')
+      setRefundCreditNoteId('')
+      setRefundNonConsiderationReason('Goodwill adjustment - statutory GST not reversed')
       setRefundAmount(0)
     } catch (err: any) {
       const result = savedRefund(err.response?.data, expected)
@@ -878,9 +924,14 @@ export default function Billing() {
       setActionLoading(`refund-check-${payment.id}`)
       const path = payment.isPharmacyReturn ? `/pharmacy/returns/${refundInvoice.invoiceId}` : `/invoices/${refundInvoice.invoiceId}/refund`
       const res = await api.post<RefundOutcome>(path, {
-        amount: Math.abs(payment.amount), method: payment.method,
+        amount: Math.abs(payment.amount),
+        method: payment.method,
         refundReference: payment.method.toLowerCase() === 'razorpay' ? undefined : payment.refundReference,
-        reason: payment.refundReason, sourcePaymentId: payment.refundSourcePaymentId, idempotencyKey: payment.idempotencyKey,
+        reason: payment.refundReason,
+        sourcePaymentId: payment.refundSourcePaymentId,
+        idempotencyKey: payment.idempotencyKey,
+        refundCreditNoteId: payment.refundCreditNoteId,
+        refundNonConsiderationReason: payment.refundNonConsiderationReason,
       })
       const result = savedRefund(res.data, expected)
       if (!result) throw new Error('Status response does not identify this saved refund. No completed payout is confirmed.')
@@ -1075,14 +1126,14 @@ export default function Billing() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div className="stat-card hover-card">
           <div className="flex items-center justify-between">
-            <span className="stat-label">Confirmed Collections (Today)</span>
+            <span className="stat-label">Net Collections (Today)</span>
             <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
           </div>
           <div className="stat-value text-emerald-600 dark:text-emerald-400 font-mono mt-1">
-            ₹{Number(dailyCollection?.totalConfirmed || 0).toLocaleString('en-IN')}
+            ₹{Number(dailyCollection?.netCollected ?? (dailyCollection?.totalConfirmed || 0)).toLocaleString('en-IN')}
           </div>
           <div className="text-[11px] text-emerald-600/80 dark:text-emerald-400/80 font-medium mt-0.5">
-            {dailyCollection?.confirmedCount || 0} staff-confirmed payment credits
+            Gross ₹{Number(dailyCollection?.totalConfirmed || 0).toLocaleString('en-IN')} ({dailyCollection?.confirmedCount || 0}){Number(dailyCollection?.totalRefunded || 0) > 0 ? ` · Refunds −₹${Number(dailyCollection?.totalRefunded || 0).toLocaleString('en-IN')} (${dailyCollection?.refundedCount || 0})` : ''}
           </div>
         </div>
 
@@ -1323,27 +1374,71 @@ export default function Billing() {
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-sm font-bold text-[var(--color-text)] font-heading">
-                Today's Collections by Payment Method
+                Today's Shift Handover &amp; Tender Reconciliations
               </h3>
-              <p className="text-xs text-[var(--color-text-muted)] font-medium">Reconciled bank credits vs direct cash collection for shift handover.</p>
+              <p className="text-xs text-[var(--color-text-muted)] font-medium">Reconciled bank credits, card settlements and physical cash drawer balances for shift handover.</p>
             </div>
             <span className="text-xs font-mono font-bold text-[var(--color-text)]">{dailyCollection?.date}</span>
+          </div>
+
+          {/* Shift Handover Net Summary */}
+          <div className="p-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-4">
+              <div>
+                <span className="text-[var(--color-text-muted)]">Gross Collections: </span>
+                <span className="font-mono font-bold text-[var(--color-text)]">₹{Number(dailyCollection?.totalConfirmed || 0).toLocaleString('en-IN')}</span>
+                <span className="text-[10px] text-[var(--color-text-muted)] ml-1">({dailyCollection?.confirmedCount || 0})</span>
+              </div>
+              <div className="text-rose-500">
+                <span>Refunds Deducted: </span>
+                <span className="font-mono font-bold">−₹{Number(dailyCollection?.totalRefunded || 0).toLocaleString('en-IN')}</span>
+                <span className="text-[10px] ml-1">({dailyCollection?.refundedCount || 0})</span>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 font-bold">
+              <span className="text-[var(--color-text-muted)]">Net Handover:</span>
+              <span className="text-sm font-mono text-emerald-600 dark:text-emerald-400">₹{Number(dailyCollection?.netCollected ?? (dailyCollection?.totalConfirmed || 0)).toLocaleString('en-IN')}</span>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
             {['cash', 'upi', 'card', 'netbanking'].map(methodKey => {
               const item = dailyCollection?.byMethod.find(m => m.method.toLowerCase() === methodKey)
+              const gross = item?.amount || 0
+              const refund = item?.refundAmount || 0
+              const net = item?.netAmount ?? (gross - refund)
+              const txCount = item?.count || 0
+              const refCount = item?.refundCount || 0
               return (
-                <div key={methodKey} className="p-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
-                  <span className="text-xs uppercase font-bold text-[var(--color-text-muted)] tracking-wider font-mono">
-                    {methodKey.toUpperCase()}
-                  </span>
-                  <div className="text-lg font-bold font-mono text-[var(--color-text)] mt-1">
-                    ₹{(item?.amount || 0).toLocaleString('en-IN')}
+                <div key={methodKey} className="p-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)] space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs uppercase font-bold text-[var(--color-text-muted)] tracking-wider font-mono">
+                      {methodKey.toUpperCase()}
+                    </span>
+                    {methodKey === 'cash' && (
+                      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                        Physical Drawer
+                      </span>
+                    )}
                   </div>
-                  <span className="text-[11px] text-[var(--color-text-muted)] font-medium">
-                    {item?.count || 0} transactions
-                  </span>
+                  <div>
+                    <div className="text-[11px] text-[var(--color-text-muted)] font-medium">Net Handover</div>
+                    <div className="text-lg font-bold font-mono text-[var(--color-text)] mt-0.5">
+                      ₹{net.toLocaleString('en-IN')}
+                    </div>
+                  </div>
+                  <div className="pt-2 border-t border-[var(--color-border)] space-y-0.5 text-[11px] text-[var(--color-text-muted)] font-medium">
+                    <div className="flex justify-between">
+                      <span>Gross:</span>
+                      <span className="font-mono">₹{gross.toLocaleString('en-IN')} ({txCount})</span>
+                    </div>
+                    {refund > 0 && (
+                      <div className="flex justify-between text-rose-500">
+                        <span>Refunds:</span>
+                        <span className="font-mono">−₹{refund.toLocaleString('en-IN')} ({refCount})</span>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )
             })}
@@ -2010,6 +2105,8 @@ export default function Billing() {
                     <span className="text-[var(--color-text-muted)]"> · {p.method} · {p.refundStatus ?? p.status}</span>
                     <p className="text-[var(--color-text-muted)]">{p.refundReason} · Reference: {p.refundReference ?? 'Not confirmed'}</p>
                     {p.refundSourcePaymentId && <p className="font-mono text-[var(--color-text-muted)]">Source receipt: {p.refundSourcePaymentId}</p>}
+                    {p.refundCreditNoteId && <p className="text-[11px] text-emerald-600 dark:text-emerald-400 font-mono">Linked Credit Note: {p.refundCreditNoteId}</p>}
+                    {p.refundNonConsiderationReason && <p className="text-[11px] text-[var(--color-text-muted)]">Tax reason: {p.refundNonConsiderationReason}</p>}
                   </div>
                   {isClinicAdmin && p.refundStatus === 'pending_approval' && p.confirmedByUserId !== user?.id && (
                     <button
@@ -2097,6 +2194,89 @@ export default function Billing() {
                 maxLength={500}
                 required
               />
+            </div>
+
+            <div className="p-3 bg-[var(--color-bg-subtle)] rounded-lg border border-[var(--color-border)] space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-[var(--color-text)]">GST tax resolution</span>
+                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-[var(--color-bg)] text-[var(--color-text-muted)] border border-[var(--color-border)]">Rule C</span>
+              </div>
+              <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+                Under GST, refunds must either reverse tax via an approved credit note or be recorded as non-consideration (commercial goodwill or duplicate payment).
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <label className={`flex items-start gap-2 p-2 rounded border cursor-pointer text-xs ${refundResolutionType === 'non_consideration' ? 'border-[var(--color-primary)] bg-[var(--color-bg)] font-medium ring-1 ring-[var(--color-primary)]' : 'border-[var(--color-border)] bg-[var(--color-bg)]'}`}>
+                  <input
+                    type="radio"
+                    name="refund-resolution-type"
+                    value="non_consideration"
+                    checked={refundResolutionType === 'non_consideration'}
+                    onChange={() => setRefundResolutionType('non_consideration')}
+                    className="mt-0.5"
+                  />
+                  <div>
+                    <div>Non-consideration</div>
+                    <div className="text-[10px] text-[var(--color-text-muted)] font-normal">GST output tax is not reversed</div>
+                  </div>
+                </label>
+                <label className={`flex items-start gap-2 p-2 rounded border cursor-pointer text-xs ${refundResolutionType === 'credit_note' ? 'border-[var(--color-primary)] bg-[var(--color-bg)] font-medium ring-1 ring-[var(--color-primary)]' : 'border-[var(--color-border)] bg-[var(--color-bg)]'}`}>
+                  <input
+                    type="radio"
+                    name="refund-resolution-type"
+                    value="credit_note"
+                    checked={refundResolutionType === 'credit_note'}
+                    onChange={() => setRefundResolutionType('credit_note')}
+                    className="mt-0.5"
+                  />
+                  <div>
+                    <div>Approved credit note</div>
+                    <div className="text-[10px] text-[var(--color-text-muted)] font-normal">Reverses GST liability on invoice</div>
+                  </div>
+                </label>
+              </div>
+
+              {refundResolutionType === 'credit_note' ? (
+                <div className="form-group pt-1">
+                  <label htmlFor="refund-credit-note" className="form-label text-xs">Linked credit note</label>
+                  {refundDetail?.creditNotes && refundDetail.creditNotes.filter(cn => cn.status === 'Approved' || !cn.status).length > 0 ? (
+                    <select
+                      id="refund-credit-note"
+                      value={refundCreditNoteId}
+                      onChange={e => setRefundCreditNoteId(e.target.value)}
+                      className="form-select text-xs"
+                      required
+                    >
+                      <option value="">Select an approved credit note…</option>
+                      {refundDetail.creditNotes
+                        .filter(cn => cn.status === 'Approved' || !cn.status)
+                        .map(cn => (
+                          <option key={cn.id} value={cn.id}>
+                            {cn.creditNoteNumber} · ₹{cn.amount.toLocaleString('en-IN')} ({cn.reason})
+                          </option>
+                        ))}
+                    </select>
+                  ) : (
+                    <div className="text-xs text-amber-700 dark:text-amber-400 p-2 rounded bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800">
+                      No approved credit notes found on this invoice. Issue and approve a credit note first, or select non-consideration.
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="form-group pt-1">
+                  <label htmlFor="refund-non-consideration" className="form-label text-xs">Non-consideration reason</label>
+                  <input
+                    id="refund-non-consideration"
+                    type="text"
+                    value={refundNonConsiderationReason}
+                    onChange={e => setRefundNonConsiderationReason(e.target.value)}
+                    className="form-input text-xs"
+                    maxLength={500}
+                    placeholder="e.g. Goodwill adjustment - statutory GST not reversed"
+                    required
+                  />
+                  <p className="text-[10px] text-[var(--color-text-muted)]">Must explain why statutory tax does not adjust (distinct from refund reason above).</p>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-end gap-3 pt-3 border-t border-[var(--color-border)]">
@@ -2244,7 +2424,17 @@ export default function Billing() {
         {invoicePending && <p role="status" className="my-4 text-sm text-[var(--color-text-secondary)]">
           Invoice queued on this device; saved invoice is not yet confirmed. Details and the retry key are frozen. Retry unchanged here or recover from Offline work on the Dashboard after navigation or reload.
         </p>}
-        <form onSubmit={invoicePending ? e => { e.preventDefault(); void handleCreateInvoice() } : handleSubmit(handleCreateInvoice)} className="space-y-4">
+        <form
+          onSubmit={e => {
+            if (invoicePending) {
+              e.preventDefault()
+              void handleCreateInvoice()
+            } else {
+              void handleSubmit(data => handleCreateInvoice(data))(e)
+            }
+          }}
+          className="space-y-4"
+        >
           <fieldset disabled={invoicePending || actionLoading === 'create-invoice'} className="min-w-0 space-y-4 border-0 p-0">
           <div className="form-group">
             <label htmlFor="invoice-patient" className="form-label">Patient</label>
@@ -2252,7 +2442,11 @@ export default function Billing() {
               id="invoice-patient"
               className="form-select"
               disabled={patients.length === 0}
-              {...register('patientId', { onChange: e => handleSelectPatient(e.target.value) })}
+              {...register('patientId')}
+              onChange={e => {
+                void register('patientId').onChange(e)
+                void handleSelectPatient(e.target.value)
+              }}
             >
               <option value="">{patients.length === 0 ? 'No patients available' : 'Select patient…'}</option>
               {patients.map(p => (

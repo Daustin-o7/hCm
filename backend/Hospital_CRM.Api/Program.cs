@@ -316,6 +316,7 @@ builder.Services.AddCors(options =>
 });
 
 // String enums in JSON both ways (e.g. employmentStatus: "Active") — numbers still bind
+builder.Services.AddExceptionHandler<Hospital_CRM.Api.Middlewares.DatabaseOutageExceptionHandler>();
 builder.Services.AddProblemDetails();
 builder.Services.AddControllers().AddJsonOptions(o =>
     o.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));

@@ -3,8 +3,7 @@
    Stitch "Clinical Precision Glass" · Premium · Responsive
 ───────────────────────────────────────────────────── */
 
-/* Fonts — SIL OFL 1.1 Variable Fonts: Inter (Body/UI), Plus Jakarta Sans (Headings), JetBrains Mono (Telemetry) */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap");
+/* Fonts — Variable Fonts bundled locally via @fontsource-variable */
 @import "@fontsource-variable/inter";
 @import "@fontsource-variable/plus-jakarta-sans";
 
@@ -1502,4 +1501,4 @@ tr:hover .avatar,
 
 .virtual-list [style*="position: absolute"] {
   contain: layout style;
-}
+}

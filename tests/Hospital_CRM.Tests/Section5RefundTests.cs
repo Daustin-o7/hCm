@@ -123,7 +123,7 @@ public class Section5RefundTests
             Amount: 500m,
             Method: PaymentMethod.UPI,
             RefundReference: "UPI-REF-001234",
-            Reason: "Partial cancellation of lab test", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
+            Reason: "Partial cancellation of lab test", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "Cancellation waiver"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);
@@ -165,7 +165,7 @@ public class Section5RefundTests
             Amount: 2500m,
             Method: PaymentMethod.NetBanking,
             RefundReference: "NEFT-REF-998877",
-            Reason: "Surgery cancellation fee refund", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
+            Reason: "Surgery cancellation fee refund", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "Procedure cancellation waiver"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);
@@ -211,7 +211,7 @@ public class Section5RefundTests
             Amount: 2000m,
             Method: PaymentMethod.Cash,
             RefundReference: "CASH-REF-01",
-            Reason: "Refund attempt", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
+            Reason: "Refund attempt", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "Goodwill refund waiver"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);
@@ -244,7 +244,7 @@ public class Section5RefundTests
             Amount: 2000m,
             Method: PaymentMethod.UPI,
             RefundReference: "UPI-DUAL-REF-1",
-            Reason: "Procedure cancellation", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
+            Reason: "Procedure cancellation", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "Procedure cancellation waiver"
         );
         var res1 = await controller1.ProcessRefund(invoice.Id, req, CancellationToken.None);
         var accepted = Assert.IsType<ObjectResult>(res1);
@@ -290,12 +290,12 @@ public class Section5RefundTests
         var controller = CreateController(db, tenantId, admin1.Id);
 
         var first = await controller.ProcessRefund(invoice.Id, new CreateRefundRequest(
-            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-A", Reason: "First request", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"), CancellationToken.None);
+            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-A", Reason: "First request", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "First request non-consideration"), CancellationToken.None);
         Assert.Equal(202, Assert.IsType<ObjectResult>(first).StatusCode);
 
         // Only ₹1,000 is still uncommitted, so a second ₹2,000 request must not be accepted as pending too.
         var second = await controller.ProcessRefund(invoice.Id, new CreateRefundRequest(
-            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-B", Reason: "Second request", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"), CancellationToken.None);
+            Amount: 2000m, Method: PaymentMethod.UPI, RefundReference: "REF-B", Reason: "Second request", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "Second request non-consideration"), CancellationToken.None);
 
         var bad = Assert.IsType<BadRequestObjectResult>(second);
         Assert.Contains("refund_exceeds_paid_balance", bad.Value?.ToString() ?? "");
@@ -322,6 +322,7 @@ public class Section5RefundTests
             ConfirmedByUserId = admin1.Id,
             RefundReference = "REF-1",
             RefundReason = "Pending one",
+            RefundNonConsiderationReason = "Goodwill adjustment for pending one",
             CreatedAt = DateTimeOffset.UtcNow
         };
         var second = new Payment
@@ -336,6 +337,7 @@ public class Section5RefundTests
             ConfirmedByUserId = admin1.Id,
             RefundReference = "REF-2",
             RefundReason = "Pending two",
+            RefundNonConsiderationReason = "Goodwill adjustment for pending two",
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.Payments.AddRange(first, second);
@@ -368,7 +370,7 @@ public class Section5RefundTests
             Amount: 1500m,
             Method: PaymentMethod.Cash,
             RefundReference: "CASH-REF-02",
-            Reason: "Excessive refund", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}"
+            Reason: "Excessive refund", IdempotencyKey: $"IDEMP-REF-{Guid.NewGuid()}", RefundNonConsiderationReason: "Excessive refund waiver"
         );
 
         var res = await controller.ProcessRefund(invoice.Id, req, CancellationToken.None);

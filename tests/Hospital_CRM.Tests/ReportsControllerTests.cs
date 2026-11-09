@@ -767,6 +767,29 @@ public class ReportsControllerTests
         Assert.Equal(-590m, july.GetProperty("netCollections").GetDecimal());
     }
 
+    // Memo case 1 sibling: a full refund plus a full credit note reverses once, not twice.
+    [Fact]
+    public async Task FinancialSummary_FullRefundWithMatchingCreditNote_ReversesOnce()
+    {
+        using var db = CreateInMemoryDb();
+        var clinicId = Guid.NewGuid();
+        var controller = CreateController(db, Guid.NewGuid(), clinicId);
+        var invoice = await SeedInstallmentInvoice(db, clinicId, 1180m, 180m, (1180m, InMonth));
+        AddRefund(db, invoice, 1180m, OutOfMonth);
+        AddCredit(db, invoice, 1180m, OutOfMonth);
+        await db.SaveChangesAsync();
+
+        var june = await Financial(controller, "2026-06");
+        var july = await Financial(controller, "2026-07");
+
+        Assert.Equal(180m, june.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(-180m, july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(0m, june.GetProperty("gstLiability").GetDecimal()
+                        + july.GetProperty("gstLiability").GetDecimal());
+        Assert.Equal(1180m, july.GetProperty("refunds").GetDecimal());
+        Assert.Equal(-1180m, july.GetProperty("netCollections").GetDecimal());
+    }
+
     // Memo case 4: partial refund without a credit note reverses nothing.
     [Fact]
     public async Task FinancialSummary_PartialRefundWithoutCreditNote_DoesNotReverse()

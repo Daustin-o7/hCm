@@ -613,7 +613,7 @@ public class Section4PharmacyAuditFixesTests
         Assert.Equal(0m, paidInvoice.BalanceDue);
 
         var returned = await controller.ProcessReturn(
-            invoiceId, new ReturnRequest("Wrong strength", "Pharmacist", "ret-key-1", "CASH-VOUCHER-1"), CancellationToken.None);
+            invoiceId, new ReturnRequest("Wrong strength", "Pharmacist", "ret-key-1", "CASH-VOUCHER-1", RefundNonConsiderationReason: "Customer goodwill adjustment"), CancellationToken.None);
         Assert.IsType<ObjectResult>(returned);
 
         var invoice = await db.Invoices.FindAsync(invoiceId);

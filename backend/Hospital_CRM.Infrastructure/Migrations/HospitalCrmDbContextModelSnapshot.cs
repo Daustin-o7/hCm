@@ -3062,6 +3062,13 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .HasMaxLength(255)
                         .HasColumnType("character varying(255)");
 
+                    b.Property<Guid?>("RefundCreditNoteId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("RefundNonConsiderationReason")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
                     b.Property<string>("RefundReason")
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)");
@@ -3098,6 +3105,8 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasIndex("PayeeAccountId");
 
+                    b.HasIndex("RefundCreditNoteId");
+
                     b.HasIndex("RefundSourcePaymentId");
 
                     b.HasIndex("TenantId", "CreatedAt");
@@ -3110,7 +3119,10 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .IsUnique()
                         .HasFilter("\"RazorpayPaymentId\" IS NOT NULL AND \"Amount\" > 0 AND \"Method\" = 5");
 
-                    b.ToTable("Payments");
+                    b.ToTable("Payments", t =>
+                        {
+                            t.HasCheckConstraint("CK_Payments_RefundResolution", "NOT (\"RefundCreditNoteId\" IS NOT NULL AND \"RefundNonConsiderationReason\" IS NOT NULL)");
+                        });
                 });
 
             modelBuilder.Entity("Hospital_CRM.Domain.Entities.PaymentBridgeDevice", b =>
@@ -5465,6 +5477,11 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .WithMany("Payments")
                         .HasForeignKey("PayeeAccountId");
 
+                    b.HasOne("Hospital_CRM.Domain.Entities.CreditNote", "RefundCreditNote")
+                        .WithMany()
+                        .HasForeignKey("RefundCreditNoteId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
                     b.HasOne("Hospital_CRM.Domain.Entities.Payment", null)
                         .WithMany()
                         .HasForeignKey("RefundSourcePaymentId")
@@ -5473,6 +5490,8 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.Navigation("Invoice");
 
                     b.Navigation("PayeeAccount");
+
+                    b.Navigation("RefundCreditNote");
                 });
 
             modelBuilder.Entity("Hospital_CRM.Domain.Entities.PrecheckSubmission", b =>

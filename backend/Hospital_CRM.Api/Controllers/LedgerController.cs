@@ -92,26 +92,52 @@ public class LedgerController : ControllerBase
         var end = _timezone.GetStartOfDayUtc(targetDate.AddDays(1), AccountingTimezone);
 
         var payments = await QueryCollections(start, end).ToListAsync(ct);
+        var refunds = await QueryRefunds(start, end).ToListAsync(ct);
 
         var confirmedPayments = payments.Where(p => p.Status == PaymentStatus.Completed).ToList();
         var reportedPayments = payments.Where(p => p.VerificationStatus == PaymentVerificationStatus.Reported && p.Status != PaymentStatus.Completed).ToList();
 
-        var confirmedByMethod = confirmedPayments
+        var refundByMethod = refunds
             .GroupBy(p => p.Method)
-            .Select(g => new
+            .ToDictionary(g => g.Key, g => new { amount = g.Sum(p => -p.Amount), count = g.Count() });
+
+        var allMethods = confirmedPayments.Select(p => p.Method)
+            .Union(refunds.Select(r => r.Method))
+            .Distinct()
+            .OrderBy(m => m.ToString())
+            .ToList();
+
+        var confirmedByMethod = allMethods
+            .Select(m =>
             {
-                method = g.Key.ToString().ToLower(),
-                amount = g.Sum(p => p.Amount),
-                count = g.Count()
+                var methodPayments = confirmedPayments.Where(p => p.Method == m).ToList();
+                var gross = methodPayments.Sum(p => p.Amount);
+                var refundAmount = refundByMethod.TryGetValue(m, out var r) ? r.amount : 0m;
+                var refundCount = refundByMethod.TryGetValue(m, out var rc) ? rc.count : 0;
+                return new
+                {
+                    method = m.ToString().ToLower(),
+                    amount = gross,
+                    refundAmount,
+                    netAmount = gross - refundAmount,
+                    count = methodPayments.Count,
+                    refundCount
+                };
             })
             .ToList();
+
+        var totalConfirmed = confirmedPayments.Sum(p => p.Amount);
+        var totalRefunded = refunds.Sum(p => -p.Amount);
 
         return Ok(new
         {
             date = targetDate.ToString("yyyy-MM-dd"),
-            totalConfirmed = confirmedPayments.Sum(p => p.Amount),
+            totalConfirmed,
+            totalRefunded,
+            netCollected = totalConfirmed - totalRefunded,
             totalReportedPending = reportedPayments.Sum(p => p.Amount),
             confirmedCount = confirmedPayments.Count,
+            refundedCount = refunds.Count,
             reportedCount = reportedPayments.Count,
             byMethod = confirmedByMethod
         });

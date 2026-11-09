@@ -3,7 +3,7 @@ import tailwindcss from '@tailwindcss/vite'
 import { defineConfig } from 'vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
-const proxyTarget = process.env.VITE_PROXY_TARGET || process.env.VITE_API_BASE || 'http://localhost:5000'
+const proxyTarget = process.env.VITE_PROXY_TARGET || process.env.VITE_API_BASE || 'http://127.0.0.1:5000'
 
 export default defineConfig({
   plugins: [

@@ -310,7 +310,7 @@ public class Part1FinancialSafetyTests
         await using var db = MemoryDb();
         var (doctor, _, _, tenant) = Seed(db);
         var invoice = PaidBill(db, tenant, PaymentVerificationStatus.Reported);
-        Assert.IsType<BadRequestObjectResult>(await Invoices(db, doctor.Id, tenant).ProcessRefund(invoice.Id, new(50m, PaymentMethod.Cash, "VOUCHER-1", "Recorded return", $"IDEMP-REF-{Guid.NewGuid()}"), Ct));
+        Assert.IsType<BadRequestObjectResult>(await Invoices(db, doctor.Id, tenant).ProcessRefund(invoice.Id, new(50m, PaymentMethod.Cash, "VOUCHER-1", "Recorded return", $"IDEMP-REF-{Guid.NewGuid()}", null, null, "Non-consideration refund test"), Ct));
         Assert.Single(db.Payments);
         Assert.Equal(100m, invoice.PaidAmount);
         Assert.Empty(db.FinanceLedgerEntries);
@@ -324,7 +324,7 @@ public class Part1FinancialSafetyTests
         var invoice = PaidBill(db, tenant);
         db.Payments.Add(new Payment { Id = Guid.NewGuid(), TenantId = tenant, InvoiceId = invoice.Id, Amount = 100m, Method = PaymentMethod.Razorpay, Status = PaymentStatus.Pending, VerificationStatus = PaymentVerificationStatus.Pending });
         await db.SaveChangesAsync();
-        Assert.Equal(201, Assert.IsType<ObjectResult>(await Invoices(db, doctor.Id, tenant).ProcessRefund(invoice.Id, new(50m, PaymentMethod.Cash, "VOUCHER-1", "Recorded return", $"IDEMP-REF-{Guid.NewGuid()}"), Ct)).StatusCode);
+        Assert.Equal(201, Assert.IsType<ObjectResult>(await Invoices(db, doctor.Id, tenant).ProcessRefund(invoice.Id, new(50m, PaymentMethod.Cash, "VOUCHER-1", "Recorded return", $"IDEMP-REF-{Guid.NewGuid()}", null, null, "Non-consideration refund test"), Ct)).StatusCode);
         Assert.Equal(50m, invoice.PaidAmount);
         Assert.Equal(2, await db.FinanceLedgerEntries.CountAsync());
     }
@@ -352,7 +352,7 @@ public class Part1FinancialSafetyTests
         var invoice = PaidBill(db, tenant);
         (await db.Payments.SingleAsync()).Method = PaymentMethod.Razorpay;
         await db.SaveChangesAsync();
-        var result = await Invoices(db, doctor.Id, tenant).ProcessRefund(invoice.Id, new(50m, PaymentMethod.Razorpay, null, "Requested provider refund", $"IDEMP-REF-{Guid.NewGuid()}"), Ct);
+        var result = await Invoices(db, doctor.Id, tenant).ProcessRefund(invoice.Id, new(50m, PaymentMethod.Razorpay, null, "Requested provider refund", $"IDEMP-REF-{Guid.NewGuid()}", null, null, "Non-consideration refund test"), Ct);
         Assert.True(result is BadRequestObjectResult || result is ObjectResult { StatusCode: 503 });
         Assert.Equal(100m, invoice.PaidAmount);
         Assert.Empty(db.FinanceLedgerEntries);

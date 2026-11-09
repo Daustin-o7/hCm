@@ -170,7 +170,12 @@ public record ReturnRequest(
     [StringLength(100)]
     string? RefundReference = null,
 
-    Guid? SourcePaymentId = null
+    Guid? SourcePaymentId = null,
+
+    Guid? RefundCreditNoteId = null,
+
+    [StringLength(500)]
+    string? RefundNonConsiderationReason = null
 );
 
 public record ReceivePurchaseOrderRequest(

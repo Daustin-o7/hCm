@@ -6,6 +6,8 @@ import { EmptyState } from '../components/ui/EmptyState'
 // ── Type Definitions ──────────────────────────────────────────────────────────
 interface FinancialData {
   grossIncome: number
+  refunds: number
+  netCollections: number
   grossCollectionsMoMChange: number
   expenses: number
   expensesPercentage: number
@@ -283,9 +285,9 @@ export default function Reports() {
         </div>
       )}
 
-      {/* Financial Performance 4 KPI Cards */}
+      {/* Financial Performance 6 KPI Cards (Rule C Cash-Basis Reconciled) */}
       {financialData && (
-        <div className={`grid grid-cols-1 sm:grid-cols-4 gap-4 transition-opacity duration-200 ${loading ? 'opacity-60 pointer-events-none' : ''}`}>
+        <div className={`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4 transition-opacity duration-200 ${loading ? 'opacity-60 pointer-events-none' : ''}`}>
           <div className="stat-card">
             <div className="flex items-center justify-between">
               <span className="stat-label">Gross Collections</span>
@@ -299,6 +301,36 @@ export default function Reports() {
             </div>
             <p className="text-[11px] text-slate-400 mt-1">
               Consultation + Pharmacy sales
+            </p>
+          </div>
+
+          <div className="stat-card">
+            <div className="flex items-center justify-between">
+              <span className="stat-label">Refunds</span>
+              <span className="badge badge-neutral">
+                Completed
+              </span>
+            </div>
+            <div className="stat-value mt-2 font-mono font-heading">
+              ₹{safeGet(financialData, 'refunds', 0).toLocaleString('en-IN')}
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Dual-control & returns
+            </p>
+          </div>
+
+          <div className="stat-card">
+            <div className="flex items-center justify-between">
+              <span className="stat-label">Net Collections</span>
+              <span className="badge badge-info">
+                Cash basis
+              </span>
+            </div>
+            <div className="stat-value mt-2 font-mono font-heading">
+              ₹{safeGet(financialData, 'netCollections', safeGet(financialData, 'grossIncome', 0)).toLocaleString('en-IN')}
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Gross collections − refunds
             </p>
           </div>
 
@@ -319,9 +351,9 @@ export default function Reports() {
 
           <div className="stat-card">
             <div className="flex items-center justify-between">
-              <span className="stat-label">GST Output Tax (18%)</span>
+              <span className="stat-label">GST Output Tax</span>
               <span className="badge badge-info">
-                GSTR-1 Table 4
+                Rule C
               </span>
             </div>
             <div className="stat-value mt-2 font-mono font-heading">
@@ -344,7 +376,7 @@ export default function Reports() {
               ₹{safeGet(financialData, 'netProfit', 0).toLocaleString('en-IN')}
             </div>
             <p className="text-[11px] text-slate-400 mt-1">
-              {safeGet(financialData, 'netProfitMargin', 0)}% net clinic profit
+              {safeGet(financialData, 'netProfitMargin', 0)}% margin on net collections
             </p>
           </div>
         </div>

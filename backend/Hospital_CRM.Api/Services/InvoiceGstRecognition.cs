@@ -9,6 +9,7 @@ namespace Hospital_CRM.Api.Services;
 /// </summary>
 public static class InvoiceGstRecognition
 {
+    // Rule C approved per Decisions 1–3 (2026-11-08); refund alone reverses no GST (Decision 2).
     /// <summary>
     /// GST recognized in [start, end). Receipts must be completed payments only: a refund
     /// without an approved credit note reverses no GST. Credit notes must be approved.

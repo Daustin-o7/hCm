@@ -6,11 +6,11 @@ import { AuthProvider } from './context/AuthContext'
 import { BrandingProvider } from './context/BrandingProvider'
 import { ToastProvider } from './context/ToastContext'
 import './index.css'
-import App from './App.tsx'
+import App from './App'
 
-// The PWA cache is for browsers. In the Capacitor shell the assets are already local
-// and the injected registerSW.js fails with an uncaught "unknown error when fetching sw.js".
-if ('serviceWorker' in navigator && !(window as any).Capacitor?.isNativePlatform?.()) {
+// The PWA cache is for browsers in production. In development Vite does not serve sw.js,
+// and in the Capacitor shell the assets are already local.
+if (import.meta.env.PROD && 'serviceWorker' in navigator && !(window as any).Capacitor?.isNativePlatform?.()) {
   window.addEventListener('load', () => {
     void navigator.serviceWorker.register('/sw.js').catch(() => {
       // A stale or blocked worker must never break the app.

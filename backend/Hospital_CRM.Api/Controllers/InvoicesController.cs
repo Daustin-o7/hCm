@@ -670,7 +670,7 @@ public class InvoicesController : ControllerBase
         ProcessRefundAsync(id, req, false, ct);
 
     internal Task<IActionResult> ProcessPharmacyReturnAsync(Guid id, ReturnRequest req, CancellationToken ct) =>
-        ProcessRefundAsync(id, new(0m, PaymentMethod.Cash, req.RefundReference, req.Reason ?? "", req.IdempotencyKey, req.SourcePaymentId), true, ct);
+        ProcessRefundAsync(id, new(0m, PaymentMethod.Cash, req.RefundReference, req.Reason ?? "", req.IdempotencyKey, req.SourcePaymentId, req.RefundCreditNoteId, req.RefundNonConsiderationReason), true, ct);
 
     private async Task<IActionResult> ProcessRefundAsync(Guid id, CreateRefundRequest req, bool pharmacyReturn, CancellationToken ct)
     {
@@ -683,7 +683,25 @@ public class InvoicesController : ControllerBase
             return BadRequest(new { error = "refund_reason_required" });
         if (req.RefundReference?.Length > 100)
             return BadRequest(new { error = "invalid_refund_reference" });
-        req = req with { Reason = req.Reason.Trim(), RefundReference = string.IsNullOrWhiteSpace(req.RefundReference) ? null : req.RefundReference.Trim() };
+        req = req with { Reason = req.Reason.Trim(), RefundReference = string.IsNullOrWhiteSpace(req.RefundReference) ? null : req.RefundReference.Trim() };
+
+        bool hasCn = req.RefundCreditNoteId.HasValue && req.RefundCreditNoteId.Value != Guid.Empty;
+        bool hasReason = !string.IsNullOrWhiteSpace(req.RefundNonConsiderationReason);
+
+        // Tax resolution requirement for new refunds is enforced inside when existing == null
+
+        if (hasCn && hasReason)
+            return BadRequest(new { error = "conflicting_refund_tax_resolution", message = "Specify either a credit note or a non-consideration reason, not both." });
+
+        if (hasReason)
+        {
+            var trimmedReason = req.RefundNonConsiderationReason!.Trim();
+            if (trimmedReason.Length > 500)
+                return BadRequest(new { error = "invalid_non_consideration_reason", message = "Non-consideration reason cannot exceed 500 characters." });
+            if (string.Equals(trimmedReason, req.Reason.Trim(), StringComparison.OrdinalIgnoreCase))
+                return BadRequest(new { error = "invalid_non_consideration_reason", message = "Non-consideration reason must be an explicit explanation of why tax does not adjust, not a restatement of the operational refund reason." });
+            req = req with { RefundNonConsiderationReason = trimmedReason };
+        }
 
         Guid refundId;
         var created = false;
@@ -721,12 +739,24 @@ public class InvoicesController : ControllerBase
                     if (existing.InvoiceId != id || existing.Amount != -req.Amount || existing.Method != req.Method
                         || existing.IsPharmacyReturn != pharmacyReturn || existing.RefundReason != req.Reason
                         || req.Method != PaymentMethod.Razorpay && existing.RefundReference != req.RefundReference
-                        || req.SourcePaymentId.HasValue && existing.RefundSourcePaymentId != req.SourcePaymentId)
+                        || req.SourcePaymentId.HasValue && existing.RefundSourcePaymentId != req.SourcePaymentId
+                        || (hasCn && existing.RefundCreditNoteId != req.RefundCreditNoteId)
+                        || (hasReason && existing.RefundNonConsiderationReason != req.RefundNonConsiderationReason))
                         return Conflict(new { error = "refund_key_conflict" });
                     refundId = existing.Id;
                 }
                 else
                 {
+                    if (!hasCn && !hasReason)
+                        return BadRequest(new { error = "refund_tax_resolution_required", message = "Select an approved credit note or record why this refund is not a consideration adjustment." });
+                    if (hasCn)
+                    {
+                        var cn = await _db.CreditNotes.AsNoTracking().FirstOrDefaultAsync(c => c.Id == req.RefundCreditNoteId && c.TenantId == tenantId && c.InvoiceId == id, ct);
+                        if (cn == null)
+                            return BadRequest(new { error = "invalid_refund_credit_note", message = "The selected credit note was not found for this invoice." });
+                        if (cn.Status == CreditNoteStatus.Rejected)
+                            return BadRequest(new { error = "credit_note_rejected", message = "A rejected credit note cannot be linked to a refund." });
+                    }
                     if (invoice.Status is InvoiceStatus.Draft or InvoiceStatus.Cancelled or InvoiceStatus.Refunded)
                         return BadRequest(new { error = "invoice_not_refundable" });
                     if (pharmacyReturn && (invoice.Status != InvoiceStatus.Paid || invoice.PaidAmount != invoice.Total))
@@ -766,6 +796,8 @@ public class InvoicesController : ControllerBase
                         RefundReason = req.Reason,
                         RefundReference = req.RefundReference,
                         RefundSourcePaymentId = source?.Id,
+                        RefundCreditNoteId = req.RefundCreditNoteId,
+                        RefundNonConsiderationReason = req.RefundNonConsiderationReason,
                         RazorpayPaymentId = req.Method == PaymentMethod.Razorpay ? source?.RazorpayPaymentId : null,
                         IsPharmacyReturn = pharmacyReturn,
                         IdempotencyKey = req.IdempotencyKey,
@@ -883,6 +915,8 @@ public class InvoicesController : ControllerBase
             secondApprovedByUserId = refund.SecondApprovedByUserId,
             idempotencyKey = refund.IdempotencyKey,
             refundReason = refund.RefundReason,
+            refundCreditNoteId = refund.RefundCreditNoteId,
+            refundNonConsiderationReason = refund.RefundNonConsiderationReason,
             refundSourcePaymentId = refund.RefundSourcePaymentId,
             confirmedByUserId = refund.ConfirmedByUserId,
             isPharmacyReturn = refund.IsPharmacyReturn,
@@ -917,6 +951,20 @@ public class InvoicesController : ControllerBase
             return BadRequest(new { error = "not_a_valid_refund" });
         if (intent.Status != PaymentStatus.Pending || intent.VerificationStatus != PaymentVerificationStatus.Confirmed)
             return RefundResult(intent, await _db.Invoices.AsNoTracking().FirstOrDefaultAsync(i => i.Id == invoiceId && i.TenantId == TenantId, ct));
+
+        if (!intent.RefundCreditNoteId.HasValue && string.IsNullOrWhiteSpace(intent.RefundNonConsiderationReason))
+            return BadRequest(new { error = "refund_tax_resolution_required", message = "Select an approved credit note or record why this refund is not a consideration adjustment." });
+
+        if (intent.RefundCreditNoteId.HasValue && !string.IsNullOrWhiteSpace(intent.RefundNonConsiderationReason))
+            return BadRequest(new { error = "conflicting_refund_tax_resolution", message = "Specify either a credit note or a non-consideration reason, not both." });
+        if (intent.RefundCreditNoteId.HasValue)
+        {
+            var cn = await _db.CreditNotes.AsNoTracking().FirstOrDefaultAsync(c => c.Id == intent.RefundCreditNoteId.Value && c.TenantId == TenantId && c.InvoiceId == invoiceId, ct);
+            if (cn == null)
+                return BadRequest(new { error = "invalid_refund_credit_note", message = "The selected credit note was not found for this invoice." });
+            if (cn.Status != CreditNoteStatus.Approved)
+                return BadRequest(new { error = "credit_note_not_approved", message = "The selected credit note must be approved before completing this refund." });
+        }
 
         RazorpayRefund? providerRefund = null;
         if (intent.Method == PaymentMethod.Razorpay)
@@ -957,8 +1005,15 @@ public class InvoicesController : ControllerBase
             if (refund.Status != PaymentStatus.Pending || refund.VerificationStatus != PaymentVerificationStatus.Confirmed)
                 return RefundResult(refund, invoice);
             if (refund.Amount >= 0 || refund.Method != intent.Method || refund.Amount != intent.Amount
-                || refund.RefundSourcePaymentId != intent.RefundSourcePaymentId || refund.RazorpayPaymentId != intent.RazorpayPaymentId)
+                || refund.RefundSourcePaymentId != intent.RefundSourcePaymentId || refund.RazorpayPaymentId != intent.RazorpayPaymentId
+                || refund.RefundCreditNoteId != intent.RefundCreditNoteId || refund.RefundNonConsiderationReason != intent.RefundNonConsiderationReason)
                 return RefundResult(refund, invoice, httpStatus: 409, error: "refund_intent_changed");
+            if (refund.RefundCreditNoteId.HasValue)
+            {
+                var cn = await _db.CreditNotes.FirstOrDefaultAsync(c => c.Id == refund.RefundCreditNoteId.Value && c.TenantId == TenantId && c.InvoiceId == invoiceId, ct);
+                if (cn == null || cn.Status != CreditNoteStatus.Approved)
+                    return RefundResult(refund, invoice, httpStatus: 400, error: "credit_note_not_approved", message: "The selected credit note must be approved before completing this refund.");
+            }
             if (providerRefund != null)
             {
                 if (refund.RefundReference != null && refund.RefundReference != providerRefund.Id)
@@ -1201,6 +1256,8 @@ public class InvoicesController : ControllerBase
                 refundableAmount = IsCollectedPayment(p) ? Math.Min(refundable, SourceRefundableBalance(invoice.Payments, p, null, true)) : 0m,
                 refundStatus = p.Amount < 0 ? RefundState(p) : null,
                 refundReason = p.RefundReason,
+                refundCreditNoteId = p.RefundCreditNoteId,
+                refundNonConsiderationReason = p.RefundNonConsiderationReason,
                 refundReference = p.RefundReference,
                 refundSourcePaymentId = p.RefundSourcePaymentId,
                 isPharmacyReturn = p.IsPharmacyReturn
@@ -1211,6 +1268,7 @@ public class InvoicesController : ControllerBase
                 creditNoteNumber = cn.CreditNoteNumber,
                 amount = cn.Amount,
                 reason = cn.Reason,
+                status = cn.Status.ToString(),
                 issuedAt = cn.IssuedAt
             }),
             linkedPharmacyInvoiceId = invoice.LinkedPharmacyInvoiceId,
@@ -1897,7 +1955,10 @@ public record CreateRefundRequest(
 
     [Required, MaxLength(128), RegularExpression(@"^IDEMP-REF-[a-zA-Z0-9\-]+$", ErrorMessage = "IdempotencyKey must follow format IDEMP-REF-{UUID}")]
     string? IdempotencyKey = null,
-    Guid? SourcePaymentId = null);
+    Guid? SourcePaymentId = null,
+    Guid? RefundCreditNoteId = null,
+    [MaxLength(500)]
+    string? RefundNonConsiderationReason = null);
 
 public record ApproveRefundRequest(
     [MaxLength(500)]

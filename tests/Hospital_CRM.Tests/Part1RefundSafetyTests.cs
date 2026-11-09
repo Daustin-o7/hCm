@@ -28,7 +28,7 @@ public class Part1RefundSafetyTests
         await using var db = MemoryDb();
         var (invoice, _, tenant, user) = await Paid(db);
         Assert.IsType<BadRequestObjectResult>(await Controller(db, tenant, user).ProcessRefund(invoice.Id,
-            new(amount, PaymentMethod.Cash, "VOUCHER-1", "Synthetic cancellation", Key()), Ct));
+            new(amount, PaymentMethod.Cash, "VOUCHER-1", "Synthetic cancellation", Key(), null, null, "Goodwill adjustment"), Ct));
         Assert.Single(db.Payments);
         Assert.Empty(db.FinanceLedgerEntries);
     }
@@ -39,7 +39,7 @@ public class Part1RefundSafetyTests
         await using var db = MemoryDb();
         var (invoice, _, tenant, user) = await Paid(db);
         var controller = Controller(db, tenant, user);
-        var request = new CreateRefundRequest(40m, PaymentMethod.Cash, "VOUCHER-1", "Synthetic cancellation");
+        var request = new CreateRefundRequest(40m, PaymentMethod.Cash, "VOUCHER-1", "Synthetic cancellation", null, null, null, "Goodwill adjustment");
         Assert.IsType<BadRequestObjectResult>(await controller.ProcessRefund(invoice.Id, request, Ct));
         request = request with { IdempotencyKey = Key() };
         Assert.Equal(201, Assert.IsType<ObjectResult>(await controller.ProcessRefund(invoice.Id, request, Ct)).StatusCode);
@@ -61,7 +61,7 @@ public class Part1RefundSafetyTests
         payment.IdempotencyKey = Key();
         await db.SaveChangesAsync(Ct);
         Assert.IsType<ConflictObjectResult>(await Controller(db, tenant, user).ProcessRefund(invoice.Id,
-            new(50m, PaymentMethod.Cash, "VOUCHER-1", "Synthetic cancellation", payment.IdempotencyKey), Ct));
+            new(50m, PaymentMethod.Cash, "VOUCHER-1", "Synthetic cancellation", payment.IdempotencyKey, null, null, "Goodwill adjustment"), Ct));
         Assert.Equal(100m, invoice.PaidAmount);
         Assert.Single(db.Payments);
     }
@@ -308,7 +308,7 @@ public class Part1RefundSafetyTests
             new TimezoneService(), config, new RazorpayOrderClient(new HttpClient(handler), config));
         Caller(controller, user, tenant, "ClinicAdmin");
         var result = Assert.IsType<BadRequestObjectResult>(await controller
-            .ProcessReturn(invoice.Id, new("Synthetic return", null, IdempotencyKey: Key(), SourcePaymentId: source.Id), Ct));
+            .ProcessReturn(invoice.Id, new("Synthetic return", null, IdempotencyKey: Key(), SourcePaymentId: source.Id, RefundNonConsiderationReason: "Customer goodwill adjustment"), Ct));
         var refund = await db.Payments.AsNoTracking().SingleAsync(p => p.Amount < 0);
         Assert.Equal("return_stock_reconciliation_required", Json(result).GetProperty("error").GetString());
         AssertSavedPending(Json(result), refund, invoice, source.Id);
@@ -335,7 +335,7 @@ public class Part1RefundSafetyTests
     }
 
     private static string Key() => $"IDEMP-REF-{Guid.NewGuid()}";
-    private static CreateRefundRequest ProviderRequest() => new(50m, PaymentMethod.Razorpay, null!, "Synthetic cancellation", Key());
+    private static CreateRefundRequest ProviderRequest() => new(50m, PaymentMethod.Razorpay, null!, "Synthetic cancellation", Key(), null, null, "Goodwill adjustment");
     private static JsonElement Json(ObjectResult result) => JsonSerializer.SerializeToElement(result.Value);
 
     internal static async Task<(Invoice Invoice, Payment Payment, Guid Tenant, Guid User)> Paid(HospitalCrmDbContext db,

@@ -573,6 +573,10 @@ public class HospitalCrmDbContext : DbContext
             e.Property(x => x.CreatedAt).HasDefaultValueSql("now()");
             e.HasOne(x => x.Invoice).WithMany(inv => inv.Payments).HasForeignKey(x => x.InvoiceId);
             e.HasOne<Payment>().WithMany().HasForeignKey(x => x.RefundSourcePaymentId).OnDelete(DeleteBehavior.Restrict);
+            e.HasIndex(x => x.RefundCreditNoteId);
+            e.Property(x => x.RefundNonConsiderationReason).HasMaxLength(500);
+            e.HasOne(x => x.RefundCreditNote).WithMany().HasForeignKey(x => x.RefundCreditNoteId).OnDelete(DeleteBehavior.Restrict);
+            e.ToTable(t => t.HasCheckConstraint("CK_Payments_RefundResolution", "NOT (\"RefundCreditNoteId\" IS NOT NULL AND \"RefundNonConsiderationReason\" IS NOT NULL)"));
         });
 
         modelBuilder.Entity<TenantIntegration>(e =>
