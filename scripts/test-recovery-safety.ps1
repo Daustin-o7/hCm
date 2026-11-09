@@ -1,6 +1,6 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ArtifactsPath)
+param([string]$ArtifactsPath = $(if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }))
 . "$PSScriptRoot/recovery-common.ps1"
 $root = Join-Path (Assert-ProtectedRecoveryPath $ArtifactsPath) ('recovery-selfcheck-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
