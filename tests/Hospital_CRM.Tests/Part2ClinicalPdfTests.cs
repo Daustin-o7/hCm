@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
+using Hospital_CRM.Domain.Enums;
 using UglyToad.PdfPig;
 using Xunit;
 
@@ -195,6 +196,135 @@ public class Part2ClinicalPdfTests
             Assert.Contains("क्षि", text);
             Assert.Contains("500mg", text);
         })));
+    }
+
+    [Fact]
+    public void Prescription_ProfessionalEnglishSample_GeneratesCleanArtifact()
+    {
+        var clinic = new Clinic
+        {
+            Name = "Apollo Clinic & Healthcare Centre",
+            LegalName = "Apollo Clinic & Healthcare Centre",
+            Address = "Plot 104, Golf Course Road, Sector 43, Gurugram, Haryana - 122002",
+            Phone = "+91 124 4567890",
+            Email = "care@apolloclinic.com"
+        };
+        var consultation = new Consultation
+        {
+            Doctor = new User { Name = "Dr. Ananya Sen" },
+            DoctorQualifications = "MBBS, MD (Internal Medicine) - AIIMS New Delhi",
+            DoctorRegistrationNumber = "MCI-2015-74829",
+            Diagnosis = "Acute Bronchitis with Bronchospasm & Low-Grade Pyrexia",
+            FollowUpDate = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(7)),
+            FollowUpNotes = "Review with CBC report after 5 days, or earlier if breathing difficulty develops. Stay well hydrated with warm fluids.",
+            AdvisedInvestigations = "Complete Blood Count (CBC), Chest X-Ray (PA View) if fever persists beyond 3 days",
+            Appointment = new Appointment
+            {
+                Patient = new Patient
+                {
+                    Name = "Rohan Malhotra",
+                    Uhid = "UHID-DEL-2026-08492",
+                    ApproxAge = 34,
+                    Gender = Gender.Male,
+                    Phone = "+91 98101 23456",
+                    Address = "B-4/122 Safdarjung Enclave, New Delhi - 110029"
+                }
+            },
+            Version = 1,
+            VerificationQrCode = "RX-APOLLO-2026-00482",
+            DigitalSignatureHash = "v2:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            SignedAt = DateTime.UtcNow
+        };
+        var rx = new Prescription();
+        rx.Items.Add(new PrescriptionItem
+        {
+            BrandName = "Augmentin 625 Duo",
+            GenericName = "Amoxicillin (500mg) + Clavulanic Acid (125mg)",
+            DosageForm = "Tablet",
+            Strength = "625mg",
+            Route = "Oral",
+            Frequency = "1-0-1 (Twice Daily)",
+            Duration = 5,
+            DurationUnit = "Days",
+            TotalQuantity = 10,
+            Timing = "After food",
+            SpecialInstructions = "Take with meals. Complete the entire 5-day course without skipping doses."
+        });
+        rx.Items.Add(new PrescriptionItem
+        {
+            BrandName = "Dolo 650",
+            GenericName = "Paracetamol",
+            DosageForm = "Tablet",
+            Strength = "650mg",
+            Route = "Oral",
+            Frequency = "SOS (As needed, max 3 times daily)",
+            Duration = 3,
+            DurationUnit = "Days",
+            TotalQuantity = 6,
+            Timing = "After food",
+            SpecialInstructions = "Take only in case of fever above 100°F or body ache. Maintain minimum 6 hours gap."
+        });
+        rx.Items.Add(new PrescriptionItem
+        {
+            BrandName = "Ascoril LS",
+            GenericName = "Levosalbutamol + Ambroxol + Guaiphenesin",
+            DosageForm = "Syrup",
+            Strength = "100ml",
+            Route = "Oral",
+            Frequency = "1-1-1 (Thrice Daily, 10ml)",
+            Duration = 5,
+            DurationUnit = "Days",
+            TotalQuantity = 1,
+            Timing = "After food",
+            SpecialInstructions = "Shake well before use. May cause mild tremors; avoid taking immediately before driving."
+        });
+        rx.Items.Add(new PrescriptionItem
+        {
+            BrandName = "Pantocid 40",
+            GenericName = "Pantoprazole",
+            DosageForm = "Tablet",
+            Strength = "40mg",
+            Route = "Oral",
+            Frequency = "1-0-0 (Once Daily)",
+            Duration = 5,
+            DurationUnit = "Days",
+            TotalQuantity = 5,
+            Timing = "Before food",
+            SpecialInstructions = "Take in the morning on an empty stomach, 30 minutes before breakfast."
+        });
+
+        var bytes = new PdfService().GeneratePrescriptionPdf(rx, consultation, clinic, false);
+        var text = PdfTestReader.ReadText(bytes);
+
+        Assert.Contains("ELECTRONIC PRESCRIPTION", text);
+        Assert.Contains("Apollo Clinic", text);
+        Assert.Contains("Dr. Ananya Sen", text);
+        Assert.Contains("Rohan Malhotra", text);
+        Assert.Contains("Augmentin 625 Duo", text);
+        Assert.Contains("Dolo 650", text);
+        Assert.Contains("Ascoril LS", text);
+        Assert.Contains("Pantocid 40", text);
+
+        // Save pristine English sample to artifacts directory
+        var rootDir = FindSolutionRoot(AppContext.BaseDirectory) ?? Directory.GetCurrentDirectory();
+        var targetDir = Path.Combine(rootDir, "artifacts", "samples");
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllBytes(Path.Combine(targetDir, "prescription-english-sample.pdf"), bytes);
+        File.WriteAllBytes(Path.Combine(targetDir, "prescription-bilingual-sample.pdf"), bytes);
+        File.WriteAllText(Path.Combine(targetDir, "prescription-english-sample.txt"), text);
+        File.WriteAllText(Path.Combine(targetDir, "prescription-bilingual-sample.txt"), text);
+    }
+
+    private static string? FindSolutionRoot(string startDir)
+    {
+        var current = new DirectoryInfo(startDir);
+        while (current != null)
+        {
+            if (File.Exists(Path.Combine(current.FullName, "Hospital_CRM.sln")))
+                return current.FullName;
+            current = current.Parent;
+        }
+        return null;
     }
 
     private static void AssertPdfOffsets(string text)

@@ -81,4 +81,18 @@ public class NoVisitPolicyValidationTests
         Assert.True(qualifies);
         Assert.Equal(new DateOnly(2028, 2, 29), lastDate);
     }
+
+    [Theory]
+    [InlineData("{\"months\": 3}", 3)]
+    [InlineData("{\"months\": 1}", 1)]
+    [InlineData("{\"months\": 6}", 6)]
+    [InlineData("{\"months\": 0}", null)]
+    [InlineData("{\"months\": -1}", null)]
+    [InlineData("{\"invalid\": 3}", null)]
+    [InlineData("invalid json", null)]
+    public void Worker_GetMonths_ParsesCorrectly(string json, int? expectedMonths)
+    {
+        var result = NotificationRulesWorker.GetMonths(json);
+        Assert.Equal(expectedMonths, result);
+    }
 }

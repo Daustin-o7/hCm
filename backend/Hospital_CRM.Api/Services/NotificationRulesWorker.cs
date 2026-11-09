@@ -7,7 +7,10 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Hospital_CRM.Api.Services;
 
-public sealed class NotificationRulesWorker(IServiceScopeFactory scopes, ILogger<NotificationRulesWorker> logger) : BackgroundService
+public sealed class NotificationRulesWorker(
+    IServiceScopeFactory scopes,
+    ILogger<NotificationRulesWorker> logger,
+    IConfiguration? configuration = null) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -57,7 +60,40 @@ public sealed class NotificationRulesWorker(IServiceScopeFactory scopes, ILogger
             {
                 if (rule.RuleType == NotificationRuleType.RemindIfNoVisitNMonths)
                 {
-                    logger.LogWarning("Notification rule {RuleId} disabled: no_visit_policy_pending", rule.Id);
+                    var isPolicyApproved = configuration?.GetValue<bool>("NotificationRules:NoVisitPolicyApproved") ?? false;
+                    if (!isPolicyApproved)
+                    {
+                        logger.LogWarning("Notification rule {RuleId} disabled: no_visit_policy_pending", rule.Id);
+                        continue;
+                    }
+
+                    var months = GetMonths(rule.TimingConfigJson);
+                    if (!months.HasValue || months.Value <= 0)
+                    {
+                        logger.LogWarning("Notification rule {RuleId} disabled: invalid_months", rule.Id);
+                        continue;
+                    }
+
+                    var clinics = await db.Clinics.AsNoTracking().Where(c => c.TenantId == tenantId).ToListAsync(ct);
+                    foreach (var clinic in clinics)
+                    {
+                        var today = timezones.GetClinicToday(clinic.Timezone);
+                        var eligiblePatients = await db.Patients.AsNoTracking()
+                            .Where(p => p.TenantId == tenantId &&
+                                p.Consents.Any(c => c.TenantId == tenantId && c.Purpose == "whatsapp_opt_in" && c.WithdrawnAt == null) &&
+                                p.Appointments.Any(a => a.TenantId == tenantId && a.ClinicId == clinic.Id))
+                            .Include(p => p.Appointments)
+                            .ToListAsync(ct);
+
+                        foreach (var patient in eligiblePatients)
+                        {
+                            var clinicAppointments = patient.Appointments.Where(a => a.ClinicId == clinic.Id);
+                            if (NoVisitPolicyEngine.QualifiesForNoVisitRecall(today, months.Value, clinicAppointments, out _))
+                            {
+                                await notifier.SendRuleAsync(patient.Id, null, rule.Id, ct);
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Booking owns confirmations, ReminderSchedulerService owns the default reminder.
@@ -91,7 +127,19 @@ public sealed class NotificationRulesWorker(IServiceScopeFactory scopes, ILogger
         }
     }
 
-    internal static int? GetDaysBefore(string timingConfig)
+    public static int? GetMonths(string timingConfig)
+    {
+        try
+        {
+            using var config = JsonDocument.Parse(timingConfig);
+            return config.RootElement.ValueKind == JsonValueKind.Object &&
+                config.RootElement.TryGetProperty("months", out var months) && months.ValueKind == JsonValueKind.Number &&
+                months.TryGetInt32(out var value) && value > 0 ? value : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    public static int? GetDaysBefore(string timingConfig)
     {
         try
         {
