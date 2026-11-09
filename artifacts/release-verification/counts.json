@@ -1,0 +1,23 @@
+{
+  "outcomes": {
+    "NotExecuted": 70,
+    "Passed": 1272
+  },
+  "postgresBoundaryResults": 10,
+  "postgresBoundaryExecuted": 0,
+  "total": 1342,
+  "passed": 1272,
+  "skipped": 70,
+  "failed": 0,
+  "durationSeconds": 52,
+  "commit": "8bb64f4",
+  "branch": "feat/sale-readiness-remaining-gates-2026-11-07",
+  "timestamp": "2026-11-09T18:45:00Z",
+  "trxFile": "backend-release-verification.trx",
+  "frontend": {
+    "build": "Passed",
+    "precacheEntries": 46,
+    "lint": "Passed with 0 errors"
+  },
+  "status": "READY_FOR_OPERATIONAL_SIGN_OFFS"
+}

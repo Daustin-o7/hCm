@@ -1,0 +1,51 @@
+{
+  "name": "Hospital_CRM Release Verification Package",
+  "version": "1.0.0-sale-readiness",
+  "generatedAt": "2026-11-09T18:45:00Z",
+  "branch": "feat/sale-readiness-remaining-gates-2026-11-07",
+  "commit": "8bb64f4",
+  "environment": {
+    "framework": ".NET 10.0 (net10.0)",
+    "node": "v22+",
+    "frontend": "React 19 + Vite 8 (PWA)",
+    "database": "PostgreSQL 16+"
+  },
+  "artifacts": [
+    {
+      "name": "backend-release-verification.trx",
+      "path": "backend-release-verification.trx",
+      "length": 2009035,
+      "sha256": "2259D43981D35B96C5F8738F8E1D17F1310B451D40D7D603C6848A86C0DD3A22",
+      "description": "Full release test execution TRX log (1,272 passed, 70 skipped, 0 failed)"
+    },
+    {
+      "name": "counts.json",
+      "path": "counts.json",
+      "length": 550,
+      "sha256": "00A788A617E2A52E3404EF8A8FD92037356DC9B52A4F731E89FFA7D841B8B623",
+      "description": "Machine-readable CI test counts and execution metrics"
+    },
+    {
+      "name": "prescription-english-sample.pdf",
+      "path": "prescription-english-sample.pdf",
+      "length": 585009,
+      "sha256": "26F9797E53A0BD698D2EA9A4C55EEEA50683400802FCEEBB13244AC21A1ECD5D",
+      "description": "Standard clinical prescription sample rendered in 100% English (Apollo/Fortis healthcare standard)"
+    },
+    {
+      "name": "prescription-english-sample.txt",
+      "path": "prescription-english-sample.txt",
+      "length": 2156,
+      "sha256": "4BFD9AFC1EEA79795F45B388CFC41D2DB63F959253343B3704B833CB443A53B3",
+      "description": "Text extraction of the clean English prescription sample"
+    }
+  ],
+  "verificationGatesSummary": {
+    "G01": "Snapshot 8bb64f4 verified: 1,272 passed, 70 skipped, 0 failed. Full test TRX, counts, and manifest packaged.",
+    "G02": "Npgsql database provenance 503 ServiceUnavailable handler verified in DatabaseOutageExceptionHandler.cs.",
+    "G05": "English clinical prescription format standardized (Apollo/Fortis private healthcare standard); Devanagari text-wrap distortions removed.",
+    "G06": "Rule C collection-basis GST & shift handover net reconciliation verified across backend controllers and Billing/Reports UI.",
+    "G07": "No-visit engine wired to background worker with fail-closed gate and consultation recognition (19 automated tests passed).",
+    "G16": "Frontend dependencies reviewed and documented with named signatories in FRONTEND-DEPENDENCY-DISPOSITION-2026-11-09.md."
+  }
+}
