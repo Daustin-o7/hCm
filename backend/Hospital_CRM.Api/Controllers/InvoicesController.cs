@@ -24,14 +24,17 @@ public class InvoicesController : ControllerBase
     private readonly IConfiguration _config;
     private readonly RazorpayOrderClient _razorpay;
     private readonly ITenantContext? _tenantContext;
+    private readonly ITimezoneService _timezone;
+    private const string AccountingTimezone = "Asia/Kolkata";
 
     public InvoicesController(HospitalCrmDbContext db, IConfiguration config, RazorpayOrderClient razorpay,
-        ITenantContext? tenantContext = null)
+        ITenantContext? tenantContext = null, ITimezoneService? timezone = null)
     {
         _db = db;
         _config = config;
         _razorpay = razorpay;
         _tenantContext = tenantContext;
+        _timezone = timezone ?? new TimezoneService();
     }
 
     private Guid TenantId => User.GetTenantId() ?? Guid.Empty;
@@ -1719,21 +1722,44 @@ public class InvoicesController : ControllerBase
 
     [HttpGet("invoices")]
     [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin")]
-    public async Task<IActionResult> ListInvoices([FromQuery] string? status, [FromQuery] Guid? doctorId, CancellationToken ct)
+    public async Task<IActionResult> ListInvoices(
+        [FromQuery] string? status, [FromQuery] Guid? doctorId,
+        [FromQuery] string? from, [FromQuery] string? to,
+        [FromQuery] int page = 1, [FromQuery] int pageSize = 50,
+        CancellationToken ct = default)
     {
         var role = User.GetUserRole();
         var userId = User.GetUserId();
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
 
         if (!userId.HasValue)
             return Unauthorized(new { error = "invalid_token" });
+        if (!tenantId.HasValue || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty)
+            return StatusCode(403, new { error = "invalid_selected_clinic" });
 
+        // Walk-ins carry tenant ownership only; appointment invoices also bind a clinic.
         var query = _db.Invoices
-            .Include(i => i.Appointment).ThenInclude(a => a!.Patient)
-            .AsQueryable();
+            .AsNoTracking()
+            .Where(i => i.TenantId == tenantId.Value
+                && (i.AppointmentId == null || i.Appointment != null
+                    && i.Appointment.TenantId == tenantId && i.Appointment.ClinicId == clinicId));
 
         if (string.Equals(role, "Doctor", StringComparison.OrdinalIgnoreCase))
         {
             query = query.Where(i => i.Appointment != null && i.Appointment.DoctorId == userId.Value);
+        }
+
+        if (DateOnly.TryParse(from, out var fromDate))
+        {
+            var start = _timezone.GetStartOfDayUtc(fromDate, AccountingTimezone);
+            query = query.Where(i => i.CreatedAt >= start);
+        }
+
+        if (DateOnly.TryParse(to, out var toDate))
+        {
+            var end = _timezone.GetStartOfDayUtc(toDate.AddDays(1), AccountingTimezone);
+            query = query.Where(i => i.CreatedAt < end);
         }
 
         if (!string.IsNullOrWhiteSpace(status))
@@ -1751,8 +1777,14 @@ public class InvoicesController : ControllerBase
         if (doctorId.HasValue)
             query = query.Where(i => i.Appointment != null && i.Appointment.DoctorId == doctorId.Value);
 
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 200);
+        var total = await query.CountAsync(ct);
+
         var invoices = await query
             .OrderByDescending(i => i.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
             .Select(i => new
             {
                 invoiceId = i.Id,
@@ -1770,7 +1802,7 @@ public class InvoicesController : ControllerBase
             })
             .ToListAsync(ct);
 
-        return Ok(invoices);
+        return Ok(new { items = invoices, total, page, pageSize });
     }
 
     #region Server-Side PDF & Print Verification

@@ -2,14 +2,16 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../../services/api'
 import { useAuth } from '../../context/AuthContext'
+import { useBranding } from '../../context/BrandingContext'
 import { Skeleton } from '../../components/ui/EmptyState'
+import { CLINICAL_SPECIALTIES } from '../../constants/clinicalSpecialties'
+import { getTodayDateString } from '../../utils/timezone'
 
 interface DepartmentStat {
   id: string
   name: string
   icon: string
   patientCount: number
-  revenue: number
   doctorsCount: number
 }
 
@@ -21,13 +23,29 @@ interface FinancialBreakdown {
   total: number
 }
 
+interface AppointmentRow {
+  appointmentId: string
+  doctorId: string
+  doctorName: string
+}
+
+interface StaffRow {
+  id: string
+  name: string
+  role: string
+  specialty?: string | null
+}
+
 export default function AdminDashboard() {
   const { user } = useAuth()
+  const { branding } = useBranding()
   const navigate = useNavigate()
 
   const [loading, setLoading] = useState(true)
   const [totalPatients, setTotalPatients] = useState(0)
-  const [activeStaffCount, setActiveStaffCount] = useState(0)
+  const [appointments, setAppointments] = useState<AppointmentRow[]>([])
+  const [staff, setStaff] = useState<StaffRow[]>([])
+  const [consentCoverage, setConsentCoverage] = useState({ active: 0, total: 0 })
   const [unsettledInvoicesCount, setUnsettledInvoicesCount] = useState(0)
   const [finances, setFinances] = useState<FinancialBreakdown>({
     cash: 0,
@@ -37,49 +55,46 @@ export default function AdminDashboard() {
     total: 0,
   })
 
-  // Department stats are a local-development demo only: the literal is the true branch of a
-  // condition that compiles to `false` in production, so the bundler drops it entirely.
-  const [departments] = useState<DepartmentStat[]>(import.meta.env.DEV ? [
-    { id: 'general', name: 'General Medicine', icon: '🩺', patientCount: 14, revenue: 11200, doctorsCount: 2 },
-    { id: 'dental', name: 'Dentistry', icon: '🦷', patientCount: 8, revenue: 16800, doctorsCount: 1 },
-    { id: 'physiotherapy', name: 'Physiotherapy & Rehab', icon: '🏃‍♂️', patientCount: 11, revenue: 14300, doctorsCount: 1 },
-    { id: 'pediatrics', name: 'Pediatrics', icon: '👶', patientCount: 9, revenue: 7200, doctorsCount: 1 },
-    { id: 'orthopedics', name: 'Orthopedics', icon: '🦴', patientCount: 6, revenue: 9500, doctorsCount: 1 },
-    { id: 'cardiology', name: 'Cardiology', icon: '❤️', patientCount: 4, revenue: 5700, doctorsCount: 1 },
-  ] : [])
-
-  const fetchAdminData = useCallback(async () => {
-    setLoading(true)
+  const fetchAdminData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
-      const todayISO = new Date().toISOString().split('T')[0]
-      const [, invRes, patRes, staffRes, distRes] = await Promise.allSettled([
+      const todayISO = getTodayDateString(branding.timezone)
+      const [apptRes, summaryRes, staffRes, distRes, ledgerRes, duesRes] = await Promise.allSettled([
         api.get(`/appointments?date=${todayISO}`),
-        api.get('/invoices'),
-        api.get('/patients'),
+        api.get('/patients/summary'),
         api.get('/staff'),
         api.get(`/reports/payment-distribution?month=${todayISO.slice(0, 7)}`),
+        api.get(`/ledger/daily-collection?date=${todayISO}`),
+        api.get('/ledger/outstanding-dues'),
       ])
 
-      if (patRes.status === 'fulfilled' && Array.isArray(patRes.value.data)) {
-        setTotalPatients(patRes.value.data.length)
+      if (apptRes.status === 'fulfilled' && Array.isArray(apptRes.value.data)) {
+        setAppointments(apptRes.value.data)
+      }
+
+      // Counted in SQL — /patients caps its browse list, so its length is not a patient count.
+      if (summaryRes.status === 'fulfilled' && summaryRes.value.data) {
+        const s = summaryRes.value.data
+        setTotalPatients(Number(s.totalPatients) || 0)
+        setConsentCoverage({
+          active: Number(s.patientsWithActiveConsent) || 0,
+          total: Number(s.totalPatients) || 0,
+        })
       }
 
       if (staffRes.status === 'fulfilled' && Array.isArray(staffRes.value.data)) {
-        setActiveStaffCount(staffRes.value.data.length)
+        setStaff(staffRes.value.data)
       }
 
-      if (invRes.status === 'fulfilled' && Array.isArray(invRes.value.data)) {
-        const invs = invRes.value.data
-        const isUnsettled = (i: any) => ['issued', 'unpaid'].includes(i.status?.toLowerCase())
+      // Today's money is the ledger's net collection, not a sum of invoice totals.
+      if (ledgerRes.status === 'fulfilled' && ledgerRes.value.data) {
+        setFinances(prev => ({ ...prev, total: Number(ledgerRes.value.data.netCollected) || 0 }))
+      }
 
-        setUnsettledInvoicesCount(invs.filter(isUnsettled).length)
-        setFinances(prev => ({
-          ...prev,
-          total: invs
-            .filter((i: any) => i.status?.toLowerCase() === 'paid' && (i.createdAt || '').slice(0, 10) === todayISO)
-            .reduce((sum: number, curr: any) => sum + (curr.total || 0), 0),
-          pending: invs.filter(isUnsettled).reduce((sum: number, curr: any) => sum + (curr.total || 0), 0),
-        }))
+      if (duesRes.status === 'fulfilled' && duesRes.value.data) {
+        const dues = duesRes.value.data
+        setFinances(prev => ({ ...prev, pending: Number(dues.totalOutstanding) || 0 }))
+        setUnsettledInvoicesCount(Array.isArray(dues.invoices) ? dues.invoices.length : 0)
       }
 
       // Real payment-channel split for the month (see /reports/payment-distribution).
@@ -92,20 +107,61 @@ export default function AdminDashboard() {
           card: dist.cardAmount ?? 0,
         }))
       }
-    } catch {
-      // Fallback
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branding.timezone])
 
   useEffect(() => {
     fetchAdminData()
   }, [fetchAdminData])
 
+  useEffect(() => {
+    const timer = setInterval(() => fetchAdminData(true), 60_000)
+    return () => clearInterval(timer)
+  }, [fetchAdminData])
+
+  const activeStaffCount = useMemo(
+    () => staff.filter(s => s.role === 'doctor' || s.role === 'receptionist').length,
+    [staff])
+
+  // Department volume is derived from today's real appointments + the doctor's specialty.
+  const departments = useMemo<DepartmentStat[]>(() => {
+    const specialtyById = new Map(
+      staff.filter(s => s.role === 'doctor').map(s => [s.id, s.specialty || 'general']))
+    const groups = new Map<string, { stat: DepartmentStat; doctors: Set<string> }>()
+
+    for (const a of appointments) {
+      const specialty = specialtyById.get(a.doctorId) || 'general'
+      const meta = CLINICAL_SPECIALTIES.find(s => s.id === specialty)
+      const key = meta?.id || 'general'
+      if (!groups.has(key)) {
+        groups.set(key, {
+          stat: {
+            id: key,
+            name: meta?.name || 'General Medicine',
+            icon: meta?.icon || '🩺',
+            patientCount: 0,
+            doctorsCount: 0,
+          },
+          doctors: new Set(),
+        })
+      }
+      const group = groups.get(key)!
+      group.stat.patientCount += 1
+      if (a.doctorId) group.doctors.add(a.doctorId)
+    }
+
+    return [...groups.values()].map(g => ({ ...g.stat, doctorsCount: g.doctors.size }))
+  }, [appointments, staff])
+
   const totalDepartmentFootfall = useMemo(() => {
     return departments.reduce((sum, d) => sum + d.patientCount, 0)
   }, [departments])
+
+  const consentPct = consentCoverage.total > 0
+    ? Math.round((consentCoverage.active / consentCoverage.total) * 100)
+    : 0
 
   const greeting = (() => {
     const h = new Date().getHours()
@@ -256,15 +312,15 @@ export default function AdminDashboard() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className="text-lg">💰</span>
-              <span className="stat-label mt-0 text-emerald-800 dark:text-emerald-200">Gross Realized Today</span>
+              <span className="stat-label mt-0 text-emerald-800 dark:text-emerald-200">Net Collected Today</span>
             </div>
-            <span className="badge badge-success text-[10px]">Real-Time</span>
+            <span className="badge badge-success text-[10px]">Ledger</span>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="stat-value font-heading font-mono text-emerald-600 dark:text-emerald-400">
               {loading ? <Skeleton width="80px" height="28px" /> : `₹${finances.total.toLocaleString('en-IN')}`}
             </span>
-            <span className="text-[11px] text-emerald-700/80 font-medium">OPD + POS + Labs</span>
+            <span className="text-[11px] text-emerald-700/80 font-medium">Net of refunds</span>
           </div>
         </div>
 
@@ -392,8 +448,10 @@ export default function AdminDashboard() {
           </div>
 
           <div className="p-3 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)] flex items-center justify-between text-xs">
-            <span className="font-semibold text-slate-600 dark:text-slate-300">DPDP Statutory Consent Capture:</span>
-            <span className="badge badge-success font-mono font-bold">100% Compliant</span>
+            <span className="font-semibold text-slate-600 dark:text-slate-300">DPDP consent on file:</span>
+            <span className={`badge font-mono font-bold ${consentPct === 100 ? 'badge-success' : 'badge-warning'}`}>
+              {consentCoverage.active}/{consentCoverage.total} patients ({consentPct}%)
+            </span>
           </div>
         </div>
 
@@ -423,15 +481,14 @@ export default function AdminDashboard() {
                   <th>Department / Discipline</th>
                   <th>Active Doctors</th>
                   <th>Patients Today</th>
-                  <th>Revenue (₹)</th>
                   <th className="text-right">Occupancy</th>
                 </tr>
               </thead>
               <tbody>
                 {departments.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="text-center text-[var(--color-text-muted)] py-6">
-                      No department statistics available.
+                    <td colSpan={4} className="text-center text-[var(--color-text-muted)] py-6">
+                      No appointments booked today.
                     </td>
                   </tr>
                 )}
@@ -449,9 +506,6 @@ export default function AdminDashboard() {
                       </td>
                       <td>
                         <span className="font-mono font-bold text-teal-600 dark:text-teal-400">{dept.patientCount} patients</span>
-                      </td>
-                      <td>
-                        <span className="font-mono font-semibold">₹{dept.revenue.toLocaleString('en-IN')}</span>
                       </td>
                       <td className="text-right">
                         <span className="badge badge-brand text-[10px]">

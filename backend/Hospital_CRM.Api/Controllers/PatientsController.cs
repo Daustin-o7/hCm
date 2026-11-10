@@ -235,6 +235,18 @@ public class PatientsController : ControllerBase
         }
     }
 
+    [HttpGet("summary")]
+    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
+    [RequirePermission(Permissions.PatientsRead)]
+    public async Task<IActionResult> Summary(CancellationToken ct)
+    {
+        // Counted in SQL: the list endpoint caps at 1,000 rows, so its length is not a patient count.
+        var totalPatients = await _db.Patients.CountAsync(ct);
+        var patientsWithActiveConsent = await _db.Patients
+            .CountAsync(p => p.Consents.Any(c => c.WithdrawnAt == null), ct);
+        return Ok(new { totalPatients, patientsWithActiveConsent });
+    }
+
     [HttpGet]
     [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
     [RequirePermission(Permissions.PatientsRead)]
@@ -245,6 +257,7 @@ public class PatientsController : ControllerBase
 
         var patients = await _db.Patients.AsNoTracking().Include(p => p.Consents)
             .OrderByDescending(p => p.CreatedAt)
+            // shortcut: browse list stops at 1,000 newest; /patients/search is the unbounded lookup path.
             .Take(1000)
             .ToListAsync(ct);
 

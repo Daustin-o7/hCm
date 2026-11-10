@@ -16,7 +16,7 @@ namespace Hospital_CRM.Api.Controllers;
 
 [ApiController]
 [Route("api/v1/reports")]
-[AuthorizeRoles("ClinicAdmin", "Doctor", "Pharmacist")]
+[AuthorizeRoles("ClinicAdmin")]
 public class ReportsController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
@@ -183,11 +183,23 @@ public class ReportsController : ControllerBase
         if (!clinicId.HasValue) return StatusCode(403, new { error = "invalid_selected_clinic" });
 
         var payments = await QueryPayments(startDt, endDt, clinicId).ToListAsync(ct);
+        var refunds = await QueryRefunds(clinicId)
+            .Where(p => p.PaidAt >= startDt && p.PaidAt < endDt)
+            .ToListAsync(ct);
 
-        var total = payments.Sum(p => p.Amount);
-        var upi = payments.Where(p => p.Method is PaymentMethod.UPI or PaymentMethod.Razorpay).Sum(p => p.Amount);
-        var card = payments.Where(p => p.Method is PaymentMethod.Card or PaymentMethod.NetBanking or PaymentMethod.Wallet).Sum(p => p.Amount);
-        var cash = payments.Where(p => p.Method == PaymentMethod.Cash).Sum(p => p.Amount);
+        // Net each tender bucket by refunds issued in the same month, so the split matches cash flow.
+        decimal Net(params PaymentMethod[] methods)
+        {
+            var collected = payments.Where(p => methods.Contains(p.Method)).Sum(p => p.Amount);
+            var refunded = refunds.Where(p => methods.Contains(p.Method)).Sum(p => -p.Amount);
+            return collected - refunded;
+        }
+
+        var upi = Net(PaymentMethod.UPI, PaymentMethod.Razorpay);
+        var card = Net(PaymentMethod.Card, PaymentMethod.NetBanking, PaymentMethod.Wallet);
+        var cash = Net(PaymentMethod.Cash);
+        var other = Net(PaymentMethod.AdvanceDeposit);
+        var total = upi + card + cash + other;
         static decimal Pct(decimal amount, decimal total) => total == 0 ? 0m : Math.Round(amount / total * 100m, 1);
 
         return Ok(new
@@ -199,8 +211,10 @@ public class ReportsController : ControllerBase
             cardPercentage = Pct(card, total),
             cashAmount = cash,
             cashPercentage = Pct(cash, total),
+            otherAmount = other,
+            otherPercentage = Pct(other, total),
             totalCollected = total,
-            digitalPaymentPercentage = Pct(total - cash, total)
+            digitalPaymentPercentage = Pct(upi + card, total)
         });
     }
 

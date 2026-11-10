@@ -1,52 +1,46 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { isAxiosError } from 'axios'
 import api from '../../services/api'
 import { useAuth } from '../../context/AuthContext'
+import { useBranding } from '../../context/BrandingContext'
 import { Skeleton } from '../../components/ui/EmptyState'
+import { getTodayDateString } from '../../utils/timezone'
 
 interface VitalsPatient {
   id: string
   appointmentId: string
   patientName: string
-  age: number
-  gender: string
+  age?: number
+  gender?: string
   doctorName: string
   tokenNumber: string
+  priority: 'normal' | 'emergency'
   vitalsRecorded: boolean
   bp?: string
   pulse?: number
   spo2?: number
   temp?: number
+  weight?: number
+  allergies?: string
+  observations?: string
 }
 
 interface PrecheckItem {
   id: string
+  appointmentId: string
   patientName: string
+  queueToken: number | null
   submittedAt: string
-  allergies: string
-  conditions: string
-  status: 'pending' | 'reviewed'
+  chiefComplaint: string | null
+  symptomDuration: string | null
+  medications: string | null
+  allergies: string | null
 }
-
-// Development-only demo fallbacks. Kept out of production builds: each literal is the
-// true branch of a condition that compiles to `false`, so the bundler drops it entirely.
-const DEMO_PATIENTS: VitalsPatient[] = import.meta.env.DEV
-  ? [
-      { id: 'pat-1', appointmentId: 'apt-1', patientName: 'Aarav Sharma', age: 38, gender: 'Male', doctorName: 'Dr. Sarah Jenkins', tokenNumber: 'A-01', vitalsRecorded: true, bp: '124/82', pulse: 76, spo2: 99, temp: 98.6 },
-      { id: 'pat-2', appointmentId: 'apt-2', patientName: 'Priya Patel', age: 29, gender: 'Female', doctorName: 'Dr. Rajiv Mehta', tokenNumber: 'A-02', vitalsRecorded: false },
-      { id: 'pat-3', appointmentId: 'apt-3', patientName: 'Rohan Gupta', age: 52, gender: 'Male', doctorName: 'Dr. Aisha Khan', tokenNumber: 'A-03', vitalsRecorded: false },
-    ]
-  : []
-
-const DEMO_PRECHECKS: PrecheckItem[] = import.meta.env.DEV
-  ? [
-      { id: 'pc-1', patientName: 'Aarav Sharma', submittedAt: '10 mins ago', allergies: 'Penicillin (Severe rash)', conditions: 'Hypertension (Grade 1)', status: 'pending' },
-      { id: 'pc-2', patientName: 'Sunita Patel', submittedAt: '25 mins ago', allergies: 'Sulfa Drugs', conditions: 'Type 2 Diabetes', status: 'reviewed' },
-    ]
-  : []
 
 export default function NurseDashboard() {
   const { user } = useAuth()
+  const { branding } = useBranding()
   const navigate = useNavigate()
 
   const [loading, setLoading] = useState(true)
@@ -55,83 +49,107 @@ export default function NurseDashboard() {
   const [recordingPatient, setRecordingPatient] = useState<VitalsPatient | null>(null)
 
   // Vitals Form State
-  const [bp, setBp] = useState('120/80')
-  const [pulse, setPulse] = useState('78')
-  const [spo2, setSpo2] = useState('99')
-  const [temp, setTemp] = useState('98.6')
-  const [weight, setWeight] = useState('68')
+  const [bp, setBp] = useState('')
+  const [pulse, setPulse] = useState('')
+  const [spo2, setSpo2] = useState('')
+  const [temp, setTemp] = useState('')
+  const [weight, setWeight] = useState('')
   const [allergies, setAllergies] = useState('')
   const [observations, setObservations] = useState('')
   const [saveSuccess, setSaveSuccess] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const [savingVitals, setSavingVitals] = useState(false)
 
-  const fetchNurseData = useCallback(async () => {
-    setLoading(true)
+  const fetchNurseData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
-      const todayISO = new Date().toISOString().split('T')[0]
-      const [apptRes] = await Promise.allSettled([
+      const todayISO = getTodayDateString(branding.timezone)
+      const [apptRes, precheckRes] = await Promise.allSettled([
         api.get(`/appointments?date=${todayISO}`),
+        api.get(`/appointments/precheck-submissions?date=${todayISO}`),
       ])
 
       if (apptRes.status === 'fulfilled' && Array.isArray(apptRes.value.data)) {
-        const raw = apptRes.value.data
-        const mapped: VitalsPatient[] = raw.map((a: any, idx: number) => ({
-          id: a.patientId || `pat-${idx}`,
-          appointmentId: a.appointmentId || a.id,
-          patientName: a.patientName || a.patient?.name || 'Patient',
-          age: a.patient?.approxAge || 32,
-          gender: a.patient?.gender || 'Adult',
-          doctorName: a.doctorName || a.doctor?.name || 'Dr. Practitioner',
-          tokenNumber: a.queueToken ? `A-${String(a.queueToken).padStart(2, '0')}` : a.time || '09:00',
-          // Only the dev demo fabricates vitals; production shows them as not yet recorded.
-          vitalsRecorded: import.meta.env.DEV && idx === 0,
-          bp: import.meta.env.DEV && idx === 0 ? '122/82' : undefined,
-          pulse: import.meta.env.DEV && idx === 0 ? 76 : undefined,
-          spo2: import.meta.env.DEV && idx === 0 ? 99 : undefined,
-          temp: import.meta.env.DEV && idx === 0 ? 98.4 : undefined,
+        const mapped: VitalsPatient[] = apptRes.value.data.map((a: any) => ({
+          id: a.patientId || a.appointmentId,
+          appointmentId: a.appointmentId,
+          patientName: a.patientName || 'Patient',
+          age: a.patientAge ?? undefined,
+          gender: a.patientGender || undefined,
+          doctorName: a.doctorName || '—',
+          tokenNumber: a.queueToken ? `A-${String(a.queueToken).padStart(2, '0')}` : a.time || '—',
+          priority: a.priority === 'emergency' ? 'emergency' : 'normal',
+          vitalsRecorded: a.vitalsRecorded === true,
+          bp: a.vitals?.systolicBp != null && a.vitals?.diastolicBp != null
+            ? `${a.vitals.systolicBp}/${a.vitals.diastolicBp}`
+            : undefined,
+          pulse: a.vitals?.heartRate ?? undefined,
+          spo2: a.vitals?.spO2 ?? undefined,
+          temp: a.vitals?.temperature ?? undefined,
+          weight: a.vitals?.weightKg ?? undefined,
+          allergies: a.vitals?.allergies ?? undefined,
+          observations: a.vitals?.bedsideObservations ?? undefined,
         }))
         setPatients(mapped)
       } else {
-        setPatients(DEMO_PATIENTS)
+        setPatients([])
       }
 
-      setPrechecks(DEMO_PRECHECKS)
+      setPrechecks(precheckRes.status === 'fulfilled' && Array.isArray(precheckRes.value.data)
+        ? precheckRes.value.data
+        : [])
     } catch {
-      // Fallback
+      setPatients([])
+      setPrechecks([])
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branding.timezone])
 
   useEffect(() => {
     fetchNurseData()
   }, [fetchNurseData])
 
+  useEffect(() => {
+    const timer = setInterval(() => fetchNurseData(true), 60_000)
+    return () => clearInterval(timer)
+  }, [fetchNurseData])
+
   const pendingVitalsCount = useMemo(() => patients.filter(p => !p.vitalsRecorded).length, [patients])
+  const emergencyCount = useMemo(() => patients.filter(p => p.priority === 'emergency').length, [patients])
 
   const handleOpenVitalsModal = (patient: VitalsPatient) => {
     setRecordingPatient(patient)
-    setBp(patient.bp || '120/80')
-    setPulse(patient.pulse ? String(patient.pulse) : '78')
-    setSpo2(patient.spo2 ? String(patient.spo2) : '99')
-    setTemp(patient.temp ? String(patient.temp) : '98.6')
-    setAllergies('')
-    setObservations('')
+    setBp(patient.bp || '')
+    setPulse(patient.pulse != null ? String(patient.pulse) : '')
+    setSpo2(patient.spo2 != null ? String(patient.spo2) : '')
+    setTemp(patient.temp != null ? String(patient.temp) : '')
+    setWeight(patient.weight != null ? String(patient.weight) : '')
+    setAllergies(patient.allergies || '')
+    setObservations(patient.observations || '')
     setSaveSuccess(false)
+    setSaveError(null)
   }
 
   const handleSaveVitals = async () => {
     if (!recordingPatient) return
+    setSaveError(null)
+
+    const [systolicRaw, diastolicRaw] = bp.split('/').map(part => part.trim())
+    const systolicBp = Number(systolicRaw)
+    const diastolicBp = Number(diastolicRaw)
+    const heartRate = Number(pulse)
+    const tempNum = Number(temp)
+    const spo2Num = Number(spo2)
+    const weightNum = Number(weight)
+
+    if (!systolicRaw || !diastolicRaw ||
+        [systolicBp, diastolicBp, heartRate, tempNum, spo2Num, weightNum].some(n => !Number.isFinite(n) || n <= 0)) {
+      setSaveError('Enter blood pressure as systolic/diastolic (e.g. 120/80) and every field as a positive number.')
+      return
+    }
+
     setSavingVitals(true)
-
-    const bpParts = bp.split('/')
-    const systolicBp = Number(bpParts[0]?.trim()) || 120
-    const diastolicBp = Number(bpParts[1]?.trim()) || 80
-    const heartRate = Number(pulse) || 78
-    const tempNum = Number(temp) || 98.6
-    const spo2Num = Number(spo2) || 99
-    const weightNum = Number(weight) || 68
-
     try {
       await api.post(`/appointments/${recordingPatient.appointmentId}/vitals`, {
         systolicBp,
@@ -143,13 +161,12 @@ export default function NurseDashboard() {
         allergies: allergies.trim() || undefined,
         bedsideObservations: observations.trim() || undefined
       })
-    } catch {
-      // Fallback silently if offline or simulated
-    } finally {
-      setSavingVitals(false)
       setPatients(prev => prev.map(p =>
         p.id === recordingPatient.id
-          ? { ...p, vitalsRecorded: true, bp, pulse: heartRate, spo2: spo2Num, temp: tempNum }
+          ? {
+              ...p, vitalsRecorded: true, bp, pulse: heartRate, spo2: spo2Num, temp: tempNum, weight: weightNum,
+              allergies: allergies.trim() || undefined, observations: observations.trim() || undefined,
+            }
           : p
       ))
       setSaveSuccess(true)
@@ -157,6 +174,19 @@ export default function NurseDashboard() {
         setRecordingPatient(null)
         setSaveSuccess(false)
       }, 1200)
+    } catch (err) {
+      const code = isAxiosError(err) ? (err.response?.data as { error?: string } | undefined)?.error : undefined
+      setSaveError(
+        code === 'appointment_closed'
+          ? 'This appointment is closed. Vitals can no longer be changed.'
+          : code === 'appointment_not_found'
+            ? 'This appointment no longer exists. Refresh the queue.'
+            : isAxiosError(err) && err.response?.status === 403
+              ? 'You do not have permission to record vitals.'
+              : 'Could not save vitals. Check the connection and try again.'
+      )
+    } finally {
+      setSavingVitals(false)
     }
   }
 
@@ -217,20 +247,20 @@ export default function NurseDashboard() {
           </div>
         </div>
 
-        {/* Pre-Checks Submitted */}
+        {/* Today's Queue */}
         <div className="stat-card hover-card">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className="text-lg">📱</span>
-              <span className="stat-label mt-0">Digital Pre-Checks</span>
+              <span className="stat-label mt-0">Today's Queue</span>
             </div>
             <span className="badge badge-info text-[10px]">Intake</span>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="stat-value font-heading font-mono text-teal-600 dark:text-teal-400">
-              {loading ? <Skeleton width="48px" height="28px" /> : prechecks.length}
+              {loading ? <Skeleton width="48px" height="28px" /> : patients.length}
             </span>
-            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Patient self-reports</span>
+            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Patients registered today</span>
           </div>
         </div>
 
@@ -262,16 +292,17 @@ export default function NurseDashboard() {
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="stat-value font-heading font-mono text-rose-600 dark:text-rose-400">
-              0
+              {loading ? <Skeleton width="48px" height="28px" /> : emergencyCount}
             </span>
-            <span className="text-[11px] text-rose-600 font-medium">All vitals stable</span>
+            <span className="text-[11px] text-rose-600 font-medium">
+              {emergencyCount > 0 ? 'Fast-track required' : 'No emergency flags'}
+            </span>
           </div>
         </div>
       </div>
 
-      {/* ── Main Grid: Vitals Entry Board (7 cols) & Pre-Check Reviews (5 cols) ── */}
+      {/* ── Vitals Entry Board (7 cols) & Pre-Check Reviews (5 cols) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Vitals Queue (7 cols) */}
         <div className="lg:col-span-7 card p-5 space-y-4">
           <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-3">
             <div>
@@ -308,7 +339,7 @@ export default function NurseDashboard() {
                     </td>
                     <td>
                       <div className="font-bold text-[var(--color-text)]">{p.patientName}</div>
-                      <div className="text-[10px] text-[var(--color-text-muted)]">{p.age} yrs • {p.gender}</div>
+                      <div className="text-[10px] text-[var(--color-text-muted)]">{p.age ?? '—'} yrs • {p.gender || '—'}</div>
                     </td>
                     <td>
                       <div className="text-xs font-semibold text-[var(--color-text-secondary)]">{p.doctorName}</div>
@@ -318,7 +349,7 @@ export default function NurseDashboard() {
                         <div className="space-y-0.5">
                           <span className="badge badge-success text-[10px]">Recorded</span>
                           <div className="text-[10px] mono text-[var(--color-text-muted)]">
-                            BP: {p.bp} • PR: {p.pulse} • SpO2: {p.spo2}%
+                            BP: {p.bp || '—'} • PR: {p.pulse ?? '—'} • SpO2: {p.spo2 != null ? `${p.spo2}%` : '—'}
                           </div>
                         </div>
                       ) : (
@@ -343,21 +374,26 @@ export default function NurseDashboard() {
           </div>
         </div>
 
-        {/* Digital Pre-Check Queue (5 cols) */}
+        {/* Digital Pre-Check Review (5 cols) — submitted intake forms only */}
         <div className="lg:col-span-5 card p-5 space-y-4">
           <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-3">
             <div>
               <h2 className="text-sm font-bold text-[var(--color-text)] font-heading">
-                Digital Intake Pre-Checks (MOD-23)
+                Submitted Pre-Checks
               </h2>
               <p className="text-[11px] text-[var(--color-text-muted)]">
-                Allergy &amp; chronic condition self-disclosures
+                Patient-reported allergy and medication disclosures
               </p>
             </div>
-            <span className="badge badge-info text-[10px]">Intake Forms</span>
+            <span className="badge badge-info text-[10px]">{prechecks.length} today</span>
           </div>
 
           <div className="space-y-3">
+            {prechecks.length === 0 && (
+              <div className="p-4 rounded-xl border border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-muted)]">
+                No pre-check forms submitted today.
+              </div>
+            )}
             {prechecks.map(pc => (
               <div
                 key={pc.id}
@@ -365,26 +401,28 @@ export default function NurseDashboard() {
               >
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-xs text-[var(--color-text)]">{pc.patientName}</span>
-                  <span className="text-[10.5px] text-[var(--color-text-muted)]">{pc.submittedAt}</span>
-                </div>
-                <div className="text-[11px] text-rose-700 dark:text-rose-300 font-medium">
-                  <strong>Allergies:</strong> {pc.allergies}
-                </div>
-                <div className="text-[11px] text-[var(--color-text-secondary)]">
-                  <strong>Conditions:</strong> {pc.conditions}
-                </div>
-                <div className="pt-1 flex items-center justify-between">
-                  <span className={`badge text-[9.5px] ${pc.status === 'reviewed' ? 'badge-success' : 'badge-warning'}`}>
-                    {pc.status === 'reviewed' ? 'Verified by Nurse' : 'Awaiting Confirmation'}
+                  <span className="text-[10.5px] text-[var(--color-text-muted)]">
+                    {pc.queueToken ? `A-${String(pc.queueToken).padStart(2, '0')}` : '—'}
                   </span>
-                  <button
-                    onClick={() => {
-                      setPrechecks(prev => prev.map(item => item.id === pc.id ? { ...item, status: 'reviewed' } : item))
-                    }}
-                    className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline"
-                  >
-                    Confirm &amp; Push to EMR →
-                  </button>
+                </div>
+                {pc.chiefComplaint && (
+                  <div className="text-[11px] text-[var(--color-text-secondary)]">
+                    <strong>Complaint:</strong> {pc.chiefComplaint}
+                    {pc.symptomDuration ? ` (${pc.symptomDuration})` : ''}
+                  </div>
+                )}
+                {pc.allergies && (
+                  <div className="text-[11px] text-rose-700 dark:text-rose-300 font-medium">
+                    <strong>Allergies:</strong> {pc.allergies}
+                  </div>
+                )}
+                {pc.medications && (
+                  <div className="text-[11px] text-[var(--color-text-secondary)]">
+                    <strong>Medications:</strong> {pc.medications}
+                  </div>
+                )}
+                <div className="text-[10px] text-[var(--color-text-muted)]">
+                  Submitted {new Date(pc.submittedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
                 </div>
               </div>
             ))}
@@ -416,6 +454,11 @@ export default function NurseDashboard() {
               </div>
             ) : (
               <div className="space-y-3">
+                {saveError && (
+                  <div role="alert" className="p-3 rounded-xl bg-rose-50 text-rose-800 text-xs font-semibold">
+                    {saveError}
+                  </div>
+                )}
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="text-[11px] font-bold text-[var(--color-text-muted)]">Blood Pressure (mmHg)</label>

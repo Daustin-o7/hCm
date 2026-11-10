@@ -2,8 +2,9 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../../services/api'
 import { useAuth } from '../../context/AuthContext'
+import { useBranding } from '../../context/BrandingContext'
 import { Skeleton } from '../../components/ui/EmptyState'
-import { CLINICAL_SPECIALTIES } from '../../constants/clinicalSpecialties'
+import { getTodayDateString } from '../../utils/timezone'
 
 interface LobbyPatient {
   id: string
@@ -21,43 +22,22 @@ interface LobbyPatient {
 interface DoctorRoomStatus {
   doctorId: string
   name: string
-  specialtyId: string
   roomNumber: string
   status: 'available' | 'busy' | 'break'
   currentQueue: number
 }
 
-// Development-only demo fallbacks. Kept out of production builds: each literal is the
-// true branch of a condition that compiles to `false`, so the bundler drops it entirely.
-const DEFAULT_DOCTOR_ROOMS: DoctorRoomStatus[] = import.meta.env.DEV
-  ? [
-      { doctorId: 'doc-1', name: 'Dr. Sarah Jenkins', specialtyId: 'dental', roomNumber: 'OPD Room 101', status: 'busy', currentQueue: 4 },
-      { doctorId: 'doc-2', name: 'Dr. Rajiv Mehta', specialtyId: 'physiotherapy', roomNumber: 'Rehab Suite 104', status: 'available', currentQueue: 2 },
-      { doctorId: 'doc-3', name: 'Dr. Aisha Khan', specialtyId: 'general', roomNumber: 'OPD Room 102', status: 'available', currentQueue: 3 },
-      { doctorId: 'doc-4', name: 'Dr. Vikram Seth', specialtyId: 'orthopedics', roomNumber: 'OPD Room 105', status: 'busy', currentQueue: 5 },
-    ]
-  : []
-
-const DEMO_QUEUE: LobbyPatient[] = import.meta.env.DEV
-  ? [
-      { id: 'apt-1', tokenNumber: 'A-01', rawToken: 1, patientName: 'Aarav Sharma', phone: '+91 98765 43210', doctorName: 'Dr. Sarah Jenkins', time: '09:30', status: 'waiting', priority: 'normal' },
-      { id: 'apt-2', tokenNumber: 'A-02', rawToken: 2, patientName: 'Priya Patel', phone: '+91 98111 22334', doctorName: 'Dr. Rajiv Mehta', time: '09:45', status: 'waiting', priority: 'normal' },
-      { id: 'apt-3', tokenNumber: 'A-03', rawToken: 3, patientName: 'Rohan Gupta', phone: '+91 98222 33445', doctorName: 'Dr. Aisha Khan', time: '10:00', status: 'in_consultation', priority: 'normal' },
-      { id: 'apt-4', tokenNumber: 'A-04', rawToken: 4, patientName: 'Ananya Deshmukh', phone: '+91 98333 44556', doctorName: 'Dr. Sarah Jenkins', time: '10:15', status: 'waiting', priority: 'emergency' },
-    ]
-  : []
-
-const DEMO_COLLECTION = import.meta.env.DEV ? 4800 : 0
-
 export default function ReceptionistDashboard() {
   const { user } = useAuth()
+  const { branding } = useBranding()
   const navigate = useNavigate()
 
   const [loading, setLoading] = useState(true)
   const [patients, setPatients] = useState<LobbyPatient[]>([])
-  const [doctorRooms, setDoctorRooms] = useState<DoctorRoomStatus[]>(DEFAULT_DOCTOR_ROOMS)
+  const [doctorRooms, setDoctorRooms] = useState<DoctorRoomStatus[]>([])
   const [counterCollection, setCounterCollection] = useState(0)
   const [callingToken, setCallingToken] = useState<string | null>(null)
+  const [checkInError, setCheckInError] = useState<string | null>(null)
   const [searchMobile, setSearchMobile] = useState('')
 
   // Keyboard accelerators: F2 -> New Patient Registration, F3 -> Appointments / Walkin
@@ -75,18 +55,17 @@ export default function ReceptionistDashboard() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [navigate])
 
-  const fetchDashboardData = useCallback(async () => {
-    setLoading(true)
+  const fetchDashboardData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
-      const todayISO = new Date().toISOString().split('T')[0]
-      const [apptRes, invRes] = await Promise.allSettled([
+      const todayISO = getTodayDateString(branding.timezone)
+      const [apptRes, ledgerRes] = await Promise.allSettled([
         api.get(`/appointments?date=${todayISO}`),
-        api.get('/invoices'),
+        api.get(`/ledger/daily-collection?date=${todayISO}`),
       ])
 
       if (apptRes.status === 'fulfilled' && Array.isArray(apptRes.value.data)) {
-        const raw = apptRes.value.data
-        const mapped: LobbyPatient[] = raw.map((a: any) => {
+        const mapped: LobbyPatient[] = apptRes.value.data.map((a: any) => {
           const s = (a.status || 'scheduled').toLowerCase()
           let status: LobbyPatient['status'] = 'scheduled'
           if (s === 'checked_in' || s === 'checkedin' || s === 'waiting') status = 'waiting'
@@ -98,49 +77,57 @@ export default function ReceptionistDashboard() {
             patientId: a.patientId,
             tokenNumber: a.queueToken ? `A-${String(a.queueToken).padStart(2, '0')}` : a.time || '—',
             rawToken: a.queueToken ?? null,
-            patientName: a.patientName || a.patient?.name || 'Walk-in Patient',
-            phone: a.phone || a.patient?.phone || '—',
-            doctorName: a.doctorName || a.doctor?.name || 'Dr. Practitioner',
-            time: a.time || '09:00',
+            patientName: a.patientName || 'Patient',
+            phone: a.patientPhone || undefined,
+            doctorName: a.doctorName || '—',
+            time: a.time || '—',
             status,
             priority: a.priority === 'emergency' ? 'emergency' : 'normal',
           }
         })
         setPatients(mapped)
 
-        // Calculate doctor queue distribution
-        setDoctorRooms(prev => prev.map(room => {
-          const doctorAppts = mapped.filter(p => p.doctorName.toLowerCase().includes(room.name.toLowerCase().replace('dr. ', '')))
-          const activeInQueue = doctorAppts.filter(p => p.status === 'waiting').length
-          return {
-            ...room,
-            currentQueue: activeInQueue,
-            status: activeInQueue > 0 ? (activeInQueue > 3 ? 'busy' : 'available') : 'available',
+        // Doctors on duty are derived from today's real appointments; the system has no room field.
+        const rooms = new Map<string, DoctorRoomStatus>()
+        mapped.forEach(p => {
+          if (!rooms.has(p.doctorName)) {
+            rooms.set(p.doctorName, {
+              doctorId: p.doctorName,
+              name: p.doctorName,
+              roomNumber: 'Room not assigned',
+              status: 'available',
+              currentQueue: 0,
+            })
           }
-        }))
+          const room = rooms.get(p.doctorName)!
+          if (p.status === 'waiting') room.currentQueue += 1
+          if (p.status === 'in_consultation') room.status = 'busy'
+        })
+        setDoctorRooms([...rooms.values()])
       } else {
-        setPatients(DEMO_QUEUE)
+        setPatients([])
+        setDoctorRooms([])
       }
 
-      if (invRes.status === 'fulfilled' && Array.isArray(invRes.value.data)) {
-        // Today's collections only — previously this summed every paid invoice ever.
-        const paidToday = invRes.value.data
-          .filter((i: any) => i.status?.toLowerCase() === 'paid' && (i.createdAt || '').slice(0, 10) === todayISO)
-          .reduce((sum: number, curr: any) => sum + (curr.total || 0), 0)
-        setCounterCollection(paidToday || DEMO_COLLECTION)
-      } else {
-        setCounterCollection(DEMO_COLLECTION)
-      }
+      setCounterCollection(ledgerRes.status === 'fulfilled'
+        ? Number(ledgerRes.value.data?.netCollected) || 0
+        : 0)
     } catch {
-      // Graceful fallback
-      setCounterCollection(DEMO_COLLECTION)
+      setPatients([])
+      setDoctorRooms([])
+      setCounterCollection(0)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branding.timezone])
 
   useEffect(() => {
     fetchDashboardData()
+  }, [fetchDashboardData])
+
+  useEffect(() => {
+    const timer = setInterval(() => fetchDashboardData(true), 60_000)
+    return () => clearInterval(timer)
   }, [fetchDashboardData])
 
   const stats = useMemo(() => {
@@ -158,14 +145,13 @@ export default function ReceptionistDashboard() {
   }
 
   const handleCheckIn = async (appointmentId: string) => {
+    setCheckInError(null)
     try {
       await api.post(`/appointments/${appointmentId}/check-in`)
       fetchDashboardData()
     } catch {
-      // Offline fallback: update locally
-      setPatients(prev => prev.map(p =>
-        p.id === appointmentId ? { ...p, status: 'waiting', rawToken: (p.rawToken || 5) } : p
-      ))
+      // Never fake a token: a failed check-in must stay visible and retryable.
+      setCheckInError('Check-in failed. The patient was not checked in — try again or verify the appointment.')
     }
   }
 
@@ -224,11 +210,17 @@ export default function ReceptionistDashboard() {
           <div className="flex items-center gap-3">
             <span className="text-2xl">📢</span>
             <div>
-              <div className="text-base tracking-wide">ANNOUNCING TOKEN {callingToken}</div>
-              <div className="text-xs font-normal opacity-90">Directing patient from lobby to designated consultation room.</div>
+              <div className="text-base tracking-wide">TOKEN {callingToken} CALLED</div>
+              <div className="text-xs font-normal opacity-90">Direct the patient from the lobby to the consultation room.</div>
             </div>
           </div>
-          <span className="badge bg-white text-teal-800 font-mono text-xs">Lobby Speaker Active</span>
+          <span className="badge bg-white text-teal-800 font-mono text-xs">On-screen notice</span>
+        </div>
+      )}
+
+      {checkInError && (
+        <div role="alert" className="p-3 rounded-lg bg-rose-50 text-rose-800 text-xs font-semibold border border-rose-200">
+          {checkInError}
         </div>
       )}
 
@@ -290,9 +282,9 @@ export default function ReceptionistDashboard() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className="text-lg">💵</span>
-              <span className="stat-label mt-0 text-emerald-800 dark:text-emerald-200">OPD Counter Cash (Today)</span>
+              <span className="stat-label mt-0 text-emerald-800 dark:text-emerald-200">Net Collected Today</span>
             </div>
-            <span className="badge badge-success text-[10px]">Cash / UPI</span>
+            <span className="badge badge-success text-[10px]">All methods</span>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="stat-value font-heading font-mono text-emerald-600 dark:text-emerald-400">
@@ -327,9 +319,12 @@ export default function ReceptionistDashboard() {
           </div>
 
           <div className="space-y-3">
+            {doctorRooms.length === 0 && (
+              <div className="p-4 rounded-xl border border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-muted)]">
+                No doctors have appointments booked today.
+              </div>
+            )}
             {doctorRooms.map(room => {
-              const spec = CLINICAL_SPECIALTIES.find(s => s.id === room.specialtyId) || CLINICAL_SPECIALTIES[1]
-
               return (
                 <div
                   key={room.doctorId}
@@ -338,10 +333,6 @@ export default function ReceptionistDashboard() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5">
                       <span className="font-bold text-xs text-[var(--color-text)] truncate">{room.name}</span>
-                      <span className={`inline-flex items-center gap-0.5 text-[9.5px] font-semibold px-1.5 py-0.2 rounded border ${spec.badgeBg} ${spec.badgeText} ${spec.badgeBorder}`}>
-                        <span>{spec.icon}</span>
-                        <span>{spec.name}</span>
-                      </span>
                     </div>
                     <div className="flex items-center gap-2 mt-1 text-[11px] text-[var(--color-text-muted)]">
                       <span className="font-semibold text-teal-700 dark:text-teal-300">{room.roomNumber}</span>

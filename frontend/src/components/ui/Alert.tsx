@@ -50,6 +50,20 @@ const KNOWN_ERROR_MAP: Record<string, string> = {
   tenant_suspended: 'Tenant subscription is suspended or expired.',
   tenant_not_found: 'Tenant account not found.',
   not_authenticated: 'Please sign in to continue.',
+  // Appointment & booking errors
+  slot_already_booked: 'This time slot is already booked for this doctor. Please choose a different slot.',
+  time_slot_outside_working_hours: 'The selected time is outside clinic working hours (09:00–13:00, 14:00–18:00).',
+  clinic_closed_on_selected_day: 'The clinic is closed on the selected day of the week.',
+  clinic_closed_on_selected_date: 'The clinic is closed for a scheduled holiday on this date.',
+  time_slot_outside_special_working_hours: 'The selected time is outside special working hours for this date.',
+  invalid_time_slot: 'Please select a valid time slot in HH:mm format.',
+  invalid_date_format: 'Please provide a valid date in YYYY-MM-DD format.',
+  doctor_not_found: 'Selected doctor is not active or not found in this clinic.',
+  patient_not_found: 'Selected patient record was not found.',
+  no_clinic_configured: 'No clinic configuration found for your account.',
+  cannot_check_in_terminal_appointment: 'Cannot check in an appointment that is already completed or cancelled.',
+  cannot_reschedule_terminal_appointment: 'Cannot reschedule a completed or cancelled appointment.',
+  invalid_status_transition: 'This status transition is not permitted.',
 }
 
 /** Maps friendly, user-facing messages from raw API errors */

@@ -92,13 +92,13 @@ namespace Hospital_CRM.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ClinicId");
-
                     b.HasIndex("DoctorId");
 
                     b.HasIndex("QueueTrackingToken")
                         .IsUnique()
                         .HasFilter("\"QueueTrackingToken\" IS NOT NULL");
+
+                    b.HasIndex("ClinicId", "Date");
 
                     b.HasIndex("PatientId", "Date");
 
@@ -1582,6 +1582,8 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.HasIndex("PatientId");
 
                     b.HasIndex("Status", "CreatedAt");
+
+                    b.HasIndex("TenantId", "CreatedAt");
 
                     b.HasIndex("TenantId", "IdempotencyKey")
                         .IsUnique()
@@ -3114,6 +3116,8 @@ namespace Hospital_CRM.Infrastructure.Migrations
                     b.HasIndex("TenantId", "IdempotencyKey")
                         .IsUnique()
                         .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+
+                    b.HasIndex("TenantId", "PaidAt");
 
                     b.HasIndex("TenantId", "Method", "RazorpayPaymentId")
                         .IsUnique()

@@ -219,6 +219,12 @@ internal static class InvoiceAccounting
         invoice.Status = invoice.BalanceDue <= 0 ? InvoiceStatus.Paid : InvoiceStatus.PartiallyPaid;
         invoice.UpdatedAt = now;
 
+        // A payment must never build on an invoice whose own figures disagree — the legacy rows this
+        // release repairs were marked Paid with PaidAmount = 0, and a drift like that hides real money.
+        if (invoice.PaidAmount < 0 || invoice.PaidAmount + invoice.CreditedAmount > invoice.Total
+            || invoice.BalanceDue != Math.Max(0m, invoice.Total - invoice.PaidAmount - invoice.CreditedAmount))
+            throw new InvalidOperationException("Invoice payment state is inconsistent with its recorded amount.");
+
         var invoiceRef = invoice.FormatInvoiceNumber();
         db.FinanceLedgerEntries.AddRange(
             new FinanceLedgerEntry

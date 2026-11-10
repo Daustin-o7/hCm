@@ -469,6 +469,7 @@ public class HospitalCrmDbContext : DbContext
             e.HasIndex(x => x.QueueTrackingToken).IsUnique().HasFilter("\"QueueTrackingToken\" IS NOT NULL");
             e.HasIndex(x => new { x.PatientId, x.Date });
             e.HasIndex(x => new { x.TenantId, x.DoctorId, x.Date, x.Status }); // doctor day-view by status
+            e.HasIndex(x => new { x.ClinicId, x.Date }); // clinic day list (reception/nurse/admin dashboards)
             e.Property(x => x.TimeSlot).HasMaxLength(10);
             e.Property(x => x.QueueTrackingToken).HasMaxLength(128);
             e.Property(x => x.TriageReasonCode).HasMaxLength(50);
@@ -533,6 +534,7 @@ public class HospitalCrmDbContext : DbContext
         {
             e.HasKey(x => x.Id);
             e.HasIndex(x => new { x.Status, x.CreatedAt });
+            e.HasIndex(x => new { x.TenantId, x.CreatedAt }); // newest-first invoice list, paged
             e.HasIndex(x => x.AppointmentId);
             e.HasIndex(x => new { x.TenantId, x.PatientId, x.Status });
             e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
@@ -564,6 +566,7 @@ public class HospitalCrmDbContext : DbContext
             e.HasKey(x => x.Id);
             e.HasIndex(x => x.InvoiceId);
             e.HasIndex(x => new { x.TenantId, x.CreatedAt });
+            e.HasIndex(x => new { x.TenantId, x.PaidAt }); // ledger date-range scans key off PaidAt, not CreatedAt
             e.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique().HasFilter("\"IdempotencyKey\" IS NOT NULL");
             e.HasIndex(x => new { x.TenantId, x.Method, x.RazorpayPaymentId }).IsUnique()
                 .HasFilter("\"RazorpayPaymentId\" IS NOT NULL AND \"Amount\" > 0 AND \"Method\" = 5");

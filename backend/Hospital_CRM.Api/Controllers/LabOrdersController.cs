@@ -328,15 +328,31 @@ public class LabOrdersController : ControllerBase
                 id = o.Id,
                 consultationId = o.ConsultationId,
                 patientId = o.PatientId,
+                patientName = o.Patient.Name,
                 doctorId = o.DoctorId,
                 testName = o.TestName,
                 notes = o.Notes,
                 status = o.Status.ToString().ToLower(),
+                isAbnormal = o.IsAbnormal,
+                doctorReviewedAt = o.DoctorReviewedAt,
                 createdAt = o.CreatedAt,
                 completedAt = o.CompletedAt,
                 latestResultVersion = _db.LabResults
                     .Where(r => r.LabOrderId == o.Id)
-                    .Max(r => (int?)r.Version)
+                    .Max(r => (int?)r.Version),
+                // Latest amendment only: the alert panel must never show a superseded value.
+                latestResult = _db.LabResults
+                    .Where(r => r.LabOrderId == o.Id)
+                    .OrderByDescending(r => r.Version)
+                    .Select(r => new
+                    {
+                        resultText = r.ResultText,
+                        referenceRange = r.ReferenceRange,
+                        units = r.Units,
+                        isAbnormal = r.IsAbnormal,
+                        enteredAt = r.EnteredAt
+                    })
+                    .FirstOrDefault()
             })
             .ToListAsync(ct);
 

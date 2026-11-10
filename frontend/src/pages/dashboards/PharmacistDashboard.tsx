@@ -1,102 +1,60 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../../services/api'
 import { useAuth } from '../../context/AuthContext'
 import { Skeleton } from '../../components/ui/EmptyState'
 
-interface PendingRx {
-  id: string
-  consultationId?: string
-  patientName: string
-  doctorName: string
-  time: string
-  itemsCount: number
-  drugsList: string
-  status: 'pending' | 'dispensed'
-  isScheduleH1: boolean
-}
-
-interface FefoBatchAlert {
+interface ExpiringBatch {
   id: string
   drugName: string
   batchNumber: string
   expiryDate: string
   daysUntilExpiry: number
-  remainingQuantity: number
+  quantityRemaining: number
 }
-
-// Development-only demo fallbacks. Kept out of production builds: each literal is the
-// true branch of a condition that compiles to `false`, so the bundler drops it entirely.
-const DEMO_RX_LIST: PendingRx[] = import.meta.env.DEV
-  ? [
-      {
-        id: 'rx-1',
-        patientName: 'Aarav Sharma',
-        doctorName: 'Dr. Sarah Jenkins',
-        time: '09:45 AM',
-        itemsCount: 3,
-        drugsList: 'Amoxicillin 500mg, Paracetamol 650mg, Chlorhexidine 0.2%',
-        status: 'pending',
-        isScheduleH1: true,
-      },
-      {
-        id: 'rx-2',
-        patientName: 'Priya Patel',
-        doctorName: 'Dr. Rajiv Mehta',
-        time: '10:15 AM',
-        itemsCount: 2,
-        drugsList: 'Aceclofenac + Paracetamol, Thiocolchicoside 4mg',
-        status: 'pending',
-        isScheduleH1: false,
-      },
-      {
-        id: 'rx-3',
-        patientName: 'Sunita Mehra',
-        doctorName: 'Dr. Aisha Khan',
-        time: '10:40 AM',
-        itemsCount: 4,
-        drugsList: 'Metformin 500mg SR, Telmisartan 40mg, Atorvastatin 10mg, Pantoprazole 40mg',
-        status: 'pending',
-        isScheduleH1: false,
-      },
-    ]
-  : []
-
-const DEMO_FEFO_ALERTS: FefoBatchAlert[] = import.meta.env.DEV
-  ? [
-      { id: 'b-1', drugName: 'Cefixime 200mg DT', batchNumber: 'CFX-2024-09', expiryDate: '2026-10-28', daysUntilExpiry: 23, remainingQuantity: 45 },
-      { id: 'b-2', drugName: 'Azithromycin 500mg', batchNumber: 'AZT-8841', expiryDate: '2026-11-12', daysUntilExpiry: 38, remainingQuantity: 80 },
-      { id: 'b-3', drugName: 'Diclofenac Sodium Gel 30g', batchNumber: 'DIC-9921', expiryDate: '2026-11-20', daysUntilExpiry: 46, remainingQuantity: 28 },
-    ]
-  : []
 
 export default function PharmacistDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
 
   const [loading, setLoading] = useState(true)
-  const [rxList, setRxList] = useState<PendingRx[]>([])
-  const [fefoAlerts, setFefoAlerts] = useState<FefoBatchAlert[]>([])
   const [pharmacySales, setPharmacySales] = useState(0)
+  const [todayInvoices, setTodayInvoices] = useState(0)
+  const [expiringSoon, setExpiringSoon] = useState(0)
   const [lowStockCount, setLowStockCount] = useState(0)
+  const [expiringBatches, setExpiringBatches] = useState<ExpiringBatch[]>([])
 
-  const fetchPharmacyData = useCallback(async () => {
-    setLoading(true)
+  // F8 opens the POS counter, matching the advertised shortcut.
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'F8') {
+        e.preventDefault()
+        navigate('/dashboard/pharmacy/pos')
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [navigate])
+
+  const fetchPharmacyData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
-      const [statsRes] = await Promise.allSettled([
+      const [statsRes, expiryRes] = await Promise.allSettled([
         api.get('/pharmacy/stats'),
+        api.get('/pharmacy/batches/expiring?days=60'),
       ])
 
       if (statsRes.status === 'fulfilled' && statsRes.value.data) {
         const d = statsRes.value.data
-        if (d.todayRevenue) setPharmacySales(d.todayRevenue)
-        if (d.lowStockCount != null) setLowStockCount(d.lowStockCount)
+        setPharmacySales(Number(d.todaySales) || 0)
+        setTodayInvoices(Number(d.todayInvoicesCount) || 0)
+        setExpiringSoon(Number(d.expiringSoonBatches) || 0)
+        setLowStockCount(Number(d.lowStockCount) || 0)
       }
 
-      setRxList(DEMO_RX_LIST)
-      setFefoAlerts(DEMO_FEFO_ALERTS)
-    } catch {
-      // Fallback
+      setExpiringBatches(expiryRes.status === 'fulfilled' && Array.isArray(expiryRes.value.data)
+        ? expiryRes.value.data
+        : [])
     } finally {
       setLoading(false)
     }
@@ -106,12 +64,10 @@ export default function PharmacistDashboard() {
     fetchPharmacyData()
   }, [fetchPharmacyData])
 
-  const pendingRxCount = useMemo(() => rxList.filter(r => r.status === 'pending').length, [rxList])
-
-  const handleDispense = (_rx: PendingRx) => {
-    // Navigate to POS with preselected prescription
-    navigate('/dashboard/pharmacy/pos')
-  }
+  useEffect(() => {
+    const timer = setInterval(() => fetchPharmacyData(true), 60_000)
+    return () => clearInterval(timer)
+  }, [fetchPharmacyData])
 
   const greeting = (() => {
     const h = new Date().getHours()
@@ -154,20 +110,20 @@ export default function PharmacistDashboard() {
 
       {/* ── 4 Pharmacy KPI Stat Cards ── */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Prescriptions Pending Dispensing */}
+        {/* Pharmacy Invoices Today */}
         <div className="stat-card hover-card border-amber-200 dark:border-amber-900 bg-amber-50/20 dark:bg-amber-950/20">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               
-              <span className="stat-label mt-0 text-amber-800 dark:text-amber-200">Prescriptions Pending</span>
+              <span className="stat-label mt-0 text-amber-800 dark:text-amber-200">Pharmacy Invoices Today</span>
             </div>
-            <span className="badge badge-warning text-[10px]">Awaiting Pickup</span>
+            <span className="badge badge-warning text-[10px]">POS</span>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="stat-value font-heading font-mono text-amber-700 dark:text-amber-300">
-              {loading ? <Skeleton width="48px" height="28px" /> : pendingRxCount}
+              {loading ? <Skeleton width="48px" height="28px" /> : todayInvoices}
             </span>
-            <span className="text-[11px] text-amber-700/80 font-medium">Ready for POS dispense</span>
+            <span className="text-[11px] text-amber-700/80 font-medium">Bills issued today</span>
           </div>
         </div>
 
@@ -195,11 +151,11 @@ export default function PharmacistDashboard() {
               
               <span className="stat-label mt-0 text-rose-800 dark:text-rose-200">FEFO Expiry Warnings</span>
             </div>
-            <span className="badge badge-danger text-[10px]">&lt; 45 Days</span>
+            <span className="badge badge-danger text-[10px]">60 days</span>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="stat-value font-heading font-mono text-rose-600 dark:text-rose-400">
-              {loading ? <Skeleton width="48px" height="28px" /> : fefoAlerts.length}
+              {loading ? <Skeleton width="48px" height="28px" /> : expiringSoon}
             </span>
             <span className="text-[11px] text-rose-600 font-medium">Batches to clear</span>
           </div>
@@ -223,118 +179,93 @@ export default function PharmacistDashboard() {
         </div>
       </div>
 
-      {/* ── Middle Grid: Doctor Rx Feed (7 cols) & FEFO Expiry Tracker (5 cols) ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Doctor Prescriptions Queue (7 cols) */}
-        <div className="lg:col-span-7 card p-5 space-y-4">
-          <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-3">
-            <div>
-              <h2 className="text-sm font-bold text-[var(--color-text)] font-heading">
-                Live Doctor Prescription Feed
-              </h2>
-              <p className="text-[11px] text-[var(--color-text-muted)]">
-                Prescriptions finalized by doctors ready for counter dispensing
-              </p>
-            </div>
-            <button
-              onClick={() => navigate('/dashboard/pharmacy/pos')}
-              className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline"
-            >
-              Open Full POS →
-            </button>
+      {/* ── Dispensary Alerts ── */}
+      <div className="card p-5 space-y-4">
+        <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-3">
+          <div>
+            <h2 className="text-sm font-bold text-[var(--color-text)] font-heading">
+              Dispensary Alerts
+            </h2>
+            <p className="text-[11px] text-[var(--color-text-muted)]">
+              Stock and statutory items that need action
+            </p>
           </div>
-
-          <div className="space-y-3">
-            {rxList.map(rx => (
-              <div
-                key={rx.id}
-                className="p-3.5 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:border-teal-400 transition-colors"
-              >
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-xs text-[var(--color-text)]">{rx.patientName}</span>
-                    <span className="text-[10px] text-[var(--color-text-muted)]">({rx.time})</span>
-                    {rx.isScheduleH1 && (
-                      <span className="badge badge-warning text-[9px] uppercase font-bold">
-                        Schedule H1
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-[11px] text-teal-700 dark:text-teal-300 font-medium mt-0.5">
-                    Prescribed by {rx.doctorName} • {rx.itemsCount} items
-                  </div>
-                  <p className="text-[11px] text-[var(--color-text-muted)] mt-1 truncate" title={rx.drugsList}>
-                    {rx.drugsList}
-                  </p>
-                </div>
-
-                <button
-                  onClick={() => handleDispense(rx)}
-                  className="btn btn-primary btn-sm text-xs flex items-center gap-1.5 shrink-0 self-end sm:self-center font-semibold"
-                >
-                  <span>🛒</span>
-                  <span>Dispense in POS →</span>
-                </button>
-              </div>
-            ))}
-          </div>
+          <button
+            onClick={() => navigate('/dashboard/pharmacy/batches')}
+            className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline"
+          >
+            Batch Log →
+          </button>
         </div>
 
-        {/* Near-Expiry FEFO Batches & Compliance (5 cols) */}
-        <div className="lg:col-span-5 card p-5 space-y-4">
-          <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-3">
-            <div>
-              <h2 className="text-sm font-bold text-[var(--color-text)] font-heading">
-                Near-Expiry FEFO Batches
-              </h2>
-              <p className="text-[11px] text-[var(--color-text-muted)]">
-                Dispense first before manufacturer expiry
-              </p>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <button
+            onClick={() => navigate('/dashboard/pharmacy/batches')}
+            className="p-3.5 rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50/25 dark:bg-rose-950/20 text-left hover:border-rose-400 transition-colors"
+          >
+            <div className="text-xs font-bold text-[var(--color-text)]">Near-expiry batches</div>
+            <div className="text-[11px] text-[var(--color-text-muted)] mt-1">
+              {expiringSoon} batch{expiringSoon === 1 ? '' : 'es'} expiring within 60 days
             </div>
-            <button
-              onClick={() => navigate('/dashboard/pharmacy/batches')}
-              className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline"
-            >
-              Batch Log →
-            </button>
-          </div>
+          </button>
 
-          <div className="space-y-2.5">
-            {fefoAlerts.map(b => (
-              <div
-                key={b.id}
-                className="p-3 rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50/25 dark:bg-rose-950/20 flex items-center justify-between gap-3 text-xs"
-              >
-                <div>
-                  <div className="font-bold text-[var(--color-text)]">{b.drugName}</div>
-                  <div className="flex items-center gap-2 text-[10.5px] text-[var(--color-text-muted)] mt-0.5">
-                    <span className="font-mono">Batch: {b.batchNumber}</span>
-                    <span>•</span>
-                    <span>Qty: {b.remainingQuantity} left</span>
-                  </div>
-                </div>
+          <button
+            onClick={() => navigate('/dashboard/inventory')}
+            className="p-3.5 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] text-left hover:border-teal-400 transition-colors"
+          >
+            <div className="text-xs font-bold text-[var(--color-text)]">Below safety buffer</div>
+            <div className="text-[11px] text-[var(--color-text-muted)] mt-1">
+              {lowStockCount} drug{lowStockCount === 1 ? '' : 's'} need reorder
+            </div>
+          </button>
 
-                <div className="text-right">
-                  <span className="badge badge-danger text-[10px] font-mono">
-                    {b.daysUntilExpiry} days left
-                  </span>
-                  <div className="text-[10px] text-[var(--color-text-muted)] mt-0.5">
-                    Exp: {b.expiryDate}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <button
+            onClick={() => navigate('/dashboard/pharmacy/compliance')}
+            className="p-3.5 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] text-left hover:border-teal-400 transition-colors"
+          >
+            <div className="text-xs font-bold text-[var(--color-text)]">Schedule H1 register</div>
+            <div className="text-[11px] text-[var(--color-text-muted)] mt-1">
+              Open the statutory compliance log
+            </div>
+          </button>
+        </div>
 
-          <div className="pt-2 border-t border-[var(--color-border)]">
-            <button
-              onClick={() => navigate('/dashboard/pharmacy/compliance')}
-              className="btn btn-secondary btn-sm w-full text-xs flex items-center justify-center gap-1.5"
-            >
-              <span>🛡️</span>
-              <span>View Schedule H1 Statutory Compliance Register</span>
-            </button>
+        <div className="pt-2">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--color-text-muted)] mb-2">
+            Expiring stock — dispense first
           </div>
+          {expiringBatches.length === 0 ? (
+            <div className="p-4 rounded-xl border border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-muted)]">
+              No batches expiring within 60 days.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="data-table text-xs">
+                <thead>
+                  <tr>
+                    <th>Drug</th>
+                    <th>Batch</th>
+                    <th>Expiry</th>
+                    <th className="text-right">Qty Left</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {expiringBatches.map(b => (
+                    <tr key={b.id}>
+                      <td className="font-semibold text-[var(--color-text)]">{b.drugName}</td>
+                      <td className="font-mono text-[11px]">{b.batchNumber}</td>
+                      <td>
+                        <span className={`badge text-[10px] font-mono ${b.daysUntilExpiry <= 30 ? 'badge-danger' : 'badge-warning'}`}>
+                          {b.expiryDate} · {b.daysUntilExpiry}d
+                        </span>
+                      </td>
+                      <td className="text-right font-mono">{b.quantityRemaining}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
 

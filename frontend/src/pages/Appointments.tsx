@@ -61,22 +61,10 @@ function formatRelativeDate(dateStr: string): string {
   return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
 }
 
-// Development-only placeholder options. Kept out of production builds: each literal is the
-// true branch of a condition that compiles to `false`, so the bundler drops it entirely.
-const DEFAULT_DOCTORS: Doctor[] = import.meta.env.DEV ? [
-  { id: 'doc-1', name: 'Dr. Sarah Jenkins', specialty: 'dental' },
-  { id: 'doc-2', name: 'Dr. Rajiv Mehta', specialty: 'physiotherapy' },
-  { id: 'doc-3', name: 'Dr. Aisha Khan', specialty: 'general' },
-  { id: 'doc-4', name: 'Dr. Vikram Seth', specialty: 'orthopedics' },
-  { id: 'doc-5', name: 'Dr. Pooja Nair', specialty: 'pediatrics' },
-] : []
-
-const DEFAULT_PATIENTS: Patient[] = import.meta.env.DEV ? [
-  { id: 'pat-1', name: 'Aarav Sharma', phone: '+91 98765 43210' },
-  { id: 'pat-2', name: 'Priya Patel', phone: '+91 98765 12345' },
-  { id: 'pat-3', name: 'Rohan Gupta', phone: '+91 98765 67890' },
-  { id: 'pat-4', name: 'Ananya Deshmukh', phone: '+91 98220 54321' },
-] : []
+const PRESET_SLOTS = [
+  '09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00', '12:30',
+  '14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00', '17:30'
+]
 
 function isGuid(id: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
@@ -86,10 +74,11 @@ function isGuid(id: string): boolean {
 export default function Appointments() {
   const navigate = useNavigate()
   const [appointments, setAppointments] = useState<Appointment[]>([])
-  const [doctors, setDoctors]   = useState<Doctor[]>(DEFAULT_DOCTORS)
-  const [patients, setPatients] = useState<Patient[]>(DEFAULT_PATIENTS)
+  const [doctors, setDoctors]   = useState<Doctor[]>([])
+  const [patients, setPatients] = useState<Patient[]>([])
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0])
   const [loading, setLoading]   = useState(true)
+  const [metaLoading, setMetaLoading] = useState(false)
   const [showModal, setShowModal] = useState(false)
   const [submitError, setSubmitError] = useState('')
 
@@ -99,14 +88,15 @@ export default function Appointments() {
   const [searchQuery, setSearchQuery] = useState('')
 
   const {
-    register, handleSubmit, reset, watch,
+    register, handleSubmit, reset, watch, setValue,
     formState: { errors, isSubmitting },
   } = useForm<AppointmentForm>({
     resolver: zodResolver(appointmentSchema),
-    defaultValues: { type: 'scheduled', date: new Date().toISOString().split('T')[0] },
+    defaultValues: { type: 'scheduled', date: new Date().toISOString().split('T')[0], time: '10:00' },
   })
 
   const modalSelectedDoctor = watch('doctorId')
+  const modalSelectedTime   = watch('time')
 
   const fetchAppointments = useCallback(async () => {
     setLoading(true)
@@ -121,20 +111,25 @@ export default function Appointments() {
   }, [selectedDate])
 
   const fetchMeta = useCallback(async () => {
-    const [docRes, patRes] = await Promise.allSettled([
-      api.get('/users?role=doctor'),
-      api.get('/patients'),
-    ])
-    if (docRes.status === 'fulfilled' && Array.isArray(docRes.value.data) && docRes.value.data.length > 0) {
-      const mappedDocs = docRes.value.data.map((d: any) => ({
-        id: d.id,
-        name: d.name,
-        specialty: d.specialty || getDoctorSpecialty(d.name).id
-      }))
-      setDoctors(mappedDocs)
-    }
-    if (patRes.status === 'fulfilled' && Array.isArray(patRes.value.data) && patRes.value.data.length > 0) {
-      setPatients(patRes.value.data)
+    setMetaLoading(true)
+    try {
+      const [docRes, patRes] = await Promise.allSettled([
+        api.get('/users?role=doctor'),
+        api.get('/patients'),
+      ])
+      if (docRes.status === 'fulfilled' && Array.isArray(docRes.value.data)) {
+        const mappedDocs = docRes.value.data.map((d: any) => ({
+          id: d.id,
+          name: d.name,
+          specialty: d.specialty || getDoctorSpecialty(d.name, d.specialty).id
+        }))
+        setDoctors(mappedDocs)
+      }
+      if (patRes.status === 'fulfilled' && Array.isArray(patRes.value.data)) {
+        setPatients(patRes.value.data)
+      }
+    } finally {
+      setMetaLoading(false)
     }
   }, [])
 
@@ -145,6 +140,19 @@ export default function Appointments() {
       const token = res.data?.queueToken ?? null
       setAppointments(prev => prev.map(a =>
         a.appointmentId === aptId ? { ...a, status: 'checked_in', queueToken: token } : a
+      ))
+    } catch (err) {
+      setSubmitError(friendlyError(err))
+    }
+  }
+
+  const handleCancel = async (aptId: string) => {
+    if (!window.confirm('Are you sure you want to cancel this appointment?')) return
+    setSubmitError('')
+    try {
+      await api.put(`/appointments/${aptId}`, { status: 'cancelled' })
+      setAppointments(prev => prev.map(a =>
+        a.appointmentId === aptId ? { ...a, status: 'cancelled' } : a
       ))
     } catch (err) {
       setSubmitError(friendlyError(err))
@@ -162,32 +170,33 @@ export default function Appointments() {
     const p = patients.find(pt => pt.id === data.patientId)
     const d = doctors.find(dc => dc.id === data.doctorId)
     if (!isGuid(data.patientId) || !isGuid(data.doctorId)) {
-      setSubmitError(
-        !isGuid(data.patientId)
-          ? `"${p?.name ?? 'This patient'}" is a demo entry and can't be booked. Register the real patient first, then book the appointment.`
-          : `"${d?.name ?? 'This doctor'}" is a demo entry — live staff data is unavailable right now.`
-      )
+      setSubmitError('Please select a valid registered patient and active doctor.')
       return
     }
     try {
       const res = await api.post('/appointments', { ...data, timeSlot: data.time })
-      if (data.date === selectedDate && res.data?.appointmentId) {
-        setAppointments(prev => [
-          {
-            appointmentId: res.data.appointmentId,
-            patientId: data.patientId,
-            patientName: p?.name ?? 'Patient',
-            doctorId: data.doctorId,
-            doctorName:  d?.name ?? 'Doctor',
-            time: data.time,
-            status: res.data.status ?? 'booked',
-            queueToken: null,
-            type: data.type,
-          },
-          ...prev,
-        ])
+      if (res.data?.appointmentId) {
+        if (data.date === selectedDate) {
+          setAppointments(prev => [
+            {
+              appointmentId: res.data.appointmentId,
+              patientId: data.patientId,
+              patientName: p?.name ?? 'Patient',
+              doctorId: data.doctorId,
+              doctorName:  d?.name ?? 'Doctor',
+              time: data.time,
+              status: res.data.status ?? 'booked',
+              queueToken: null,
+              type: data.type,
+            },
+            ...prev,
+          ])
+        } else {
+          // Switch to the newly booked date so user sees their appointment
+          setSelectedDate(data.date)
+        }
       }
-      reset()
+      reset({ type: 'scheduled', date: selectedDate, time: '10:00' })
       setShowModal(false)
     } catch (err) {
       setSubmitError(friendlyError(err))
@@ -539,15 +548,26 @@ export default function Appointments() {
                       <td style={{ textAlign: 'right' }}>
                         <div className="flex items-center justify-end gap-1.5">
                           {isBooked && (
-                            <button
-                              className="btn btn-secondary btn-sm"
-                              onClick={() => handleCheckIn(appt.appointmentId)}
-                              aria-label={`Check in ${appt.patientName}`}
-                              style={{ fontSize: '11px', padding: '4px 10px', fontWeight: 600 }}
-                            >
-                              <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
-                              Check In
-                            </button>
+                            <>
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                onClick={() => handleCheckIn(appt.appointmentId)}
+                                aria-label={`Check in ${appt.patientName}`}
+                                style={{ fontSize: '11px', padding: '4px 10px', fontWeight: 600 }}
+                              >
+                                <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                                Check In
+                              </button>
+                              <button
+                                className="btn btn-ghost btn-sm text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                                onClick={() => handleCancel(appt.appointmentId)}
+                                aria-label={`Cancel appointment for ${appt.patientName}`}
+                                title="Cancel this appointment"
+                                style={{ fontSize: '11px', padding: '4px 8px' }}
+                              >
+                                Cancel
+                              </button>
+                            </>
                           )}
 
                           {isCheckedIn && (
@@ -600,9 +620,18 @@ export default function Appointments() {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
             {/* Patient */}
             <div style={{ gridColumn: '1 / -1' }}>
-              <label htmlFor="appt-patient" className="form-label">Patient *</label>
+              <div className="flex items-center justify-between mb-1">
+                <label htmlFor="appt-patient" className="form-label" style={{ marginBottom: 0 }}>Patient *</label>
+                <button
+                  type="button"
+                  onClick={() => navigate('/dashboard/patients')}
+                  className="text-xs font-semibold text-[var(--brand-primary)] hover:underline flex items-center gap-1 cursor-pointer"
+                >
+                  + Register New Patient
+                </button>
+              </div>
               <select id="appt-patient" className="form-select" {...register('patientId')}>
-                <option value="">Select patient…</option>
+                <option value="">{metaLoading ? 'Loading patients…' : patients.length === 0 ? 'No registered patients found' : 'Select patient…'}</option>
                 {patients.map(p => <option key={p.id} value={p.id}>{p.name} · {p.phone}</option>)}
               </select>
               {errors.patientId && <p className="form-error">{errors.patientId.message}</p>}
@@ -612,7 +641,7 @@ export default function Appointments() {
             <div style={{ gridColumn: '1 / -1' }}>
               <label htmlFor="appt-doctor" className="form-label">Consulting Doctor & Specialization *</label>
               <select id="appt-doctor" className="form-select" {...register('doctorId')}>
-                <option value="">Select doctor…</option>
+                <option value="">{metaLoading ? 'Loading doctors…' : doctors.length === 0 ? 'No active doctors found' : 'Select doctor…'}</option>
                 {doctors.map(d => {
                   const spec = getDoctorSpecialty(d.name, d.specialty)
                   return (
@@ -654,6 +683,29 @@ export default function Appointments() {
               <label htmlFor="appt-time" className="form-label">Time slot *</label>
               <input id="appt-time" type="time" className="form-input" {...register('time')} />
               {errors.time && <p className="form-error">{errors.time.message}</p>}
+            </div>
+
+            {/* Time preset pills */}
+            <div style={{ gridColumn: '1 / -1' }}>
+              <div className="text-[11px] font-medium text-[var(--color-text-muted)] mb-1.5 flex items-center justify-between">
+                <span>Select a standard OPD slot (Clinic: 09:00–13:00 & 14:00–18:00)</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {PRESET_SLOTS.map(slot => (
+                  <button
+                    key={slot}
+                    type="button"
+                    onClick={() => setValue('time', slot, { shouldValidate: true })}
+                    className={`text-[11px] px-2.5 py-1 rounded-md font-mono border transition-all cursor-pointer ${
+                      modalSelectedTime === slot
+                        ? 'bg-[var(--brand-primary)] text-white border-[var(--brand-primary)] shadow-xs font-bold'
+                        : 'bg-[var(--color-surface-raised)] hover:border-[var(--brand-primary)] text-[var(--color-text-secondary)] border-[var(--color-border)]'
+                    }`}
+                  >
+                    {slot}
+                  </button>
+                ))}
+              </div>
             </div>
 
             {/* Type */}

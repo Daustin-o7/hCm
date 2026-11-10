@@ -83,6 +83,42 @@ public class PharmacyBatchController : ControllerBase
         return Ok(batch);
     }
 
+    /// <summary>
+    /// Tenant-wide near-expiry batch list for the dispensary alert panel. Same 60-day horizon
+    /// and stock filters as the per-drug FEFO endpoint.
+    /// </summary>
+    [HttpGet("batches/expiring")]
+    [AuthorizeRoles("ClinicAdmin", "Pharmacist")]
+    public async Task<IActionResult> GetExpiringBatches([FromQuery] int days = 60, CancellationToken ct = default)
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var horizon = today.AddDays(Math.Clamp(days, 1, 365));
+
+        var rows = await _db.DrugBatches.AsNoTracking()
+            .Where(b => b.QuantityRemaining > 0 && b.ExpiryDate >= today && b.ExpiryDate <= horizon && !b.IsRecalled)
+            .OrderBy(b => b.ExpiryDate)
+            .Take(100)
+            .Select(b => new
+            {
+                id = b.Id,
+                drugName = b.Drug != null ? b.Drug.Name : "Unknown drug",
+                batchNumber = b.BatchNumber,
+                expiryDate = b.ExpiryDate,
+                quantityRemaining = b.QuantityRemaining
+            })
+            .ToListAsync(ct);
+
+        return Ok(rows.Select(b => new
+        {
+            b.id,
+            b.drugName,
+            b.batchNumber,
+            expiryDate = b.expiryDate.ToString("yyyy-MM-dd"),
+            daysUntilExpiry = b.expiryDate.DayNumber - today.DayNumber,
+            b.quantityRemaining
+        }));
+    }
+
     [HttpPost("drugs/{id:guid}/batches")]
     [AuthorizeRoles("ClinicAdmin", "Pharmacist")]
     public async Task<IActionResult> InwardBatch(Guid id, [FromBody] InwardBatchRequest req, CancellationToken ct)

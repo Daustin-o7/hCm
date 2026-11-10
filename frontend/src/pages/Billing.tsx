@@ -319,6 +319,7 @@ export default function Billing() {
 
   const [activeTab, setActiveTab] = useState<'invoices' | 'daily' | 'outstanding' | 'deposits' | 'expenses' | 'ledger'>('invoices')
   const [invoices, setInvoices] = useState<Invoice[]>([])
+  const [invoiceTotal, setInvoiceTotal] = useState(0)
   const [patients, setPatients] = useState<PatientOption[]>([])
   const [patientAppointments, setPatientAppointments] = useState<AppointmentOption[]>([])
   const [appointmentsLoading, setAppointmentsLoading] = useState(false)
@@ -441,7 +442,8 @@ export default function Billing() {
     const generation = getSessionGeneration()
     try {
       const [invRes, taxRes, dailyRes, duesRes, patientRes] = await Promise.allSettled([
-        api.get('/invoices'),
+        // shortcut: the tab shows the newest 200 invoices only; add server-side paging when a clinic exceeds that.
+        api.get('/invoices?pageSize=200'),
         api.get('/clinic/tax-profile'),
         api.get('/ledger/daily-collection'),
         api.get('/ledger/outstanding-dues'),
@@ -449,7 +451,10 @@ export default function Billing() {
       ])
 
       if (!active.current || generation !== getSessionGeneration()) return
-      if (invRes.status === 'fulfilled') setInvoices(invRes.value.data)
+      if (invRes.status === 'fulfilled') {
+        setInvoices(Array.isArray(invRes.value.data?.items) ? invRes.value.data.items : [])
+        setInvoiceTotal(Number(invRes.value.data?.total) || 0)
+      }
       if (patientRes.status === 'fulfilled') setPatients(patientRes.value.data)
       if (taxRes.status === 'fulfilled') setTaxProfile(taxRes.value.data)
       if (dailyRes.status === 'fulfilled') setDailyCollection(dailyRes.value.data)
@@ -1170,7 +1175,7 @@ export default function Billing() {
           onClick={() => setActiveTab('invoices')}
           className={`btn btn-sm ${activeTab === 'invoices' ? 'btn-primary' : 'btn-ghost'}`}
         >
-          Clinical Invoices ({invoices.length})
+          Clinical Invoices ({invoiceTotal})
         </button>
         <button
           onClick={() => setActiveTab('daily')}

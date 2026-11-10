@@ -381,6 +381,10 @@ public class AppointmentsController : ControllerBase
             .Include(a => a.Doctor)
             .AsQueryable();
 
+        // A doctor's queue is their own patients only. Reception/nursing/admin still see the clinic list.
+        if (membership.Role == UserRole.Doctor)
+            query = query.Where(a => a.DoctorId == membership.UserId);
+
         if (DateOnly.TryParse(date, out var parsedDate))
             query = query.Where(a => a.Date == parsedDate);
 
@@ -414,7 +418,27 @@ public class AppointmentsController : ControllerBase
                 queueTrackingToken = a.QueueTrackingToken,
                 triageReasonCode = a.TriageReasonCode,
                 triageConfirmed = a.TriageConfirmedBy.HasValue,
-                type = a.Type.ToString().ToLower()
+                type = a.Type.ToString().ToLower(),
+                // Only a submitted intake form is a real complaint; a created-but-unsubmitted link is not.
+                chiefComplaint = a.PrecheckSubmission != null && a.PrecheckSubmission.SubmittedAt != null
+                    ? a.PrecheckSubmission.ChiefComplaint
+                    : null,
+                vitalsRecorded = _db.PatientVitals.Any(v => v.AppointmentId == a.Id),
+                vitals = _db.PatientVitals
+                    .Where(v => v.AppointmentId == a.Id)
+                    .OrderByDescending(v => v.RecordedAt)
+                    .Select(v => new
+                    {
+                        systolicBp = v.SystolicBp,
+                        diastolicBp = v.DiastolicBp,
+                        heartRate = v.HeartRate,
+                        spO2 = v.SpO2,
+                        temperature = v.Temperature,
+                        weightKg = v.WeightKg,
+                        allergies = v.Allergies,
+                        bedsideObservations = v.BedsideObservations
+                    })
+                    .FirstOrDefault()
             })
             .ToListAsync(ct);
 
@@ -683,6 +707,42 @@ public class AppointmentsController : ControllerBase
         return Ok(new { message = "valid" });
     }
 
+    /// <summary>FR-23-03 — Today's submitted pre-checks for nurse/doctor review (clinic-scoped).</summary>
+    [HttpGet("precheck-submissions")]
+    [AuthorizeRoles("Nurse", "Doctor", "ClinicAdmin", "Receptionist")]
+    public async Task<IActionResult> ListPrecheckSubmissions([FromQuery] string? date, CancellationToken ct)
+    {
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null) return Forbid();
+
+        var targetDate = DateOnly.TryParse(date, out var parsedDate)
+            ? parsedDate
+            : _timezoneService.GetClinicToday(membership.Clinic?.Timezone);
+
+        var rows = await _db.PrecheckSubmissions.AsNoTracking()
+            .Where(s => s.TenantId == membership.TenantId
+                && s.SubmittedAt != null
+                && s.Appointment.TenantId == membership.TenantId
+                && s.Appointment.ClinicId == membership.ClinicId
+                && s.Appointment.Date == targetDate)
+            .OrderByDescending(s => s.SubmittedAt)
+            .Select(s => new
+            {
+                id = s.Id,
+                appointmentId = s.AppointmentId,
+                patientName = s.Appointment.Patient.Name,
+                queueToken = s.Appointment.QueueToken,
+                submittedAt = s.SubmittedAt,
+                chiefComplaint = s.ChiefComplaint,
+                symptomDuration = s.SymptomDuration,
+                medications = s.Medications,
+                allergies = s.Allergies
+            })
+            .ToListAsync(ct);
+
+        return Ok(rows);
+    }
+
     private Task<TenantMembership?> SelectedMembershipAsync(CancellationToken ct)
     {
         var userId = User.GetUserId();
@@ -690,7 +750,7 @@ public class AppointmentsController : ControllerBase
         var clinicId = User.GetClinicId();
         if (userId is null || tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty ||
             !Enum.TryParse<UserRole>(User.GetUserRole(), out var role) ||
-            role is not (UserRole.Receptionist or UserRole.Doctor or UserRole.ClinicAdmin or UserRole.Nurse))
+            role is not (UserRole.Receptionist or UserRole.Doctor or UserRole.ClinicAdmin or UserRole.Nurse or UserRole.Owner))
             return Task.FromResult<TenantMembership?>(null);
         return _db.TenantMemberships.AsNoTracking().Include(m => m.Clinic).SingleOrDefaultAsync(m =>
             m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active" &&

@@ -979,14 +979,44 @@ static async Task SeedDevelopmentDataAsync(HospitalCrmDbContext db)
         Id = Guid.NewGuid(),
         Email = "doctor@samstack.ai",
         PasswordHash = "DoctorPass123!".HashPassword(),
-        Name = "Dr. Sharma",
+        Name = "Dr. Rajesh Sharma",
         Role = UserRole.Doctor,
+        Specialty = "general",
         ClinicId = clinic.Id,
         TenantId = tenant.Id,
         CreatedAt = DateTimeOffset.UtcNow,
         UpdatedAt = DateTimeOffset.UtcNow
     };
     db.Users.Add(doctor);
+
+    var specialistDocs = new[]
+    {
+        new { Email = "dentist@samstack.ai", Name = "Dr. Sarah Jenkins", Specialty = "dental" },
+        new { Email = "physio@samstack.ai", Name = "Dr. Rajiv Mehta", Specialty = "physiotherapy" },
+        new { Email = "pediatric@samstack.ai", Name = "Dr. Pooja Nair", Specialty = "pediatrics" },
+        new { Email = "ortho@samstack.ai", Name = "Dr. Vikram Seth", Specialty = "orthopedics" },
+        new { Email = "cardio@samstack.ai", Name = "Dr. Aisha Khan", Specialty = "cardiology" },
+        new { Email = "derma@samstack.ai", Name = "Dr. Ananya Rao", Specialty = "dermatology" }
+    };
+    var additionalDoctors = new List<User>();
+    foreach (var spec in specialistDocs)
+    {
+        var specDoc = new User
+        {
+            Id = Guid.NewGuid(),
+            Email = spec.Email,
+            PasswordHash = "DoctorPass123!".HashPassword(),
+            Name = spec.Name,
+            Role = UserRole.Doctor,
+            Specialty = spec.Specialty,
+            ClinicId = clinic.Id,
+            TenantId = tenant.Id,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        db.Users.Add(specDoc);
+        additionalDoctors.Add(specDoc);
+    }
 
     var receptionist = new User
     {
@@ -1048,7 +1078,7 @@ static async Task SeedDevelopmentDataAsync(HospitalCrmDbContext db)
 
     // Section 0: explicit membership rows for every clinic-scoped seed user. The migration
     // backfill only covers users that existed before it ran; a fresh install seeds after.
-    foreach (var clinicUser in new[] { admin, owner, doctor, receptionist, pharmacist, nurse })
+    foreach (var clinicUser in new[] { admin, owner, doctor, receptionist, pharmacist, nurse }.Concat(additionalDoctors))
     {
         db.TenantMemberships.Add(new TenantMembership
         {
@@ -1057,6 +1087,7 @@ static async Task SeedDevelopmentDataAsync(HospitalCrmDbContext db)
             TenantId = tenant.Id,
             ClinicId = clinic.Id,
             Role = clinicUser.Role,
+            Specialty = clinicUser.Specialty,
             IsDefault = true,
             Status = "active",
             CreatedAt = DateTimeOffset.UtcNow,

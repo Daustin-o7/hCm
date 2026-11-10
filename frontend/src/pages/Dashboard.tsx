@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Navigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import ReceptionistDashboard from './dashboards/ReceptionistDashboard'
 import DoctorDashboard from './dashboards/DoctorDashboard'
@@ -24,7 +24,12 @@ export default function Dashboard() {
     return 'clinicadmin'
   }, [user])
 
-  const canSwitchPreview = userActualRole === 'clinicadmin' || userActualRole === 'platformadmin'
+  // Platform staff have no clinic membership: the clinic dashboard would render five 403s.
+  if (userActualRole === 'platformadmin') {
+    return <Navigate to="/dashboard/platform-admin" replace />
+  }
+
+  const canSwitchPreview = userActualRole === 'clinicadmin'
 
   // Admin or testing preview switcher state derived from URL
   const previewParam = canSwitchPreview ? (searchParams.get('previewRole') as AppRole | null) : null
@@ -61,7 +66,7 @@ export default function Dashboard() {
               Role Perspective Switcher:
             </span>
             <span className="text-slate-400 text-[11px]">
-              (Preview how each clinical team member experiences their operational dashboard)
+              (Layout preview only — data is fetched with your Clinic Admin permissions, so queues are not role-scoped)
             </span>
           </div>
 
@@ -99,7 +104,7 @@ export default function Dashboard() {
       {activeRole === 'doctor' && <DoctorDashboard />}
       {activeRole === 'pharmacist' && <PharmacistDashboard />}
       {activeRole === 'nurse' && <NurseDashboard />}
-      {(activeRole === 'clinicadmin' || activeRole === 'platformadmin') && <AdminDashboard />}
+      {(activeRole === 'clinicadmin') && <AdminDashboard />}
     </div>
   )
 }

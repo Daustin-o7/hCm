@@ -327,7 +327,8 @@ public class StaffController : ControllerBase
             return Forbid();
 
         var staff = await _db.TenantMemberships
-            .Where(m => m.TenantId == membership.TenantId && m.ClinicId == membership.ClinicId && m.Role != UserRole.PlatformAdmin)
+            .Where(m => m.TenantId == membership.TenantId && m.ClinicId == membership.ClinicId
+                && m.Status == "active" && m.Role != UserRole.PlatformAdmin)
             .OrderBy(m => m.User.Name)
             .Select(m => new
             {
@@ -353,7 +354,7 @@ public class StaffController : ControllerBase
             return Task.FromResult<TenantMembership?>(null);
         return _db.TenantMemberships.AsNoTracking().SingleOrDefaultAsync(m =>
             m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active"
-            && m.Role == UserRole.ClinicAdmin && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
+            && (m.Role == UserRole.ClinicAdmin || m.Role == UserRole.Owner) && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
     }
 }
 

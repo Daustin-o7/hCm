@@ -5,6 +5,7 @@ import { useAuth } from '../../context/AuthContext'
 import { useBranding } from '../../context/BrandingContext'
 import { Skeleton } from '../../components/ui/EmptyState'
 import { CLINICAL_SPECIALTIES } from '../../constants/clinicalSpecialties'
+import { getTodayDateString } from '../../utils/timezone'
 
 interface DoctorPatientAppt {
   id: string
@@ -30,23 +31,6 @@ interface LabAlert {
   orderedDate: string
 }
 
-// Development-only demo fallbacks. Kept out of production builds: each literal is the
-// true branch of a condition that compiles to `false`, so the bundler drops it entirely.
-const DEMO_QUEUE: DoctorPatientAppt[] = import.meta.env.DEV
-  ? [
-      { id: 'apt-1', patientId: 'pat-1', tokenNumber: 'A-01', rawToken: 1, patientName: 'Aarav Sharma', age: 38, gender: 'Male', complaint: 'Severe throbbing lower molar pain aggravated by hot liquids', time: '09:30', status: 'waiting', priority: 'normal' },
-      { id: 'apt-2', patientId: 'pat-2', tokenNumber: 'A-02', rawToken: 2, patientName: 'Priya Patel', age: 29, gender: 'Female', complaint: 'Low back stiffness radiating to left calf x 10 days', time: '10:00', status: 'waiting', priority: 'normal' },
-      { id: 'apt-3', patientId: 'pat-3', tokenNumber: 'A-03', rawToken: 3, patientName: 'Rohan Gupta', age: 52, gender: 'Male', complaint: 'Hypertension follow-up with episodic morning dizziness', time: '10:30', status: 'scheduled', priority: 'normal' },
-      { id: 'apt-4', patientId: 'pat-4', tokenNumber: 'A-04', rawToken: 4, patientName: 'Ananya Deshmukh', age: 8, gender: 'Female', complaint: 'Acute high fever (102°F) with dry cough for 3 days', time: '11:00', status: 'waiting', priority: 'emergency' },
-    ]
-  : []
-
-const DEMO_LAB_ALERTS: LabAlert[] = import.meta.env.DEV
-  ? [
-      { id: 'lab-1', patientName: 'Ramesh Verma', testName: 'Hemoglobin & Hematocrit', resultValue: 'Hb 7.2 g/dL', referenceRange: '13.0 - 17.0 g/dL', isCritical: true, orderedDate: 'Today, 08:45 AM' },
-      { id: 'lab-2', patientName: 'Sunita Mehra', testName: 'Serum Potassium (K+)', resultValue: '5.8 mEq/L', referenceRange: '3.5 - 5.0 mEq/L', isCritical: true, orderedDate: 'Today, 09:15 AM' },
-    ]
-  : []
 
 export default function DoctorDashboard() {
   const { user } = useAuth()
@@ -80,28 +64,19 @@ export default function DoctorDashboard() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [navigate])
 
-  const fetchDoctorData = useCallback(async () => {
-    setLoading(true)
+  const fetchDoctorData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
-      const todayISO = new Date().toISOString().split('T')[0]
+      const todayISO = getTodayDateString(branding.timezone)
       const [apptRes, labRes] = await Promise.allSettled([
         api.get(`/appointments?date=${todayISO}`),
-        // Skip the call when the tenant has no lab module: it would 403 and fall back to demo alerts.
+        // Skip the call when the tenant has no lab module: it would 403.
         labEnabled ? api.get('/lab-orders') : Promise.resolve({ data: [] as unknown[] }),
       ])
 
       if (apptRes.status === 'fulfilled' && Array.isArray(apptRes.value.data)) {
-        const raw = apptRes.value.data
-        const doctorName = user?.name || ''
-        
-        // Filter by logged-in doctor if named, or fallback to all for demonstration
-        const filtered = raw.filter((a: any) => {
-          if (!doctorName || doctorName.toLowerCase().includes('admin')) return true
-          const aDoc = (a.doctorName || a.doctor?.name || '').toLowerCase()
-          return aDoc.includes(doctorName.toLowerCase().replace('dr. ', ''))
-        })
-
-        const mapped: DoctorPatientAppt[] = (filtered.length > 0 ? filtered : raw).map((a: any) => {
+        // The API already scopes a doctor to their own appointments; no client-side fallback.
+        const mapped: DoctorPatientAppt[] = apptRes.value.data.map((a: any) => {
           const s = (a.status || 'scheduled').toLowerCase()
           let status: DoctorPatientAppt['status'] = 'scheduled'
           if (s === 'checked_in' || s === 'checkedin' || s === 'waiting') status = 'waiting'
@@ -113,44 +88,59 @@ export default function DoctorDashboard() {
             patientId: a.patientId,
             tokenNumber: a.queueToken ? `A-${String(a.queueToken).padStart(2, '0')}` : a.time || '—',
             rawToken: a.queueToken ?? null,
-            patientName: a.patientName || a.patient?.name || 'Patient',
-            age: a.patient?.approxAge || 34,
-            gender: a.patient?.gender || 'Adult',
-            complaint: a.complaint || 'Routine OPD consultation and clinical review',
-            time: a.time || '09:00',
+            patientName: a.patientName || 'Patient',
+            age: a.patientAge ?? undefined,
+            gender: a.patientGender || undefined,
+            complaint: a.chiefComplaint || undefined,
+            time: a.time || '—',
             status,
             priority: a.priority === 'emergency' ? 'emergency' : 'normal',
           }
         })
         setAppointments(mapped)
       } else {
-        setAppointments(DEMO_QUEUE)
+        setAppointments([])
       }
 
       if (labRes.status === 'fulfilled' && Array.isArray(labRes.value.data)) {
-        setLabAlerts(labRes.value.data.slice(0, 3).map((l: any) => ({
-          id: l.id || l.orderId,
-          patientName: l.patientName || 'Patient',
-          testName: l.testName || 'Complete Blood Count (CBC)',
-          resultValue: l.result || 'Hb: 8.4 g/dL (Low)',
-          referenceRange: '12.0 - 16.0 g/dL',
-          isCritical: true,
-          orderedDate: 'Today, 08:30 AM',
-        })))
+        // Only a real, latest, abnormal, not-yet-reviewed result is a critical alert.
+        const alerts: LabAlert[] = labRes.value.data
+          .filter((l: any) => l.latestResult && (l.latestResult.isAbnormal || l.isAbnormal) && !l.doctorReviewedAt)
+          .slice(0, 3)
+          .map((l: any) => ({
+            id: l.id,
+            patientName: l.patientName || 'Patient',
+            testName: l.testName,
+            resultValue: [l.latestResult.resultText, l.latestResult.units].filter(Boolean).join(' ') || 'Abnormal result',
+            referenceRange: l.latestResult.referenceRange || '—',
+            isCritical: true,
+            orderedDate: l.latestResult.enteredAt
+              ? new Date(l.latestResult.enteredAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+              : '—',
+          }))
+        setLabAlerts(alerts)
       } else {
-        setLabAlerts(DEMO_LAB_ALERTS)
+        setLabAlerts([])
       }
     } catch {
-      // Fallback
+      setAppointments([])
+      setLabAlerts([])
     } finally {
       setLoading(false)
     }
-  }, [user, labEnabled])
+  }, [labEnabled, branding.timezone])
 
   useEffect(() => {
     // Wait for entitlements: the first pass would otherwise call a gated endpoint blind.
     if (brandingLoading) return
     fetchDoctorData()
+  }, [fetchDoctorData, brandingLoading])
+
+  // A queue moves while the page is open; refresh without a manual reload.
+  useEffect(() => {
+    if (brandingLoading) return
+    const timer = setInterval(() => fetchDoctorData(true), 60_000)
+    return () => clearInterval(timer)
   }, [fetchDoctorData, brandingLoading])
 
   const waitingPatients = useMemo(() => {
@@ -413,14 +403,14 @@ export default function DoctorDashboard() {
                     {nextPatient.patientName}
                   </h3>
                   <span className="text-xs text-[var(--color-text-muted)] font-medium">
-                    ({nextPatient.age} yrs • {nextPatient.gender})
+                    ({nextPatient.age ?? '—'} yrs • {nextPatient.gender || '—'})
                   </span>
                   {nextPatient.priority === 'emergency' && (
                     <span className="badge badge-danger text-[10px] animate-pulse">EMERGENCY PRIORITY</span>
                   )}
                 </div>
                 <p className="text-xs text-[var(--color-text-secondary)] mt-0.5">
-                  <span className="font-semibold text-teal-700 dark:text-teal-300">Presenting Complaint:</span> {nextPatient.complaint}
+                  <span className="font-semibold text-teal-700 dark:text-teal-300">Presenting Complaint:</span> {nextPatient.complaint || 'Not recorded at intake'}
                 </p>
               </div>
             </div>
@@ -502,14 +492,14 @@ export default function DoctorDashboard() {
                       </td>
                       <td>
                         <div className="font-bold text-[var(--color-text)]">{item.patientName}</div>
-                        <div className="text-[10px] text-[var(--color-text-muted)]">{item.age} yrs • {item.gender}</div>
+                        <div className="text-[10px] text-[var(--color-text-muted)]">{item.age ?? '—'} yrs • {item.gender || '—'}</div>
                       </td>
                       <td>
                         <span className="mono font-semibold">{item.time}</span>
                       </td>
                       <td>
-                        <div className="max-w-xs truncate text-[11px] text-[var(--color-text-secondary)]" title={item.complaint}>
-                          {item.complaint}
+                        <div className="max-w-xs truncate text-[11px] text-[var(--color-text-secondary)]" title={item.complaint || ''}>
+                          {item.complaint || '—'}
                         </div>
                       </td>
                       <td>
@@ -572,6 +562,11 @@ export default function DoctorDashboard() {
           </div>
 
           <div className="space-y-3">
+            {labAlerts.length === 0 && (
+              <div className="p-4 rounded-xl border border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-muted)]">
+                No abnormal lab results awaiting review.
+              </div>
+            )}
             {labAlerts.map(alert => (
               <div
                 key={alert.id}

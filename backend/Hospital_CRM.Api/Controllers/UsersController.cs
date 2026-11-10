@@ -39,7 +39,8 @@ public class UsersController : ControllerBase
                 id = u.Id,
                 name = u.Name,
                 email = u.Email,
-                role = u.Role.ToString()
+                role = u.Role.ToString(),
+                specialty = u.Specialty
             })
             .ToListAsync(ct);
 
