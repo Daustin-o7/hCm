@@ -24,6 +24,7 @@ public static class AuthEvent
     public const string RoleChanged = "role_changed";
     public const string RoleGranted = "role_granted";
     public const string BreakGlass = "break_glass_access";
+    public const string SigningCredentialsUpdated = "signing_credentials_updated";
 }
 
 public static class AuthAudit

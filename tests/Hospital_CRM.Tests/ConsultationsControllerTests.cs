@@ -206,4 +206,87 @@ public class ConsultationsControllerTests
         Assert.Null(consultation.SignedAt);
         Assert.NotNull(consultation.UpdatedAt);
     }
+
+    // Legacy/seed data can leave two drafts on one appointment. Finalize must sign the newest one,
+    // not whichever row the query happened to return first.
+    [Fact]
+    public async Task FinalizeConsultation_WithTwoDrafts_SignsTheNewest()
+    {
+        var db = CreateInMemoryDb();
+        var doctorId = Guid.NewGuid();
+        var clinicId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+
+        db.Tenants.Add(new Tenant { Id = tenantId, Name = "Synthetic clinic tenant" });
+        db.Clinics.Add(new Clinic { Id = clinicId, TenantId = tenantId, Name = "Synthetic clinic" });
+        db.Users.Add(new User
+        {
+            Id = doctorId,
+            Name = "Dr. Test",
+            Role = UserRole.Doctor,
+            ClinicId = clinicId,
+            TenantId = tenantId,
+            Email = "dr.test@samstack.ai",
+            PasswordHash = "hash"
+        });
+        var patient = new Patient
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenantId,
+            Name = "Patient One",
+            Phone = "9988776655",
+            ApproxAge = 30,
+            CreatedBy = doctorId
+        };
+        db.Patients.Add(patient);
+        var appointment = new Appointment
+        {
+            Id = Guid.NewGuid(),
+            DoctorId = doctorId,
+            PatientId = patient.Id,
+            ClinicId = clinicId,
+            TenantId = tenantId,
+            Date = DateOnly.FromDateTime(DateTime.UtcNow),
+            TimeSlot = "10:30",
+            Status = AppointmentStatus.CheckedIn,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.Appointments.Add(appointment);
+        db.TenantMemberships.Add(new TenantMembership
+        {
+            UserId = doctorId, TenantId = tenantId, ClinicId = clinicId, Role = UserRole.Doctor,
+            RegistrationNumber = "TEST-REG", Qualifications = "TEST-QUAL"
+        });
+
+        var older = new Consultation
+        {
+            Id = Guid.NewGuid(), AppointmentId = appointment.Id, DoctorId = doctorId,
+            Status = ConsultationStatus.Draft, Version = 1, ChiefComplaint = "Older draft",
+            TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddHours(-2),
+            UpdatedAt = DateTimeOffset.UtcNow.AddHours(-1)
+        };
+        var newest = new Consultation
+        {
+            Id = Guid.NewGuid(), AppointmentId = appointment.Id, DoctorId = doctorId,
+            Status = ConsultationStatus.Draft, Version = 2, ChiefComplaint = "Newest draft",
+            TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        db.Consultations.AddRange(older, newest);
+        await db.SaveChangesAsync();
+
+        var controller = CreateController(db, doctorId, tenantId, clinicId);
+        var request = new FinalizeConsultationRequest(
+            ChiefComplaint: "Newest draft", Observations: null, Diagnosis: "Viral fever",
+            AdvisedInvestigations: null, IcdCode: null, IcdTitle: null, FollowUpDate: null,
+            FollowUpNotes: null, TemplateId: null, TemplateVersion: null,
+            StructuredObservationsJson: null, PrescriptionItems: null, OrderedLabTests: null,
+            ExpectedConsultationId: newest.Id, ExpectedVersion: 2, ExpectedUpdatedAt: newest.UpdatedAt);
+
+        var result = await controller.FinalizeConsultation(appointment.Id, request, CancellationToken.None);
+
+        Assert.IsType<OkObjectResult>(result);
+        Assert.Equal(ConsultationStatus.Finalized, newest.Status);
+        Assert.Equal(ConsultationStatus.Draft, older.Status);
+    }
 }

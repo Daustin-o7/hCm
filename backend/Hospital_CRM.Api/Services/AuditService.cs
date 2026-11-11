@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -55,9 +56,9 @@ public static class AuditService
                         Id = Guid.NewGuid(),
                         PatientId = entityGuid,
                         ChangedBy = userId,
-                        FieldName = prop.Metadata.Name,
-                        OldValue = prop.OriginalValue?.ToString() ?? string.Empty,
-                        NewValue = prop.CurrentValue?.ToString() ?? string.Empty,
+                        FieldName = JsonNamingPolicy.CamelCase.ConvertName(prop.Metadata.Name),
+                        OldValue = prop.OriginalValue is DateOnly oldDate ? oldDate.ToString("yyyy-MM-dd") : prop.OriginalValue?.ToString() ?? string.Empty,
+                        NewValue = prop.CurrentValue is DateOnly newDate ? newDate.ToString("yyyy-MM-dd") : prop.CurrentValue?.ToString() ?? string.Empty,
                         ChangedAt = DateTimeOffset.UtcNow
                     });
                 }

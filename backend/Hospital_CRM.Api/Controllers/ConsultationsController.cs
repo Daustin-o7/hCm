@@ -350,9 +350,11 @@ public class ConsultationsController : ControllerBase
         if (appointment.Status is AppointmentStatus.Completed or AppointmentStatus.Cancelled or AppointmentStatus.NoShow)
             return Conflict(new { error = "appointment_closed", status = appointment.Status.ToString() });
 
-        // Find existing draft or create new
+        // Find existing draft or create new. Newest wins when legacy data left several behind.
         var draft = await _db.Consultations
             .Include(c => c.Prescriptions).ThenInclude(p => p.Items)
+            .OrderByDescending(c => c.Version)
+            .ThenByDescending(c => c.UpdatedAt)
             .FirstOrDefaultAsync(c => c.AppointmentId == appointmentId && c.Status == ConsultationStatus.Draft, ct);
 
         if (draft is not null && draft.DoctorId != doctorId.Value) return Forbid();
@@ -494,6 +496,10 @@ public class ConsultationsController : ControllerBase
         var patient = appointment.Patient;
         var consultation = await _db.Consultations
             .Include(c => c.Prescriptions).ThenInclude(p => p.Items)
+            // More than one draft can exist (seed or legacy data). The newest is the one the doctor
+            // last saved; picking "first" signed whichever row the database happened to return.
+            .OrderByDescending(c => c.Version)
+            .ThenByDescending(c => c.UpdatedAt)
             .FirstOrDefaultAsync(c => c.AppointmentId == appointmentId && c.Status == ConsultationStatus.Draft, ct);
         if (consultation is not null && consultation.DoctorId != doctorId.Value) return Forbid();
 

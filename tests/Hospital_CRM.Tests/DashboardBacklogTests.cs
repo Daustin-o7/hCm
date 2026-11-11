@@ -172,6 +172,27 @@ public class DashboardBacklogTests
     }
 
     [Fact]
+    public async Task CallPatient_PersistsCallAndRejectsTerminalVisit()
+    {
+        using var db = CreateInMemoryDb();
+        var (doctor, _, patient) = await SeedAsync(db);
+        var appointment = AddAppointment(db, doctor, patient, "09:00");
+        var finished = AddAppointment(db, doctor, patient, "09:30");
+        finished.Status = AppointmentStatus.Completed;
+        await db.SaveChangesAsync();
+
+        var called = await Appointments(db, doctor.Id, "Doctor").CallPatient(appointment.Id, CancellationToken.None);
+        Assert.IsType<OkObjectResult>(called);
+
+        var stored = await db.Appointments.AsNoTracking().FirstAsync(a => a.Id == appointment.Id);
+        Assert.NotNull(stored.CalledAt);
+        Assert.Equal(doctor.Id, stored.CalledByUserId);
+
+        var refused = await Appointments(db, doctor.Id, "Doctor").CallPatient(finished.Id, CancellationToken.None);
+        Assert.IsType<ConflictObjectResult>(refused);
+    }
+
+    [Fact]
     public async Task LabWorklist_ReturnsOnlyLatestResultVersion()
     {
         using var db = CreateInMemoryDb();

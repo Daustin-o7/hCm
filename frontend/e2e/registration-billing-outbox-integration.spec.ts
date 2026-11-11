@@ -76,9 +76,15 @@ async function openHarness(page: Page, kind: Kind) {
     }
     if (request.method() !== 'GET') return undefined
     const own = [...evidence].filter(([key]) => key.startsWith(`${owner}/`)).map(([, value]) => value)
-    if (path === '/patients') return { json: [{ id: ids.patient, name: 'Existing patient', phone: '9876543210', createdAt: savedAt },
-      ...own.filter(value => 'uhid' in value)] }
-    if (path === '/invoices') return { json: own.filter(value => 'invoiceId' in value) }
+    if (path === '/patients' || path === '/patients/paged') {
+      const items = [{ id: ids.patient, name: 'Existing patient', phone: '9876543210', createdAt: savedAt },
+        ...own.filter(value => 'uhid' in value)]
+      return { json: path === '/patients' ? items : { items, total: items.length, page: 1, pageSize: 50 } }
+    }
+    if (path === '/invoices') {
+      const items = own.filter(value => 'invoiceId' in value)
+      return { json: { items, total: items.length, page: 1, pageSize: 50 } }
+    }
     const proof = evidence.get(`${owner}/${path.split('/').at(-1)}`)
     if (proof) return { json: proof }
     if (path === '/appointments') return { json: [{ appointmentId: ids.visit, patientId: ids.patient,

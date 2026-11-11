@@ -30,6 +30,7 @@ interface QueueAppointment {
   triageReasonCode?: string
   triageConfirmed?: boolean
   trackingToken?: string | null
+  calledAt?: string | null
 }
 
 interface PriorityLogEntry {
@@ -71,8 +72,6 @@ export default function Queue() {
   const [reasonError, setReasonError] = useState('')
   const [saving, setSaving] = useState(false)
 
-  const [callingToken, setCallingToken] = useState<string | null>(null)
-
   const fetchQueue = useCallback(async (quiet = false) => {
     try {
       if (!quiet) setLoading(true)
@@ -88,6 +87,7 @@ export default function Queue() {
         status: mapStatus(a.status),
         priority: a.priority === 'emergency' ? 'emergency' : 'normal',
         trackingToken: a.queueTrackingToken ?? null,
+        calledAt: a.calledAt ?? null,
       })))
     } catch (err) {
       if (!quiet) setError(friendlyError(err))
@@ -112,11 +112,22 @@ export default function Queue() {
     setModalOpen(true)
   }
 
-  const handleCallPatient = (patient: QueueAppointment) => {
-    setCallingToken(patient.tokenNumber)
-    toast(`Calling Token ${patient.tokenNumber}: ${patient.patientName} to ${patient.doctorName}'s room.`)
-    setTimeout(() => setCallingToken(null), 6000)
+  const handleCallPatient = async (patient: QueueAppointment) => {
+    try {
+      await api.post(`/appointments/${patient.id}/call`)
+      toast(`Calling Token ${patient.tokenNumber}: ${patient.patientName} to ${patient.doctorName}'s room.`)
+      fetchQueue(true)
+    } catch (err) {
+      toast(friendlyError(err))
+    }
   }
+
+  // The board shows the most recent persisted call, so it survives reloads and other desks see it.
+  const nowServing = useMemo(() => {
+    const called = appointments.filter(a => a.calledAt)
+    if (called.length === 0) return null
+    return called.reduce((latest, a) => (a.calledAt! > latest.calledAt! ? a : latest))
+  }, [appointments])
 
   const handleTransitionStatus = async (patient: QueueAppointment, newStatus: string) => {
     try {
@@ -247,6 +258,15 @@ export default function Queue() {
         </div>
 
         <div className="flex items-center gap-2.5">
+          <a
+            href="/queue-display"
+            target="_blank"
+            rel="noreferrer"
+            className="btn btn-ghost text-xs"
+            title="Open the waiting-room token board in a new tab"
+          >
+            🖥️ Display Board
+          </a>
           <button
             type="button"
             className="btn btn-primary text-xs"
@@ -257,17 +277,21 @@ export default function Queue() {
         </div>
       </div>
 
-      {/* Calling Banner */}
-      {callingToken && (
-        <div className="p-4 rounded-xl bg-[var(--brand-primary)] text-white font-bold flex items-center justify-between shadow-lg border border-[var(--brand-primary-hover)] animate-bounce">
+      {/* Calling Banner — last persisted call for today */}
+      {nowServing && (
+        <div className="p-4 rounded-xl bg-[var(--brand-primary)] text-white font-bold flex items-center justify-between shadow-lg border border-[var(--brand-primary-hover)]">
           <div className="flex items-center gap-3">
             <span className="text-2xl">📢</span>
             <div>
-              <div className="text-base tracking-wide">NOW CALLING: TOKEN {callingToken}</div>
-              <div className="text-xs font-normal opacity-90">Please proceed to the designated consultation room.</div>
+              <div className="text-base tracking-wide">NOW CALLING: TOKEN {nowServing.tokenNumber}</div>
+              <div className="text-xs font-normal opacity-90">
+                {nowServing.patientName} · {nowServing.doctorName}'s room
+              </div>
             </div>
           </div>
-          <span className="badge bg-white text-teal-800 font-mono text-xs">Announcing</span>
+          <span className="badge bg-white text-teal-800 font-mono text-xs">
+            {new Date(nowServing.calledAt!).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+          </span>
         </div>
       )}
 

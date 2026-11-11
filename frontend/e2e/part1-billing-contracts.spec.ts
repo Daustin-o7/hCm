@@ -17,7 +17,10 @@ async function openBilling(page: Page, handle: (path: string, request: Request) 
     const reply = handle(path, request)
     if (reply) return reply
     if (request.method() !== 'GET') return undefined
-    if (path === '/invoices') return { json: options.invoices ?? [invoice] }
+    if (path === '/invoices') {
+      const items = options.invoices ?? [invoice]
+      return { json: { items, total: items.length, page: 1, pageSize: 50 } }
+    }
     if (path === `/invoices/${ids.invoice}`) return { json: { ...invoice, payments: options.payments ?? [], refundableAmount: options.refundableAmount ?? 0 } }
     if (path === '/patients') return { json: [{ id: ids.patient, name: 'Test patient', phone: '9876543210' }] }
     if (path === '/appointments') return { json: [{ appointmentId: ids.visit, patientId: ids.patient, doctorName: 'Test doctor', date: '2026-11-06', time: '10:00', status: 'completed' }] }
@@ -322,7 +325,10 @@ async function openInvoiceCreation(page: Page, reply: (item: SyncItem, attempt: 
   const items: SyncItem[] = []
   const evidence = new Map<string, Record<string, unknown>>()
   const unexpected = await openBilling(page, (path, request) => {
-    if (path === '/invoices' && request.method() === 'GET') return { json: [invoice, ...evidence.values()] }
+    if (path === '/invoices' && request.method() === 'GET') {
+      const items = [invoice, ...evidence.values()]
+      return { json: { items, total: items.length, page: 1, pageSize: 50 } }
+    }
     if (path.startsWith('/invoices/') && request.method() === 'GET' && evidence.has(path.slice('/invoices/'.length))) {
       return { json: evidence.get(path.slice('/invoices/'.length)) }
     }

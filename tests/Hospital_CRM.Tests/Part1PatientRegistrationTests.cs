@@ -60,7 +60,7 @@ public class Part1PatientRegistrationTests
         var request = Adult() with { WhatsAppOptIn = true };
         await controller.Register(request, Ct);
         var patient = await db.Patients.SingleAsync();
-        Assert.IsType<OkObjectResult>(await controller.Patch(patient.Id, new("Corrected name", null, null, null, "Corrected address"), Ct));
+        Assert.IsType<OkObjectResult>(await controller.Patch(patient.Id, new("Corrected name", null, null, null, null, "Corrected address"), Ct));
         var consent = await db.PatientConsents.SingleAsync(c => c.Purpose == "care_delivery");
         await controller.WithdrawConsent(patient.Id, consent.Id, Ct);
         var auditCount = await db.PatientAuditLogs.CountAsync();
@@ -228,8 +228,47 @@ public class Part1PatientRegistrationTests
         }
         finally { release.TrySetResult(); }
         var body = Body(await registration);
-        await controller.Patch(body.GetProperty("patientId").GetGuid(), new("Corrected name", null, null, null, null), Ct);
+        await controller.Patch(body.GetProperty("patientId").GetGuid(), new("Corrected name", null, null, null, null, null), Ct);
         Assert.Equal(new[] { "Synthetic adult", "Corrected name" }, indexedNames);
+    }
+
+    [Fact]
+    public async Task Patch_ApproximateAgeReplacesDob_AndEveryChangedFieldIsAudited()
+    {
+        await using var db = MemoryDb();
+        var controller = Controller(db);
+        await controller.Register(Adult() with { Dob = new DateOnly(1996, 1, 1), ApproxAge = null, Address = "Old address" }, Ct);
+        var patient = await db.Patients.SingleAsync();
+
+        Assert.IsType<OkObjectResult>(await controller.Patch(patient.Id,
+            new("Corrected name", "9876543211", null, 31, "female", ""), Ct));
+        db.ChangeTracker.Clear();
+        patient = await db.Patients.SingleAsync();
+        Assert.Null(patient.Dob);
+        Assert.False(patient.DobHasValue);
+        Assert.Equal(31, patient.ApproxAge);
+        Assert.Equal("", patient.Address);
+        var logs = await db.PatientAuditLogs.Where(a => a.FieldName != "REGISTRATION_REQUEST_V1").ToListAsync();
+        foreach (var field in new[] { "name", "phone", "dob", "dobHasValue", "approxAge", "gender", "address" })
+            Assert.Single(logs, a => a.FieldName == field);
+        Assert.Equal("1996-01-01", logs.Single(a => a.FieldName == "dob").OldValue);
+        Assert.Equal("", logs.Single(a => a.FieldName == "dob").NewValue);
+    }
+
+    [Fact]
+    public async Task Patch_FutureDobMakesNoDemographicOrAuditChanges()
+    {
+        await using var db = MemoryDb();
+        var controller = Controller(db);
+        await controller.Register(Adult(), Ct);
+        var patient = await db.Patients.SingleAsync();
+        var audits = await db.PatientAuditLogs.CountAsync();
+
+        Assert.IsType<BadRequestObjectResult>(await controller.Patch(patient.Id,
+            new("Changed name", null, new DateOnly(9999, 1, 1), null, null, null), Ct));
+        db.ChangeTracker.Clear();
+        Assert.Equal("Synthetic adult", (await db.Patients.SingleAsync()).Name);
+        Assert.Equal(audits, await db.PatientAuditLogs.CountAsync());
     }
 
     private sealed class RecordingSearch(Func<Patient, Task> index) : FakePatientSearchService

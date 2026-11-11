@@ -320,6 +320,7 @@ export default function Billing() {
   const [activeTab, setActiveTab] = useState<'invoices' | 'daily' | 'outstanding' | 'deposits' | 'expenses' | 'ledger'>('invoices')
   const [invoices, setInvoices] = useState<Invoice[]>([])
   const [invoiceTotal, setInvoiceTotal] = useState(0)
+  const [invoicePage, setInvoicePage] = useState(1)
   const [patients, setPatients] = useState<PatientOption[]>([])
   const [patientAppointments, setPatientAppointments] = useState<AppointmentOption[]>([])
   const [appointmentsLoading, setAppointmentsLoading] = useState(false)
@@ -442,8 +443,7 @@ export default function Billing() {
     const generation = getSessionGeneration()
     try {
       const [invRes, taxRes, dailyRes, duesRes, patientRes] = await Promise.allSettled([
-        // shortcut: the tab shows the newest 200 invoices only; add server-side paging when a clinic exceeds that.
-        api.get('/invoices?pageSize=200'),
+        api.get(`/invoices?page=${invoicePage}&pageSize=50`),
         api.get('/clinic/tax-profile'),
         api.get('/ledger/daily-collection'),
         api.get('/ledger/outstanding-dues'),
@@ -464,7 +464,7 @@ export default function Billing() {
     } finally {
       if (active.current && generation === getSessionGeneration()) setLoading(false)
     }
-  }, [])
+  }, [invoicePage])
 
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect
@@ -530,6 +530,17 @@ export default function Billing() {
       }
     }
   }
+
+  // Support preselecting patient when navigated from Patients page (/dashboard/patients)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const patientParam = params.get('patientId')
+    if (patientParam) {
+      setValue('patientId', patientParam)
+      void handleSelectPatient(patientParam)
+      setCreateModalOpen(true)
+    }
+  }, [setValue])
 
   // Create Invoice Handler
   const handleCreateInvoice = async (data?: InvoiceForm) => {
@@ -1371,6 +1382,17 @@ export default function Billing() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+          {invoiceTotal > 50 && (
+            <div className="flex items-center justify-between gap-3 pt-4 border-t border-[var(--color-border)] mt-4">
+              <span className="text-xs text-[var(--color-text-muted)]">
+                Page {invoicePage} of {Math.max(1, Math.ceil(invoiceTotal / 50))} · {invoiceTotal} invoices
+              </span>
+              <div className="flex items-center gap-2">
+                <button className="btn btn-ghost btn-sm" disabled={invoicePage <= 1} onClick={() => setInvoicePage(p => p - 1)}>Previous</button>
+                <button className="btn btn-ghost btn-sm" disabled={invoicePage >= Math.ceil(invoiceTotal / 50)} onClick={() => setInvoicePage(p => p + 1)}>Next</button>
+              </div>
             </div>
           )}
         </div>

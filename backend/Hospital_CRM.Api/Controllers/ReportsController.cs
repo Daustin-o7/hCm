@@ -1,6 +1,7 @@
 using Hospital_CRM.Api.Authorization;
 using Hospital_CRM.Api.Extensions;
 using Hospital_CRM.Api.Services;
+using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Entities;
 using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Domain.Utils;
@@ -21,7 +22,7 @@ public class ReportsController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
     private readonly ITimezoneService _timezone;
-    private const string AccountingTimezone = "Asia/Kolkata";
+    private const string AccountingTimezone = AccountingTimezones.Kolkata;
 
     public ReportsController(HospitalCrmDbContext db, ITimezoneService? timezone = null)
     {

@@ -298,7 +298,8 @@ public class PatientSearchService : IPatientSearchService
             var lowerQuery = query.Trim().ToLowerInvariant();
             var matches = await _db.Patients.AsNoTracking()
                 .Where(p => p.TenantId == tenantId
-                         && (p.Name.ToLower().Contains(lowerQuery) || p.Phone.Contains(query) || candidates.Contains(p.Id)))
+                         && (p.Name.ToLower().Contains(lowerQuery) || p.Phone.Contains(query)
+                             || (p.Uhid != null && p.Uhid.Contains(query)) || candidates.Contains(p.Id)))
                 .OrderByDescending(p => p.Name.ToLower().Contains(lowerQuery) || p.Phone.Contains(query))
                 .ThenByDescending(p => p.CreatedAt).ThenBy(p => p.Id)
                 .Take(limit)

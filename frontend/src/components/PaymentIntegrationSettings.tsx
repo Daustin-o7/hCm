@@ -260,8 +260,8 @@ function UnmatchedRow({ row, onMatched }: { row: UnmatchedPayment; onMatched: ()
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    api.get('/invoices', { params: { status: 'Issued' } })
-      .then(res => setInvoices(Array.isArray(res.data) ? res.data : []))
+    api.get('/invoices', { params: { status: 'Issued', pageSize: 200 } })
+      .then(res => setInvoices(Array.isArray(res.data?.items) ? res.data.items : []))
       .catch(() => setInvoices([]))
   }, [])
 

@@ -418,6 +418,8 @@ public class AppointmentsController : ControllerBase
                 queueTrackingToken = a.QueueTrackingToken,
                 triageReasonCode = a.TriageReasonCode,
                 triageConfirmed = a.TriageConfirmedBy.HasValue,
+                calledAt = a.CalledAt,
+                calledByUserId = a.CalledByUserId,
                 type = a.Type.ToString().ToLower(),
                 // Only a submitted intake form is a real complaint; a created-but-unsubmitted link is not.
                 chiefComplaint = a.PrecheckSubmission != null && a.PrecheckSubmission.SubmittedAt != null
@@ -564,6 +566,43 @@ public class AppointmentsController : ControllerBase
             triageConfirmed = appointment.TriageConfirmedBy.HasValue,
             hospitalReferralAdvisory = referralWarning,
             unchanged = false
+        });
+    }
+
+    /// <summary>Records that staff called this patient forward; the waiting-room display reads the last call.</summary>
+    [HttpPost("{id:guid}/call")]
+    [AuthorizeRoles("Receptionist", "Doctor", "ClinicAdmin", "Nurse")]
+    public async Task<IActionResult> CallPatient(Guid id, CancellationToken ct)
+    {
+        var membership = await SelectedMembershipAsync(ct);
+        if (membership is null) return Forbid();
+
+        var appointment = await SelectedAppointments(membership)
+            .Include(a => a.Patient)
+            .Include(a => a.Doctor)
+            .FirstOrDefaultAsync(a => a.Id == id, ct);
+        if (appointment is null)
+            return NotFound(new { error = "appointment_not_found" });
+
+        // Calling a finished or cancelled visit would put a dead token on the display board.
+        if (appointment.Status is AppointmentStatus.Completed or AppointmentStatus.Cancelled or AppointmentStatus.NoShow)
+            return Conflict(new { error = "appointment_not_callable", status = formatStatus(appointment.Status) });
+
+        var userId = User.GetUserId();
+        if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
+
+        appointment.CalledAt = DateTimeOffset.UtcNow;
+        appointment.CalledByUserId = userId.Value;
+        appointment.UpdatedAt = DateTimeOffset.UtcNow;
+        await _db.SaveChangesAsync(ct);
+
+        return Ok(new
+        {
+            appointmentId = id,
+            queueToken = appointment.QueueToken,
+            patientName = appointment.Patient.Name,
+            doctorName = appointment.Doctor.Name,
+            calledAt = appointment.CalledAt
         });
     }
 

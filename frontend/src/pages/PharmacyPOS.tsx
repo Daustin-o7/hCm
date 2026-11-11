@@ -271,6 +271,16 @@ export default function PharmacyPOS() {
     }
   }
 
+  // Deep link from the dashboard dispensing queue: ?prescriptionId=… opens that Rx in the dispense modal.
+  useEffect(() => {
+    const rxId = new URLSearchParams(window.location.search).get('prescriptionId')
+    if (!rxId) return
+    setDispenseModalOpen(true)
+    void loadPrescription(rxId)
+    // Runs once: the id comes from the URL, not from component state.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const handleDispenseSubmit = async () => {
     if (!loadedPrescription || supplyBusy.current) return
     if (!supplyRequest.current) {

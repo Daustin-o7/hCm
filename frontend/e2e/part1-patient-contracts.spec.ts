@@ -25,7 +25,10 @@ async function openPatients(page: Page,
   const writes: Record<string, any>[] = []
   const evidence = new Map<string, Record<string, any>>()
   const unexpected = await installClinicMock(page, (path, request): ApiReply | undefined => {
-    if (path === '/patients' && request.method() === 'GET') return { json: [...(options.patients ?? []), ...evidence.values()] }
+    if (path === '/patients/paged' && request.method() === 'GET') {
+      const items = [...(options.patients ?? []), ...evidence.values()]
+      return { json: { items, total: items.length, page: 1, pageSize: 50 } }
+    }
     if (path.startsWith('/patients/') && request.method() === 'GET' && evidence.has(path.slice('/patients/'.length))) {
       return { json: evidence.get(path.slice('/patients/'.length)) }
     }
@@ -191,6 +194,22 @@ test('registry does not invent UHIDs or blanket consent from a patient ID', asyn
   await expect(row).toContainText('UHID not recorded')
   await expect(row).toContainText('Consent not verified')
   await expect(row).not.toContainText('Consented')
+  expect(unexpected).toEqual([])
+})
+
+test('a legacy patient detail does not claim verified consent and lower-case gender stays editable', async ({ page }) => {
+  const patient = { id: ids.patient, name: 'Legacy patient', phone: '9876543210', createdAt: savedAt,
+    approxAge: 30, gender: 'female', address: 'Old address', consents: [] }
+  const { unexpected } = await openPatients(page, undefined, { patients: [patient] })
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.route(`**/api/v1/patients/${ids.patient}`, route => route.fulfill({ json: patient }))
+  await page.getByRole('row').filter({ hasText: patient.name }).click()
+  const detail = page.getByRole('dialog', { name: 'Electronic Health Record' })
+  await expect(detail).toContainText('Consent not verified')
+  await expect(detail).not.toContainText('Active & Verified')
+  await expect(detail.getByRole('button', { name: 'Withdraw Consent' })).toHaveCount(0)
+  await detail.getByRole('button', { name: 'Edit Profile' }).click()
+  await expect(page.locator('#edit-gender')).toHaveValue('Female')
   expect(unexpected).toEqual([])
 })
 

@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using Hospital_CRM.Domain.Constants;
 using Hospital_CRM.Domain.Enums;
 
 namespace Hospital_CRM.Domain.Entities;
@@ -30,7 +31,7 @@ public class Clinic : ITenantScoped
     public string? Website { get; set; }
 
     [MaxLength(50)]
-    public string Timezone { get; set; } = "Asia/Kolkata";
+    public string Timezone { get; set; } = AccountingTimezones.Kolkata;
 
     [MaxLength(10)]
     public string Currency { get; set; } = "INR";

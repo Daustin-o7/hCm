@@ -337,12 +337,59 @@ public class StaffController : ControllerBase
                 email = m.User.Email,
                 role = m.Role.ToString().ToLower(),
                 specialty = m.Specialty,
+                // Signing a consultation is refused without these; the directory shows which doctors lack them.
+                registrationNumber = m.RegistrationNumber,
+                qualifications = m.Qualifications,
                 status = m.Status,
                 joinedAt = m.CreatedAt
             })
             .ToListAsync(ct);
 
         return Ok(staff);
+    }
+
+    /// <summary>
+    /// Sets the credentials a doctor's signature carries (FR-14). Without them
+    /// FinalizeConsultation returns signing_credentials_required, so this is the only path
+    /// that makes a real clinic able to sign at all.
+    /// </summary>
+    [HttpPatch("{userId:guid}/credentials")]
+    [AuthorizeRoles("ClinicAdmin")]
+    public async Task<IActionResult> UpdateSigningCredentials(Guid userId,
+        [FromBody] SigningCredentialsRequest request, CancellationToken ct)
+    {
+        var admin = await SelectedAdminMembershipAsync(ct);
+        if (admin is null) return Forbid();
+
+        var registration = request.RegistrationNumber?.Trim();
+        var qualifications = request.Qualifications?.Trim();
+        if (registration?.Length is not (>= 2 and <= 100) || qualifications?.Length is not (>= 2 and <= 200))
+            return BadRequest(new { error = "credentials_required", message = "A signing doctor needs both a registration number and qualifications." });
+
+        var doctor = await _db.TenantMemberships.FirstOrDefaultAsync(m =>
+            m.UserId == userId && m.TenantId == admin.TenantId && m.ClinicId == admin.ClinicId
+            && m.Status == "active" && m.Role == UserRole.Doctor, ct);
+        if (doctor is null) return NotFound(new { error = "doctor_membership_not_found" });
+
+        doctor.RegistrationNumber = registration;
+        doctor.Qualifications = qualifications;
+        doctor.UpdatedAt = DateTimeOffset.UtcNow;
+
+        // Unlike best-effort login auditing, a credential change must not report success if its audit fails.
+        _db.AuthAuditLogs.Add(new AuthAuditLog
+        {
+            EventType = AuthEvent.SigningCredentialsUpdated, Outcome = "success",
+            UserId = admin.UserId, TenantId = admin.TenantId, Detail = $"doctor={userId}",
+            IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
+            UserAgent = Request.Headers.UserAgent.ToString(), CreatedAt = DateTimeOffset.UtcNow
+        });
+        await _db.SaveChangesAsync(ct);
+
+        return Ok(new
+        {
+            registrationNumber = doctor.RegistrationNumber,
+            qualifications = doctor.Qualifications
+        });
     }
 
     private Task<TenantMembership?> SelectedAdminMembershipAsync(CancellationToken ct)
@@ -393,6 +440,13 @@ public record StaffInviteRequest(
     string? Designation = null,
     EmploymentType? EmploymentType = null,
     EmploymentStatus? EmploymentStatus = null);
+
+public record SigningCredentialsRequest(
+    [Required(ErrorMessage = "Registration number is required"), StringLength(100, MinimumLength = 2)]
+    string RegistrationNumber,
+
+    [Required(ErrorMessage = "Qualifications are required"), StringLength(200, MinimumLength = 2)]
+    string Qualifications);
 
 public record AcceptInviteRequest(
     [Required(ErrorMessage = "InviteToken is required")]

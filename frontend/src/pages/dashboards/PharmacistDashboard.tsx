@@ -13,6 +13,15 @@ interface ExpiringBatch {
   quantityRemaining: number
 }
 
+interface PendingPrescription {
+  prescriptionId: string
+  patientName: string
+  doctorName: string
+  itemCount: number
+  pendingItemCount: number
+  createdAt: string
+}
+
 export default function PharmacistDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
@@ -23,6 +32,8 @@ export default function PharmacistDashboard() {
   const [expiringSoon, setExpiringSoon] = useState(0)
   const [lowStockCount, setLowStockCount] = useState(0)
   const [expiringBatches, setExpiringBatches] = useState<ExpiringBatch[]>([])
+  const [pendingRx, setPendingRx] = useState<PendingPrescription[]>([])
+  const [pendingRxError, setPendingRxError] = useState(false)
 
   // F8 opens the POS counter, matching the advertised shortcut.
   useEffect(() => {
@@ -39,9 +50,10 @@ export default function PharmacistDashboard() {
   const fetchPharmacyData = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
-      const [statsRes, expiryRes] = await Promise.allSettled([
+      const [statsRes, expiryRes, rxRes] = await Promise.allSettled([
         api.get('/pharmacy/stats'),
         api.get('/pharmacy/batches/expiring?days=60'),
+        api.get('/pharmacy/prescriptions/pending?limit=10'),
       ])
 
       if (statsRes.status === 'fulfilled' && statsRes.value.data) {
@@ -54,6 +66,11 @@ export default function PharmacistDashboard() {
 
       setExpiringBatches(expiryRes.status === 'fulfilled' && Array.isArray(expiryRes.value.data)
         ? expiryRes.value.data
+        : [])
+
+      setPendingRxError(rxRes.status === 'rejected')
+      setPendingRx(rxRes.status === 'fulfilled' && Array.isArray(rxRes.value.data)
+        ? rxRes.value.data
         : [])
     } finally {
       setLoading(false)
@@ -177,6 +194,67 @@ export default function PharmacistDashboard() {
             <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Reorder required</span>
           </div>
         </div>
+      </div>
+
+      {/* ── Doctor prescription dispensing queue ── */}
+      <div className="card p-5">
+        <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-3 mb-3">
+          <div>
+            <h2 className="text-sm font-bold text-[var(--color-text)] font-heading">Prescriptions Awaiting Dispensing</h2>
+            <p className="text-[11px] text-[var(--color-text-muted)]">
+              Finalised doctor prescriptions with medicine still to be supplied
+            </p>
+          </div>
+          <span className="badge badge-warning text-[10px]">{pendingRx.length} open</span>
+        </div>
+
+        {pendingRxError ? (
+          <div className="p-4 rounded-xl border border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-muted)]">
+            Dispensing queue unavailable. Retry in a moment.
+          </div>
+        ) : pendingRx.length === 0 ? (
+          <div className="p-4 rounded-xl border border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-muted)]">
+            Nothing to dispense. Finalised prescriptions appear here.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="data-table text-xs">
+              <thead>
+                <tr>
+                  <th>Patient</th>
+                  <th>Prescriber</th>
+                  <th>Pending Lines</th>
+                  <th>Written</th>
+                  <th className="text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pendingRx.map(rx => (
+                  <tr key={rx.prescriptionId}>
+                    <td className="font-semibold text-[var(--color-text)]">{rx.patientName}</td>
+                    <td className="text-[var(--color-text-secondary)]">{rx.doctorName}</td>
+                    <td>
+                      <span className="badge badge-warning text-[10px]">
+                        {rx.pendingItemCount} of {rx.itemCount}
+                      </span>
+                    </td>
+                    <td className="text-[var(--color-text-muted)]">
+                      {new Date(rx.createdAt).toLocaleString('en-IN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    </td>
+                    <td className="text-right">
+                      <button
+                        className="btn btn-primary btn-sm text-xs"
+                        onClick={() => navigate(`/dashboard/pharmacy/pos?prescriptionId=${rx.prescriptionId}`)}
+                      >
+                        Dispense
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* ── Dispensary Alerts ── */}

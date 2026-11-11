@@ -24,11 +24,23 @@ public class PatientsController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
     private readonly IPatientSearchService _search;
+    private readonly ITimezoneService _timezone;
 
-    public PatientsController(HospitalCrmDbContext db, IPatientSearchService search)
+    public PatientsController(HospitalCrmDbContext db, IPatientSearchService search, ITimezoneService? timezone = null)
     {
         _db = db;
         _search = search;
+        _timezone = timezone ?? new TimezoneService();
+    }
+
+    private async Task<string?> SelectedClinicTimezoneAsync(CancellationToken ct)
+    {
+        var clinicId = User.GetClinicId();
+        if (!clinicId.HasValue) return null;
+        return await _db.Clinics.AsNoTracking()
+            .Where(c => c.Id == clinicId.Value)
+            .Select(c => c.Timezone)
+            .FirstOrDefaultAsync(ct);
     }
 
     [HttpPost]
@@ -247,6 +259,97 @@ public class PatientsController : ControllerBase
         return Ok(new { totalPatients, patientsWithActiveConsent });
     }
 
+    [HttpGet("paged")]
+    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
+    [RequirePermission(Permissions.PatientsRead)]
+    public async Task<IActionResult> GetPaged(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 50,
+        [FromQuery] string? filter = null,
+        [FromQuery] string? q = null,
+        CancellationToken ct = default)
+    {
+        var userId = User.GetUserId();
+        if (!userId.HasValue) return Unauthorized(new { error = "invalid_token" });
+
+        var timezone = await SelectedClinicTimezoneAsync(ct);
+        var today = _timezone.GetClinicToday(timezone);
+
+        var query = _db.Patients.AsNoTracking().AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var term = q.Trim();
+            if (term.Length > 100) term = term[..100];
+            var lowered = term.ToLower();
+            query = query.Where(p => p.Name.ToLower().Contains(lowered) || p.Phone.Contains(term)
+                || (p.Uhid != null && p.Uhid.Contains(term)));
+        }
+
+        // Age is computed from DOB in SQL so the filter is exact at birthday boundaries.
+        switch (filter?.ToLowerInvariant())
+        {
+            case "senior":
+                query = query.Where(p => (p.DobHasValue
+                    ? today.Year - p.Dob!.Value.Year - (today.Month < p.Dob.Value.Month || (today.Month == p.Dob.Value.Month && today.Day < p.Dob.Value.Day) ? 1 : 0)
+                    : (p.ApproxAge ?? 0)) >= 60);
+                break;
+            case "pediatric":
+                // Written out twice: EF cannot translate a pattern match inside an expression tree.
+                query = query.Where(p => (p.DobHasValue
+                    ? today.Year - p.Dob!.Value.Year - (today.Month < p.Dob.Value.Month || (today.Month == p.Dob.Value.Month && today.Day < p.Dob.Value.Day) ? 1 : 0)
+                    : (p.ApproxAge ?? 0)) > 0
+                    && (p.DobHasValue
+                    ? today.Year - p.Dob!.Value.Year - (today.Month < p.Dob.Value.Month || (today.Month == p.Dob.Value.Month && today.Day < p.Dob.Value.Day) ? 1 : 0)
+                    : (p.ApproxAge ?? 0)) <= 12);
+                break;
+            case "today":
+                var dayStart = _timezone.GetStartOfDayUtc(today, timezone);
+                var dayEnd = dayStart.AddDays(1);
+                query = query.Where(p => p.CreatedAt >= dayStart && p.CreatedAt < dayEnd);
+                break;
+        }
+
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 200);
+        var total = await query.CountAsync(ct);
+
+        var rows = await query
+            .OrderByDescending(p => p.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(p => new
+            {
+                id = p.Id,
+                patientId = p.Id,
+                uhid = p.Uhid,
+                name = p.Name,
+                phone = p.Phone,
+                gender = p.Gender.ToString(),
+                dob = p.Dob,
+                approxAge = p.ApproxAge,
+                address = p.Address,
+                createdAt = p.CreatedAt,
+                consents = p.Consents.OrderBy(c => c.CapturedAt).ThenBy(c => c.Id).Select(c => new
+                {
+                    id = c.Id,
+                    patientId = c.PatientId,
+                    purpose = c.Purpose,
+                    noticeVersion = c.NoticeVersion,
+                    language = c.Language,
+                    captureMethod = c.CaptureMethod,
+                    guardianName = c.GuardianName,
+                    guardianRelationship = c.GuardianRelationship,
+                    capturedBy = c.CapturedBy,
+                    capturedAt = c.CapturedAt,
+                    withdrawnAt = c.WithdrawnAt
+                }).ToArray()
+            })
+            .ToListAsync(ct);
+
+        return Ok(new { items = rows, total, page, pageSize });
+    }
+
     [HttpGet]
     [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
     [RequirePermission(Permissions.PatientsRead)]
@@ -430,6 +533,46 @@ public class PatientsController : ControllerBase
         return Ok(await BuildPatientDetailAsync(patient, ct));
     }
 
+    [HttpGet("{id:guid}/audit")]
+    [Authorize]
+    [AuthorizeRoles("ClinicAdmin", "Doctor")]
+    [RequirePermission(Permissions.PatientsRead)]
+    public async Task<IActionResult> GetAudit(Guid id, CancellationToken ct)
+    {
+        var patient = await _db.Patients.AsNoTracking().FirstOrDefaultAsync(p => p.Id == id, ct);
+        if (patient is null)
+            return NotFound(new { error = "patient_not_found" });
+
+        if (IsDoctor() && !await DoctorMayAccessPatientAsync(id, patient.CreatedBy, ct))
+        {
+            return StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                error = "clinical_access_denied",
+                breakGlassRequired = true,
+                patientId = patient.Id
+            });
+        }
+
+        var logs = await _db.PatientAuditLogs
+            .AsNoTracking()
+            .Where(a => a.PatientId == id)
+            .OrderByDescending(a => a.ChangedAt)
+            .Select(a => new
+            {
+                id = a.Id,
+                patientId = a.PatientId,
+                fieldName = a.FieldName,
+                oldValue = a.OldValue,
+                newValue = a.NewValue,
+                changedBy = a.ChangedBy,
+                changedByName = a.ChangedByUser.Name,
+                changedAt = a.ChangedAt
+            })
+            .ToListAsync(ct);
+
+        return Ok(logs);
+    }
+
     /// <summary>
     /// Emergency override for a clinician with no treating relationship. Every use is
     /// written to the append-only patient audit trail and the auth audit log.
@@ -521,6 +664,8 @@ public class PatientsController : ControllerBase
             ["approxAge"] = patient.ApproxAge,
             ["gender"] = patient.Gender.ToString().ToLower(),
             ["address"] = patient.Address,
+            ["guardianName"] = patient.Consents.FirstOrDefault(c => !string.IsNullOrEmpty(c.GuardianName))?.GuardianName,
+            ["guardianRelationship"] = patient.Consents.FirstOrDefault(c => !string.IsNullOrEmpty(c.GuardianRelationship))?.GuardianRelationship,
             ["createdAt"] = patient.CreatedAt,
             ["consents"] = ConsentEvidence(patient)
         };
@@ -555,6 +700,19 @@ public class PatientsController : ControllerBase
         if (patient is null)
             return NotFound(new { error = "patient_not_found" });
 
+        request = request with { Name = request.Name?.Trim(), Phone = request.Phone?.Trim(), Address = request.Address?.Trim() };
+        if (request.Name is not null && request.Name.Length is < 2 or > 100
+            || request.Phone is not null && !Regex.IsMatch(request.Phone, @"^[6-9][0-9]{9}$")
+            || request.ApproxAge is < 0 or > 130 || request.Address?.Length > 500
+            || request.Gender is not null && request.Gender.ToLowerInvariant() is not ("male" or "female" or "other" or "prefernottosay"))
+            return BadRequest(new { error = "invalid_patient_demographics" });
+        if (request.Dob.HasValue)
+        {
+            var today = _timezone.GetClinicToday(await SelectedClinicTimezoneAsync(ct));
+            if (request.Dob > today || request.Dob < today.AddYears(-130))
+                return BadRequest(new { error = "invalid_patient_date_of_birth" });
+        }
+
         var now = DateTimeOffset.UtcNow;
 
         if (request.Phone is not null && request.Phone != patient.Phone)
@@ -563,23 +721,25 @@ public class PatientsController : ControllerBase
             if (phoneTaken)
                 return Conflict(new { error = "phone_already_in_use" });
 
-            await AuditService.LogChangeAsync(_db, "Patient", id, userId.Value, "phone", patient.Phone, request.Phone, ct);
             patient.Phone = request.Phone;
         }
 
         if (request.Name is not null && request.Name != patient.Name)
         {
-            await AuditService.LogChangeAsync(_db, "Patient", id, userId.Value, "name", patient.Name, request.Name, ct);
             patient.Name = request.Name;
         }
 
-        if (request.Dob.HasValue && request.Dob.Value != patient.Dob)
+        if (request.Dob.HasValue)
         {
-            var oldDob = patient.Dob?.ToString("yyyy-MM-dd") ?? "";
-            var newDob = request.Dob.Value.ToString("yyyy-MM-dd");
-            await AuditService.LogChangeAsync(_db, "Patient", id, userId.Value, "dob", oldDob, newDob, ct);
             patient.Dob = request.Dob;
-            patient.DobHasValue = request.Dob.HasValue;
+            patient.DobHasValue = true;
+            patient.ApproxAge = null;
+        }
+        else if (request.ApproxAge.HasValue)
+        {
+            patient.Dob = null;
+            patient.DobHasValue = false;
+            patient.ApproxAge = request.ApproxAge;
         }
 
         if (request.Gender is not null)
@@ -587,18 +747,19 @@ public class PatientsController : ControllerBase
             var newGender = ParseGender(request.Gender);
             if (newGender != patient.Gender)
             {
-                await AuditService.LogChangeAsync(_db, "Patient", id, userId.Value, "gender", patient.Gender.ToString(), newGender.ToString(), ct);
                 patient.Gender = newGender;
             }
         }
 
         if (request.Address is not null && request.Address != patient.Address)
         {
-            await AuditService.LogChangeAsync(_db, "Patient", id, userId.Value, "address", patient.Address ?? "", request.Address, ct);
             patient.Address = request.Address;
         }
 
-        await _db.SaveChangesAsync(ct);
+        patient.UpdatedAt = now;
+        _db.ChangeTracker.DetectChanges();
+        // All demographic changes and their field history commit together, including cleared DOB/age.
+        await AuditService.LogEntityAuditAsync(_db, patient, userId.Value, "update", ct);
 
         await _search.IndexAsync(patient, ct);
 
@@ -720,6 +881,9 @@ public record PatientPatchRequest(
     string? Phone,
 
     DateOnly? Dob,
+
+    [Range(0, 130, ErrorMessage = "Approximate Age must be between 0 and 130")]
+    int? ApproxAge,
 
     string? Gender,
 

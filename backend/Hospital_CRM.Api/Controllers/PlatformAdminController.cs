@@ -609,7 +609,7 @@ public class PlatformAdminController : ControllerBase
                 Id = clinicId,
                 TenantId = tenantId,
                 Name = (request.ClinicName ?? request.Name).Trim(),
-                Timezone = request.Timezone ?? "Asia/Kolkata",
+                Timezone = request.Timezone ?? AccountingTimezones.Kolkata,
                 Currency = request.Currency ?? "INR",
                 SubscriptionTier = tier,
                 SubscriptionStatus = status,

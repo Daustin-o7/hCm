@@ -23,6 +23,7 @@ const Staff = lazy(() => import('./pages/Staff'))
 const NurseRoster = lazy(() => import('./pages/NurseRoster'))
 const Intake = lazy(() => import('./pages/Intake'))
 const QueueStatus = lazy(() => import('./pages/QueueStatus'))
+const QueueDisplay = lazy(() => import('./pages/QueueDisplay'))
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'))
 const ResetPassword = lazy(() => import('./pages/ResetPassword'))
 const AcceptInvite = lazy(() => import('./pages/AcceptInvite'))
@@ -87,6 +88,7 @@ function App() {
       <Route path="/setup-mfa" element={<ProtectedRoute><SetupMfa /></ProtectedRoute>} />
       <Route path="/intake/:token" element={<Intake />} />
       <Route path="/queue-status/:token" element={<QueueStatus />} />
+      <Route path="/queue-display" element={<ProtectedRoute><QueueDisplay /></ProtectedRoute>} />
       <Route path="/rx-verify/:code" element={<VerifyRx />} />
       <Route path="/verify-rx/:code" element={<VerifyRx />} />
       <Route element={<ProtectedRoute><AccountSetupGate><DashboardLayout /></AccountSetupGate></ProtectedRoute>}>

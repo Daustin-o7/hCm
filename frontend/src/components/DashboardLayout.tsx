@@ -92,7 +92,9 @@ const NAV_SECTIONS: NavSection[] = [
       {
         name: 'Patients',
         href: '/dashboard/patients',
-        roles: ['clinicadmin', 'doctor', 'receptionist', 'nurse'],
+        // FR-06/FR-07 give the registry to Receptionist/Doctor/ClinicAdmin. Nurses read a patient
+        // through /patients/search and /patients/{id}; the browse list 403s, so it is not in their nav.
+        roles: ['clinicadmin', 'doctor', 'receptionist'],
         icon: UsersIcon,
       },
       {

@@ -19,7 +19,7 @@ public class LedgerController : ControllerBase
 {
     private readonly HospitalCrmDbContext _db;
     private readonly ITimezoneService _timezone;
-    private const string AccountingTimezone = "Asia/Kolkata";
+    private const string AccountingTimezone = AccountingTimezones.Kolkata;
 
     public LedgerController(HospitalCrmDbContext db, ITimezoneService? timezone = null)
     {

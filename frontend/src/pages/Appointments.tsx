@@ -10,6 +10,8 @@ import { AppointmentBadge } from '../components/ui/Badge'
 import { EmptyAppointments } from '../components/ui/EmptyState'
 import { SkeletonRow } from '../components/ui/Skeleton'
 import { Skeleton } from '../components/ui/EmptyState'
+import { useBranding } from '../context/BrandingContext'
+import { getTodayDateString } from '../utils/timezone'
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 const appointmentSchema = z.object({
@@ -25,6 +27,7 @@ interface Appointment {
   appointmentId: string
   patientId?: string
   patientName: string
+  patientPhone?: string
   doctorId?: string
   doctorName: string
   time: string
@@ -51,14 +54,13 @@ import { CLINICAL_SPECIALTIES, getDoctorSpecialty, type SpecialtyMeta } from '..
 export { CLINICAL_SPECIALTIES, getDoctorSpecialty, type SpecialtyMeta }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function formatRelativeDate(dateStr: string): string {
-  const d = new Date(dateStr)
-  const today = new Date(); today.setHours(0,0,0,0)
-  const diff = Math.round((new Date(dateStr).setHours(0,0,0,0) - today.getTime()) / 86400000)
+function formatRelativeDate(dateStr: string, today: string): string {
+  // Both sides are plain YYYY-MM-DD, so the difference is exact whole days in any timezone.
+  const diff = Math.round((Date.parse(dateStr) - Date.parse(today)) / 86400000)
   if (diff === 0) return 'Today'
   if (diff === 1) return 'Tomorrow'
   if (diff === -1) return 'Yesterday'
-  return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+  return new Date(dateStr).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
 }
 
 const PRESET_SLOTS = [
@@ -73,10 +75,13 @@ function isGuid(id: string): boolean {
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function Appointments() {
   const navigate = useNavigate()
+  const { branding } = useBranding()
+  // "Today" is the clinic's day, not the device's or UTC's: an IST clinic at 01:00 is still on yesterday in UTC.
+  const today = getTodayDateString(branding.timezone || 'UTC')
   const [appointments, setAppointments] = useState<Appointment[]>([])
   const [doctors, setDoctors]   = useState<Doctor[]>([])
   const [patients, setPatients] = useState<Patient[]>([])
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0])
+  const [selectedDate, setSelectedDate] = useState(today)
   const [loading, setLoading]   = useState(true)
   const [metaLoading, setMetaLoading] = useState(false)
   const [showModal, setShowModal] = useState(false)
@@ -92,21 +97,22 @@ export default function Appointments() {
     formState: { errors, isSubmitting },
   } = useForm<AppointmentForm>({
     resolver: zodResolver(appointmentSchema),
-    defaultValues: { type: 'scheduled', date: new Date().toISOString().split('T')[0], time: '10:00' },
+    defaultValues: { type: 'scheduled', date: today, time: '10:00' },
   })
 
   const modalSelectedDoctor = watch('doctorId')
   const modalSelectedTime   = watch('time')
 
-  const fetchAppointments = useCallback(async () => {
-    setLoading(true)
+  const fetchAppointments = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
       const res = await api.get(`/appointments?date=${selectedDate}`)
       setAppointments(Array.isArray(res.data) ? res.data : [])
     } catch {
-      setAppointments([])
+      // A dropped background poll keeps the last good list; only a foreground load may blank it.
+      if (!silent) setAppointments([])
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [selectedDate])
 
@@ -203,19 +209,40 @@ export default function Appointments() {
     }
   }, [patients, doctors, reset, selectedDate])
 
-  useEffect(() => { fetchAppointments() }, [fetchAppointments])
+  // The badge says "Live Queue Active", so the desk list must actually refresh: 60s, same cadence
+  // as the role dashboards. Silent so a poll never flashes skeletons over the table.
+  useEffect(() => {
+    void fetchAppointments()
+    const timer = setInterval(() => void fetchAppointments(true), 60_000)
+    return () => clearInterval(timer)
+  }, [fetchAppointments])
   useEffect(() => { fetchMeta() }, [fetchMeta])
+
+  // Support preselecting patient when navigated from Patients page (/dashboard/patients)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const patientParam = params.get('patientId')
+    const bookParam = params.get('book')
+    if (patientParam) {
+      setValue('patientId', patientParam)
+      if (bookParam === 'true') {
+        setSubmitError('')
+        setShowModal(true)
+      }
+    }
+  }, [setValue])
 
   const stats = useMemo(() => ({
     total:     appointments.length,
-    waiting:   appointments.filter(a => ['booked', 'scheduled', 'checked_in'].includes(a.status.toLowerCase())).length,
+    // Confirmed is the state a pre-booked slot sits in until the desk checks it in.
+    waiting:   appointments.filter(a => ['booked', 'scheduled', 'confirmed', 'checked_in'].includes(a.status.toLowerCase())).length,
     completed: appointments.filter(a => a.status.toLowerCase() === 'completed').length,
   }), [appointments])
 
   const filteredAppointments = useMemo(() => {
     return appointments.filter(a => {
-      // Doctor filter
-      if (selectedDocFilter !== 'all' && a.doctorName !== selectedDocFilter) return false
+      // Doctor filter — by id: two doctors can share a name, and only the id is unique.
+      if (selectedDocFilter !== 'all' && a.doctorId !== selectedDocFilter) return false
 
       // Specialty filter
       if (selectedSpecialtyFilter !== 'all') {
@@ -227,9 +254,10 @@ export default function Appointments() {
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim()
         const matchesName = a.patientName.toLowerCase().includes(q)
+        const matchesPhone = (a.patientPhone ?? '').includes(q)
         const matchesDoc = a.doctorName.toLowerCase().includes(q)
         const matchesToken = a.queueToken ? String(a.queueToken).includes(q) : false
-        if (!matchesName && !matchesDoc && !matchesToken) return false
+        if (!matchesName && !matchesPhone && !matchesDoc && !matchesToken) return false
       }
 
       return true
@@ -237,9 +265,9 @@ export default function Appointments() {
   }, [appointments, selectedDocFilter, selectedSpecialtyFilter, searchQuery])
 
   const setRelativeDate = (daysAhead: number) => {
-    const d = new Date()
-    d.setDate(d.getDate() + daysAhead)
-    setSelectedDate(d.toISOString().split('T')[0])
+    const d = new Date(`${today}T00:00:00Z`)
+    d.setUTCDate(d.getUTCDate() + daysAhead)
+    setSelectedDate(d.toISOString().slice(0, 10))
   }
 
   return (
@@ -303,7 +331,7 @@ export default function Appointments() {
               type="button"
               onClick={() => setRelativeDate(0)}
               className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
-                formatRelativeDate(selectedDate) === 'Today'
+                formatRelativeDate(selectedDate, today) === 'Today'
                   ? 'btn-primary'
                   : 'btn-secondary'
               }`}
@@ -315,7 +343,7 @@ export default function Appointments() {
               type="button"
               onClick={() => setRelativeDate(1)}
               className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
-                formatRelativeDate(selectedDate) === 'Tomorrow'
+                formatRelativeDate(selectedDate, today) === 'Tomorrow'
                   ? 'btn-primary'
                   : 'btn-secondary'
               }`}
@@ -324,7 +352,7 @@ export default function Appointments() {
               Tomorrow
             </button>
             <span className="badge badge-brand ml-1">
-              {formatRelativeDate(selectedDate)}
+              {formatRelativeDate(selectedDate, today)}
             </span>
           </div>
 
@@ -363,7 +391,7 @@ export default function Appointments() {
             <div className="text-xl font-bold text-[var(--color-text)]" style={{ fontFamily: 'var(--font-heading)' }}>
               {loading ? <Skeleton width="36px" height="24px" style={{ margin: '0 auto' }} /> : stats.total}
             </div>
-            <div className="text-[10.5px] font-semibold uppercase tracking-wider mt-0.5 text-[var(--color-text-muted)]">Total Slots</div>
+            <div className="text-[10.5px] font-semibold uppercase tracking-wider mt-0.5 text-[var(--color-text-muted)]">Appointments</div>
           </div>
           <div className="card p-3.5 text-center hover-card" style={{ background: 'var(--color-warning-bg)', borderColor: 'var(--color-warning-border)' }}>
             <div className="w-8 h-8 rounded-xl mx-auto mb-2 flex items-center justify-center bg-amber-100 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-800">
@@ -404,7 +432,7 @@ export default function Appointments() {
               >
                 <option value="all">All Doctors</option>
                 {doctors.map(d => (
-                  <option key={d.id} value={d.name}>{d.name}</option>
+                  <option key={d.id} value={d.id}>{d.name}</option>
                 ))}
               </select>
             </div>
@@ -440,7 +468,7 @@ export default function Appointments() {
           <div className="p-4">
             <div className="flex items-center gap-2 mb-4 text-xs text-[var(--color-text-muted)]">
               <span className="spinner spinner-sm" />
-              <span>Loading appointments for {formatRelativeDate(selectedDate)}…</span>
+              <span>Loading appointments for {formatRelativeDate(selectedDate, today)}…</span>
             </div>
             <table className="data-table">
               <thead>
@@ -472,7 +500,7 @@ export default function Appointments() {
                 {filteredAppointments.map(appt => {
                   const spec = getDoctorSpecialty(appt.doctorName)
                   const isCheckedIn = appt.status.toLowerCase() === 'checked_in'
-                  const isBooked = ['booked', 'scheduled'].includes(appt.status.toLowerCase())
+                  const isBooked = ['booked', 'scheduled', 'confirmed'].includes(appt.status.toLowerCase())
                   const isCompleted = appt.status.toLowerCase() === 'completed'
 
                   return (

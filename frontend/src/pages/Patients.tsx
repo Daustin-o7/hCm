@@ -61,6 +61,28 @@ const patientSchema = (today: string) => z.object({
 })
 type PatientForm = z.infer<ReturnType<typeof patientSchema>>
 
+const patientPatchSchema = (today: string) => z.object({
+  name: z.string().trim().min(2, 'Enter at least 2 characters for the name').max(100, 'Name cannot exceed 100 characters'),
+  phone: z.string().refine(val => /^[6-9]\d{9}$/.test(normalizePhone(val)), 'Enter a valid 10-digit Indian mobile number (starting with 6-9)'),
+  dob: z.string().optional(),
+  approxAge: z.string().refine(value => !value || (/^\d+$/.test(value) && Number(value) <= 130), 'Age must be a whole number from 0 to 130').optional(),
+  gender: z.enum(['', 'Male', 'Female', 'Other', 'PreferNotToSay']).optional(),
+  address: z.string().trim().max(500, 'Address cannot exceed 500 characters').optional(),
+}).superRefine((data, ctx) => {
+  if (!data.dob && !data.approxAge) ctx.addIssue({ code: 'custom', path: ['approxAge'], message: 'Enter a date of birth or approximate age' })
+  if (data.dob) {
+    const parsed = new Date(`${data.dob}T00:00:00Z`)
+    const oldest = new Date(`${today}T00:00:00Z`)
+    const month = oldest.getUTCMonth()
+    oldest.setUTCFullYear(oldest.getUTCFullYear() - 130)
+    if (oldest.getUTCMonth() !== month) oldest.setUTCDate(0)
+    if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== data.dob || data.dob > today || parsed < oldest) {
+      ctx.addIssue({ code: 'custom', path: ['dob'], message: 'Date of birth must be within the last 130 years and cannot be in the future' })
+    }
+  }
+})
+type PatientPatchForm = z.infer<ReturnType<typeof patientPatchSchema>>
+
 const persistedId = z.string().uuid().refine(id => id !== '00000000-0000-0000-0000-000000000000')
 const consentEvidence = z.object({
   id: persistedId, patientId: persistedId, purpose: z.string(), noticeVersion: z.string().trim().min(1),
@@ -101,6 +123,8 @@ interface Patient {
   gender?: string | null
   address?: string | null
   createdAt: string
+  guardianName?: string | null
+  guardianRelationship?: string | null
   consents?: ConsentEvidence[]
 }
 
@@ -124,16 +148,25 @@ function getInitials(name: string) {
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function Patients() {
   const navigate = useNavigate()
+  const { hasRole } = useAuth()
+  const canEdit = hasRole(['clinicadmin', 'doctor', 'receptionist'])
+  const canWithdrawConsent = hasRole(['clinicadmin', 'receptionist'])
   const { branding } = useBranding()
   const today = getTodayDateString(branding.timezone || 'UTC')
   const [patients, setPatients] = useState<Patient[]>([])
+  const [patientTotal, setPatientTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [filterType, setFilterType] = useState<'all' | 'today' | 'senior' | 'pediatric'>('all')
   // Seed from the topbar global search: /dashboard/patients?q=…
-  const [searchQuery, setSearchQuery] = useState(() => new URLSearchParams(window.location.search).get('q') ?? '')
+  // Also the text the browse table is filtered by on its next load; the filter chips reset it.
+  const tableQuery = useRef(new URLSearchParams(window.location.search).get('q') ?? '')
+  const [searchQuery, setSearchQuery] = useState(tableQuery.current)
   const deferredSearchQuery = useDeferredValue(searchQuery)
   const [searchResults, setSearchResults] = useState<Patient[]>([])
   const [showSearchDropdown, setShowSearchDropdown] = useState(false)
   const [searchLoading, setSearchLoading] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [showRegister, setShowRegister] = useState(false)
   const [viewingPatient, setViewingPatient] = useState<Patient | null>(null)
   const [breakGlassFor, setBreakGlassFor] = useState<string | null>(null)
@@ -143,7 +176,25 @@ export default function Patients() {
   const [breakGlassBusy, setBreakGlassBusy] = useState(false)
   const [submitError, setSubmitError] = useState('')
   const [duplicatePreflightUnavailable, setDuplicatePreflightUnavailable] = useState(false)
-  
+
+  // Edit Patient State (FR-08)
+  const [editingPatient, setEditingPatient] = useState<Patient | null>(null)
+  const [editSaving, setEditSaving] = useState(false)
+  const [editError, setEditError] = useState('')
+
+  // Consent Withdrawal State (FR-09 DPDP Act)
+  const [withdrawingConsentId, setWithdrawingConsentId] = useState<string | null>(null)
+  const [withdrawBusy, setWithdrawBusy] = useState(false)
+  const [withdrawError, setWithdrawError] = useState('')
+
+  // Quick Copy Feedback
+  const [copiedField, setCopiedField] = useState<string | null>(null)
+  const copyToClipboard = (text: string, fieldName: string) => {
+    navigator.clipboard.writeText(text)
+    setCopiedField(fieldName)
+    setTimeout(() => setCopiedField(null), 2000)
+  }
+
   // Duplicate Resolution State
   const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[]>([])
   const [showDuplicateModal, setShowDuplicateModal] = useState(false)
@@ -194,25 +245,127 @@ export default function Patients() {
     }
   }
 
-  const fetchPatients = useCallback(async (query = '') => {
+  // Edit patient form (FR-08)
+  const {
+    register: registerEdit,
+    handleSubmit: handleEditSubmit,
+    reset: resetEdit,
+    setValue: setEditValue,
+    watch: watchEdit,
+    formState: { errors: editErrors },
+  } = useForm<PatientPatchForm>({
+    resolver: zodResolver(patientPatchSchema(today)),
+  })
+
+  const editDob = watchEdit('dob')
+  const handleEditDobChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const dobValue = e.target.value
+    if (dobValue) {
+      const a = calculateAgeFromDob(dobValue)
+      if (a !== null) {
+        setEditValue('approxAge', a.toString(), { shouldValidate: true })
+      }
+    } else {
+      setEditValue('approxAge', '', { shouldValidate: true })
+    }
+  }
+
+  const startEditPatient = (p: Patient) => {
+    setEditingPatient(p)
+    setEditError('')
+    resetEdit({
+      name: p.name,
+      phone: p.phone || '',
+      dob: p.dob ? p.dob.slice(0, 10) : '',
+      approxAge: p.approxAge != null ? String(p.approxAge) : '',
+      gender: (['Male', 'Female', 'Other', 'PreferNotToSay'] as const).find(g => g.toLowerCase() === p.gender?.toLowerCase()) ?? 'PreferNotToSay',
+      address: p.address || '',
+    })
+  }
+
+  const onEditSubmit = async (data: PatientPatchForm) => {
+    if (!editingPatient) return
+    setEditSaving(true)
+    setEditError('')
+    try {
+      const cleanPhone = normalizePhone(data.phone)
+      const payload = {
+        name: data.name.trim(),
+        phone: cleanPhone,
+        dob: data.dob || null,
+        approxAge: data.dob || !data.approxAge ? null : Number(data.approxAge),
+        gender: data.gender || 'PreferNotToSay',
+        address: data.address?.trim() ?? '',
+      }
+      await api.patch(`/patients/${editingPatient.id}`, payload)
+      const updated: Patient = {
+        ...editingPatient,
+        name: payload.name,
+        phone: payload.phone,
+        dob: payload.dob,
+        approxAge: payload.approxAge,
+        gender: payload.gender,
+        address: payload.address,
+      }
+      setPatients(prev => prev.map(p => p.id === editingPatient.id ? { ...p, ...updated } : p))
+      if (viewingPatient?.id === editingPatient.id) {
+        setViewingPatient(prev => prev ? { ...prev, ...updated } : null)
+      }
+      setEditingPatient(null)
+    } catch (err: any) {
+      setEditError(friendlyError(err))
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
+  const handleWithdrawConsent = async (consentId: string) => {
+    if (!viewingPatient) return
+    setWithdrawBusy(true)
+    setWithdrawError('')
+    try {
+      const res = await api.post(`/patients/${viewingPatient.id}/consents/${consentId}/withdraw`)
+      const withdrawnAt = res.data?.withdrawnAt || new Date().toISOString()
+      const updatedConsents = (viewingPatient.consents || []).map(c =>
+        c.id === consentId ? { ...c, withdrawnAt } : c
+      )
+      const updatedPatient = { ...viewingPatient, consents: updatedConsents }
+      setViewingPatient(updatedPatient)
+      setPatients(prev => prev.map(p => p.id === viewingPatient.id ? { ...p, consents: updatedConsents } : p))
+      setWithdrawingConsentId(null)
+    } catch (err: any) {
+      setWithdrawError(friendlyError(err))
+    } finally {
+      setWithdrawBusy(false)
+    }
+  }
+
+  const fetchPatients = useCallback(async (query = '', targetPage = 1, filter: 'all' | 'today' | 'senior' | 'pediatric' = filterType) => {
     const generation = getSessionGeneration()
     try {
-      // Blank query lists everything; /patients/search treats blank as "no results"
-      const url = query.trim()
-        ? `/patients/search?q=${encodeURIComponent(query)}`
-        : '/patients'
-      const res = await api.get(url)
+      // Server-side paging and filtering: the browse list no longer truncates at 1,000 rows.
+      const params = new URLSearchParams({ page: String(targetPage), pageSize: '50', filter })
+      if (query.trim()) params.set('q', query.trim())
+      const res = await api.get(`/patients/paged?${params.toString()}`)
       if (!active.current || generation !== getSessionGeneration()) return
-      setPatients(Array.isArray(res.data) ? res.data : [])
-      if (query.trim()) setSearchResults(Array.isArray(res.data) ? res.data : [])
-    } catch {
+      setPatients(Array.isArray(res.data?.items) ? res.data.items : [])
+      setPatientTotal(Number(res.data?.total) || 0)
+      setPage(targetPage)
+      setLoadError('')
+      if (query.trim()) setSearchResults(Array.isArray(res.data?.items) ? res.data.items : [])
+    } catch (err: any) {
       if (!active.current || generation !== getSessionGeneration()) return
       setPatients([])
+      setPatientTotal(0)
       setSearchResults([])
+      // "No patients found" is a lie when the request was refused or failed; say which it was.
+      setLoadError(err?.response?.status === 403
+        ? 'Your role cannot browse the patient registry.'
+        : friendlyError(err))
     } finally {
       if (active.current && generation === getSessionGeneration()) setLoading(false)
     }
-  }, [])
+  }, [filterType])
 
   const openPatient = useCallback(async (id: string) => {
     try {
@@ -269,8 +422,10 @@ export default function Patients() {
         if (!data) return
         const session = captureOutboxSession()
         const payload = registrationPayload(data, confirmDifferentPerson)
-        const item: OutboxItem = { version: 1, id: crypto.randomUUID(), type: 1,
-          idempotencyKey: payload.idempotencyKey, payloadJson: JSON.stringify(payload), createdAt: new Date().toISOString() }
+        const item: OutboxItem = {
+          version: 1, id: crypto.randomUUID(), type: 1,
+          idempotencyKey: payload.idempotencyKey, payloadJson: JSON.stringify(payload), createdAt: new Date().toISOString()
+        }
         await enqueueOutbox(item, session)
         if (!active.current || generation !== getSessionGeneration()) return
         attempt = { item, session }
@@ -350,7 +505,11 @@ export default function Patients() {
     }
   }
 
-  useEffect(() => { fetchPatients() }, [fetchPatients])
+  // The topbar deep link must filter the table, not just prefill the box. Nothing is mutated here,
+  // so StrictMode's second run issues the same request; a filter change resets the term below.
+  useEffect(() => {
+    void fetchPatients(tableQuery.current)
+  }, [fetchPatients])
 
   useEffect(() => {
     let mounted = true
@@ -418,24 +577,17 @@ export default function Patients() {
     }
   }, [])
 
-  const [filterType, setFilterType] = useState<'all' | 'today' | 'senior' | 'pediatric'>('all')
   const [, startTransition] = useTransition()
 
   const handleFilterChange = (value: typeof filterType) => {
+    // A chip re-queries from the top, filtered by whatever the box currently shows (usually nothing).
+    tableQuery.current = searchQuery
     startTransition(() => {
       setFilterType(value)
     })
   }
 
-  const filteredPatients = patients.filter(p => {
-    if (filterType === 'senior') return (p.approxAge || 0) >= 60
-    if (filterType === 'pediatric') return (p.approxAge || 0) > 0 && (p.approxAge || 0) <= 12
-    if (filterType === 'today') {
-      const todayStr = new Date().toDateString()
-      return new Date(p.createdAt).toDateString() === todayStr
-    }
-    return true
-  })
+  const totalPages = Math.max(1, Math.ceil(patientTotal / 50))
 
   const hasSearch = deferredSearchQuery.trim().length > 0
 
@@ -453,7 +605,7 @@ export default function Patients() {
             </span>
           </div>
           <p className="text-xs font-medium mt-1 text-[var(--color-text-muted)]">
-            {loading ? 'Synchronizing patient registry…' : `${patients.length} active patient profile${patients.length !== 1 ? 's' : ''} in electronic database`}
+            {loading ? 'Synchronizing patient registry…' : `${patientTotal} active patient profile${patientTotal !== 1 ? 's' : ''} in electronic database`}
           </p>
         </div>
         <button
@@ -550,26 +702,28 @@ export default function Patients() {
         {/* Quick Filter Chips */}
         <div className="flex items-center gap-1.5 overflow-x-auto pb-1 md:pb-0">
           {[
-            { id: 'all', label: 'All Records', count: patients.length },
-            { id: 'today', label: 'Registered Today', count: patients.filter(p => new Date(p.createdAt).toDateString() === new Date().toDateString()).length },
-            { id: 'senior', label: 'Senior (60+)', count: patients.filter(p => (p.approxAge || 0) >= 60).length },
-            { id: 'pediatric', label: 'Pediatric (≤12)', count: patients.filter(p => (p.approxAge || 0) > 0 && (p.approxAge || 0) <= 12).length },
+            { id: 'all', label: 'All Records', count: patientTotal },
+            // Filtered counts would need one query per chip; the server total above is the honest number.
+            { id: 'today', label: 'Registered Today' },
+            { id: 'senior', label: 'Senior (60+)' },
+            { id: 'pediatric', label: 'Pediatric (≤12)' },
           ].map(chip => (
             <button
               key={chip.id}
               onClick={() => handleFilterChange(chip.id as any)}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap cursor-pointer ${
-                filterType === chip.id
+              className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap cursor-pointer ${filterType === chip.id
                   ? 'btn-primary'
                   : 'btn-secondary'
-              }`}
+                }`}
               aria-pressed={filterType === chip.id}
               role="tab"
             >
               <span>{chip.label}</span>
-              <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${filterType === chip.id ? 'bg-white/20 text-white' : 'bg-[var(--color-surface-raised)] text-[var(--color-text-muted)]'}`}>
-                {chip.count}
-              </span>
+              {chip.count != null && (
+                <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${filterType === chip.id ? 'bg-white/20 text-white' : 'bg-[var(--color-surface-raised)] text-[var(--color-text-muted)]'}`}>
+                  {chip.count}
+                </span>
+              )}
             </button>
           ))}
         </div>
@@ -577,6 +731,11 @@ export default function Patients() {
 
       {/* ── Table Card ── */}
       <div className="card" style={{ overflow: 'hidden' }}>
+        {loadError && (
+          <div className="p-4">
+            <Alert variant="error" onDismiss={() => setLoadError('')}>{loadError}</Alert>
+          </div>
+        )}
         {loading ? (
           <table className="data-table">
             <thead>
@@ -593,7 +752,7 @@ export default function Patients() {
               {Array.from({ length: 5 }).map((_, i) => <SkeletonRow key={i} cols={6} />)}
             </tbody>
           </table>
-        ) : filteredPatients.length === 0 ? (
+        ) : loadError ? null : patients.length === 0 ? (
           hasSearch
             ? <EmptySearch />
             : (
@@ -627,7 +786,7 @@ export default function Patients() {
                 </tr>
               </thead>
               <tbody>
-                {filteredPatients.map(p => (
+                {patients.map(p => (
                   <tr key={p.id} style={{ cursor: 'pointer' }} onClick={() => openPatient(p.id)}>
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -670,6 +829,20 @@ export default function Patients() {
                     </td>
                     <td style={{ textAlign: 'right' }}>
                       <div className="flex items-center justify-end gap-1.5">
+                        {canEdit && (
+                          <button
+                            className="btn btn-secondary btn-sm flex items-center gap-1"
+                            onClick={e => {
+                              e.stopPropagation()
+                              startEditPatient(p)
+                            }}
+                            aria-label={`Edit ${p.name}`}
+                            style={{ padding: '3px 8px', fontSize: '11px', fontWeight: 600 }}
+                          >
+                            <span>✏️</span>
+                            <span>Edit</span>
+                          </button>
+                        )}
                         <button
                           className="btn btn-primary btn-sm flex items-center gap-1"
                           onClick={e => {
@@ -695,6 +868,15 @@ export default function Patients() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+        {!loading && totalPages > 1 && (
+          <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-[var(--color-border)]">
+            <span className="text-xs text-[var(--color-text-muted)]">Page {page} of {totalPages}</span>
+            <div className="flex items-center gap-2">
+              <button className="btn btn-ghost btn-sm" disabled={page <= 1} onClick={() => void fetchPatients(deferredSearchQuery, page - 1)}>Previous</button>
+              <button className="btn btn-ghost btn-sm" disabled={page >= totalPages} onClick={() => void fetchPatients(deferredSearchQuery, page + 1)}>Next</button>
+            </div>
           </div>
         )}
       </div>
@@ -999,7 +1181,7 @@ export default function Patients() {
         {viewingPatient && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
             {/* Header banner */}
-            <div className="flex items-center justify-between p-4 rounded-lg" style={{ background: 'var(--color-surface-raised)', border: '1px solid var(--color-border)' }}>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-lg" style={{ background: 'var(--color-surface-raised)', border: '1px solid var(--color-border)' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
                 <div
                   className="avatar avatar-lg bg-[var(--brand-primary)] text-white border border-[var(--brand-primary-hover)]/40 shadow-xs font-bold shadow-xs"
@@ -1010,7 +1192,7 @@ export default function Patients() {
                   <div style={{ fontSize: '18px', fontWeight: 700, color: 'var(--color-text)', fontFamily: 'var(--font-heading)' }}>
                     {viewingPatient.name}
                   </div>
-                  <div className="flex items-center gap-2 mt-0.5">
+                  <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                     <span className="mono text-xs font-semibold text-teal-700 bg-teal-50 px-2 py-0.5 rounded border border-teal-200/60">
                       {viewingPatient.uhid || 'UHID not recorded'}
                     </span>
@@ -1021,12 +1203,60 @@ export default function Patients() {
                   </div>
                 </div>
               </div>
-              <div className="hidden sm:flex flex-col items-end">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-text-muted)]">Consent Status</span>
-                <span className="text-xs font-semibold text-[var(--color-text-secondary)] mt-0.5">
-                  {consentStatus(viewingPatient)}
-                </span>
+              <div className="flex items-center gap-2 self-start sm:self-center">
+                <span className="badge">{consentStatus(viewingPatient)}</span>
+                {canEdit && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                    onClick={() => startEditPatient(viewingPatient)}
+                  >
+                    <span>✏️</span>
+                    <span>Edit Profile</span>
+                  </button>
+                )}
               </div>
+            </div>
+
+            {/* Quick Copy / PII Safeguard Toolbar */}
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              {viewingPatient.uhid && (
+                <button
+                  type="button"
+                  onClick={() => copyToClipboard(viewingPatient.uhid!, 'uhid')}
+                  className="px-2.5 py-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-hover)] transition-colors flex items-center gap-1.5 cursor-pointer"
+                  title="Click to copy UHID"
+                >
+                  <span className="text-[var(--color-text-muted)]">UHID:</span>
+                  <span className="mono font-semibold text-[var(--color-text)]">{viewingPatient.uhid}</span>
+                  <span className="text-[10px] text-teal-700 bg-teal-50 px-1 rounded font-bold">
+                    {copiedField === 'uhid' ? '✓ Copied' : 'Copy'}
+                  </span>
+                </button>
+              )}
+              {viewingPatient.phone && (
+                <button
+                  type="button"
+                  onClick={() => copyToClipboard(viewingPatient.phone!, 'phone')}
+                  className="px-2.5 py-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-hover)] transition-colors flex items-center gap-1.5 cursor-pointer"
+                  title="Click to copy phone number"
+                >
+                  <span className="text-[var(--color-text-muted)]">Phone:</span>
+                  <span className="mono font-semibold text-[var(--color-text)]">{viewingPatient.phone}</span>
+                  <span className="text-[10px] text-teal-700 bg-teal-50 px-1 rounded font-bold">
+                    {copiedField === 'phone' ? '✓ Copied' : 'Copy'}
+                  </span>
+                </button>
+              )}
+              {viewingPatient.guardianName && (
+                <div className="px-2.5 py-1 rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 text-amber-800 dark:text-amber-200 flex items-center gap-1.5 font-medium">
+                  <span>🛡️ Guardian:</span>
+                  <span className="font-semibold">{viewingPatient.guardianName}</span>
+                  {viewingPatient.guardianRelationship && (
+                    <span className="text-xs opacity-80">({viewingPatient.guardianRelationship})</span>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Quick Details Grid */}
@@ -1037,7 +1267,7 @@ export default function Patients() {
                 { label: 'Age / Demographic', value: viewingPatient.approxAge != null ? `${viewingPatient.approxAge} years` : 'Not recorded' },
                 { label: 'Date of Birth', value: viewingPatient.dob ? formatDate(viewingPatient.dob) : 'Not specified' },
                 { label: 'First Registered', value: formatDate(viewingPatient.createdAt) },
-                { label: 'Residential City', value: viewingPatient.address || 'Not recorded' },
+                { label: 'Residential Address', value: viewingPatient.address || 'Not recorded' },
               ].map(f => (
                 <div key={f.label} className="p-2.5 rounded-xl" style={{ background: 'var(--color-surface-raised)', border: '1px solid var(--color-border-subtle)' }}>
                   <div style={{ fontSize: '10.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-muted)' }}>
@@ -1050,11 +1280,54 @@ export default function Patients() {
               ))}
             </div>
 
+            {/* DPDP Statutory Treatment Consent Details (FR-09) */}
+            {(() => {
+              const careConsents = (viewingPatient.consents || []).filter(c => consentEvidence.safeParse(c).success
+                && c.patientId === viewingPatient.id && ['care_delivery', 'direct_care'].includes(c.purpose))
+              const careConsent = careConsents.find(c => !c.withdrawnAt) ?? careConsents.at(-1)
+              const isWithdrawn = Boolean(careConsent?.withdrawnAt)
+              return (
+                <div className="p-3.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold uppercase tracking-wider text-[var(--color-text)]">
+                        DPDP Treatment Consent (Statutory)
+                      </span>
+                      <span className={`badge ${isWithdrawn ? 'badge-danger' : careConsent ? 'badge-brand' : ''}`}>
+                        {consentStatus(viewingPatient)}
+                      </span>
+                    </div>
+                    <p className="text-xs text-[var(--color-text-muted)] mt-1">
+                      Notice {careConsent?.noticeVersion || '—'} · {careConsent?.language?.toUpperCase() || '—'} · {careConsent?.captureMethod?.replaceAll('_', ' ') || '—'}
+                      {careConsent?.capturedAt && ` · Recorded ${formatDate(careConsent.capturedAt)}`}
+                    </p>
+                    {isWithdrawn && (
+                      <p className="text-xs text-rose-600 font-semibold mt-0.5">
+                        ⚠️ Consent was withdrawn on {formatDate(careConsent!.withdrawnAt!)}. Clinical OPD actions require active treatment authorization.
+                      </p>
+                    )}
+                  </div>
+                  {canWithdrawConsent && careConsent && !isWithdrawn && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm text-xs self-start sm:self-center text-rose-700 hover:text-rose-800 border-rose-300"
+                      onClick={() => setWithdrawingConsentId(careConsent.id)}
+                    >
+                      Withdraw Consent
+                    </button>
+                  )}
+                </div>
+              )
+            })()}
+
             {/* Nursing care — assignments + handover (MOD-26) */}
             <NursingCareSection patientId={viewingPatient.id} />
 
             {/* Prior visits (FR-08 clinical history) */}
             <TreatmentHistorySection patientId={viewingPatient.id} />
+
+            {/* DPDP Statutory Audit Trail (FR-08) */}
+            <PatientAuditTrailSection patientId={viewingPatient.id} />
 
             {/* Patient Clinical Quick Actions */}
             <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-3 border-t" style={{ borderColor: 'var(--color-border)' }}>
@@ -1063,8 +1336,9 @@ export default function Patients() {
                 <button
                   type="button"
                   onClick={() => {
+                    const pid = viewingPatient.id
                     setViewingPatient(null)
-                    navigate('/dashboard/appointments')
+                    navigate(`/dashboard/appointments?patientId=${pid}&book=true`)
                   }}
                   className="btn btn-secondary btn-sm text-xs"
                 >
@@ -1073,8 +1347,9 @@ export default function Patients() {
                 <button
                   type="button"
                   onClick={() => {
+                    const pid = viewingPatient.id
                     setViewingPatient(null)
-                    navigate(`/dashboard/billing`)
+                    navigate(`/dashboard/billing?patientId=${pid}`)
                   }}
                   className="btn btn-secondary btn-sm text-xs"
                 >
@@ -1101,6 +1376,156 @@ export default function Patients() {
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* ── Edit Patient Modal (FR-08) ── */}
+      <Modal
+        open={!!editingPatient}
+        onClose={() => { if (!editSaving) setEditingPatient(null) }}
+        title="Edit Patient Demographics"
+        description="Update patient personal details. All changes are logged to the statutory DPDP audit trail."
+      >
+        {editError && (
+          <div style={{ marginBottom: 16 }}>
+            <Alert variant="error" onDismiss={() => setEditError('')}>{editError}</Alert>
+          </div>
+        )}
+        <form onSubmit={handleEditSubmit(onEditSubmit)} noValidate>
+          <fieldset disabled={editSaving} className="grid grid-cols-1 sm:grid-cols-2 gap-4 border-0 p-0 min-w-0">
+            {/* Full name */}
+            <div style={{ gridColumn: '1 / -1' }}>
+              <label htmlFor="edit-name" className="form-label">Full Legal Name *</label>
+              <input id="edit-name" className="form-input" {...registerEdit('name')} maxLength={100} aria-invalid={!!editErrors.name} />
+              {editErrors.name && <p className="form-error">{editErrors.name.message}</p>}
+            </div>
+
+            {/* Phone */}
+            <div>
+              <label htmlFor="edit-phone" className="form-label">Phone Number *</label>
+              <input id="edit-phone" className="form-input" {...registerEdit('phone')} type="tel" placeholder="+91 98765 43210" />
+              {editErrors.phone && <p className="form-error">{editErrors.phone.message}</p>}
+            </div>
+
+            {/* Gender */}
+            <div>
+              <label htmlFor="edit-gender" className="form-label">Gender Identity</label>
+              <select id="edit-gender" className="form-select" {...registerEdit('gender')}>
+                <option value="PreferNotToSay">Prefer not to say</option>
+                <option value="Male">Male</option>
+                <option value="Female">Female</option>
+                <option value="Other">Other</option>
+              </select>
+              {editErrors.gender && <p className="form-error">{editErrors.gender.message}</p>}
+            </div>
+
+            {/* DOB */}
+            <div>
+              <label htmlFor="edit-dob" className="form-label">Date of Birth</label>
+              <input
+                id="edit-dob"
+                className="form-input"
+                {...registerEdit('dob')}
+                type="date"
+                max={today}
+                onChange={e => { registerEdit('dob').onChange(e); handleEditDobChange(e); }}
+              />
+              {editErrors.dob && <p className="form-error">{editErrors.dob.message}</p>}
+            </div>
+
+            {/* Approx age */}
+            <div>
+              <label htmlFor="edit-age" className="form-label">Approximate Age (years)</label>
+              <input
+                id="edit-age"
+                className="form-input"
+                {...registerEdit('approxAge')}
+                type="number"
+                min="0"
+                max="130"
+                step="1"
+                readOnly={!!editDob}
+                placeholder="e.g. 35"
+              />
+              {editErrors.approxAge && <p className="form-error">{editErrors.approxAge.message}</p>}
+            </div>
+
+            {/* Address */}
+            <div style={{ gridColumn: '1 / -1' }}>
+              <label htmlFor="edit-address" className="form-label">Residential Address</label>
+              <textarea id="edit-address" className="form-textarea" {...registerEdit('address')} rows={2} maxLength={500} placeholder="House / Flat No, Street, City, Pincode" style={{ minHeight: 64 }} />
+              {editErrors.address && <p className="form-error">{editErrors.address.message}</p>}
+            </div>
+          </fieldset>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 24, paddingTop: 16, borderTop: '1px solid var(--color-border)' }}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setEditingPatient(null)}
+              disabled={editSaving}
+            >
+              Cancel
+            </button>
+            <button
+              id="submit-edit-patient-btn"
+              type="submit"
+              className="btn btn-primary"
+              disabled={editSaving}
+            >
+              {editSaving && <span className="spinner spinner-sm" />}
+              {editSaving ? 'Saving Changes…' : 'Save Demographic Changes'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* ── Consent Withdrawal Modal (DPDP Act Section 6) ── */}
+      <Modal
+        open={!!withdrawingConsentId}
+        onClose={() => { if (!withdrawBusy) setWithdrawingConsentId(null) }}
+        title="Withdraw DPDP Treatment Consent"
+        description="Statutory Right under DPDP Act 2023, Section 6(4)"
+      >
+        <div className="space-y-4">
+          <div className="alert alert-warning">
+            <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <div className="text-xs">
+              <p className="font-bold">Important Statutory Warning</p>
+              <p className="mt-1">
+                Withdrawing treatment consent will mark this patient&apos;s consent as revoked in the database and record a statutory event in the immutable audit log. Clinical consultations cannot be initiated without active treatment consent.
+              </p>
+            </div>
+          </div>
+
+          {withdrawError && (
+            <Alert variant="error" onDismiss={() => setWithdrawError('')}>{withdrawError}</Alert>
+          )}
+
+          <p className="text-xs text-[var(--color-text-secondary)]">
+            Patient: <strong>{viewingPatient?.name}</strong> ({viewingPatient?.uhid || 'UHID not recorded'})
+          </p>
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[var(--color-border)]">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={withdrawBusy}
+              onClick={() => setWithdrawingConsentId(null)}
+            >
+              Keep Consent Active
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              disabled={withdrawBusy}
+              onClick={() => withdrawingConsentId && void handleWithdrawConsent(withdrawingConsentId)}
+            >
+              {withdrawBusy ? 'Revoking…' : 'Confirm Consent Revocation'}
+            </button>
+          </div>
+        </div>
       </Modal>
     </div>
   )
@@ -1203,9 +1628,11 @@ interface HandoverItem {
 
 function NursingCareSection({ patientId }: { patientId: string }) {
   const { hasRole } = useAuth()
-  const isAdmin = hasRole(['clinicadmin'])
+  const isAdmin = hasRole(['clinicadmin', 'owner'])
   const isNurse = hasRole(['nurse'])
   const canManageCare = isAdmin || isNurse
+  // GET /handovers is ClinicAdmin/Doctor/Nurse only; asking as anyone else 403s and paints an error.
+  const canReadCare = canManageCare || hasRole(['doctor'])
 
   const [assignments, setAssignments] = useState<CareAssignment[]>([])
   const [handovers, setHandovers] = useState<HandoverItem[]>([])
@@ -1220,6 +1647,7 @@ function NursingCareSection({ patientId }: { patientId: string }) {
   const [error, setError] = useState('')
 
   const load = useCallback(async () => {
+    if (!canReadCare) return
     try {
       const ho = await api.get('/handovers', { params: { patientId } })
       setHandovers(ho.data)
@@ -1237,9 +1665,11 @@ function NursingCareSection({ patientId }: { patientId: string }) {
     } catch (err) {
       setError(friendlyError(err))
     }
-  }, [patientId, canManageCare, isAdmin, isNurse])
+  }, [patientId, canManageCare, canReadCare, isAdmin, isNurse])
 
   useEffect(() => { load() }, [load])
+
+  if (!canReadCare) return null
 
   const assign = async () => {
     if (!assignTo) return
@@ -1435,6 +1865,108 @@ function NursingCareSection({ patientId }: { patientId: string }) {
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+// ── DPDP Statutory Audit Trail (FR-08: field-level immutable history) ──
+
+interface AuditLogItem {
+  id: string
+  patientId: string
+  fieldName: string
+  oldValue: string
+  newValue: string
+  changedBy: string
+  changedByName: string
+  changedAt: string
+}
+
+function PatientAuditTrailSection({ patientId }: { patientId: string }) {
+  const { hasRole } = useAuth()
+  const canRead = hasRole(['clinicadmin', 'doctor', 'owner'])
+  const [logs, setLogs] = useState<AuditLogItem[]>([])
+  const [loading, setLoading] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [error, setError] = useState('')
+
+  const loadLogs = useCallback(async () => {
+    if (!canRead || !patientId) return
+    setLoading(true)
+    try {
+      const res = await api.get(`/patients/${patientId}/audit`)
+      setLogs(Array.isArray(res.data) ? res.data : [])
+      setError('')
+    } catch (err) {
+      setLogs([])
+      setError(friendlyError(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [canRead, patientId])
+
+  useEffect(() => {
+    if (expanded) void loadLogs()
+  }, [expanded, loadLogs])
+
+  if (!canRead) return null
+
+  return (
+    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setExpanded(v => !v)}
+        className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-[var(--color-surface-hover)] transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-[var(--color-text-muted)]">
+            Statutory DPDP Audit Trail &amp; Field History
+          </span>
+          <span className="badge badge-brand text-[10px]">Append-Only Log</span>
+        </div>
+        <span className="text-xs font-semibold text-[var(--brand-primary)]">
+          {expanded ? 'Hide History ▲' : 'View History ▼'}
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="p-4 border-t border-[var(--color-border)] space-y-3 bg-[var(--color-surface-raised)]">
+          {loading ? (
+            <p className="text-xs text-[var(--color-text-muted)]">Loading immutable audit log…</p>
+          ) : error ? (
+            <Alert variant="error">{error}</Alert>
+          ) : logs.length === 0 ? (
+            <p className="text-xs text-[var(--color-text-muted)]">No demographic updates or overrides logged for this profile yet.</p>
+          ) : (
+            <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+              {logs.map(log => (
+                <div key={log.id} className="p-2.5 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border-subtle)] text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-[var(--color-text)] uppercase text-[11px] mono">
+                      {log.fieldName}
+                    </span>
+                    <span className="text-[10px] text-[var(--color-text-muted)]">
+                      {formatDate(log.changedAt)} · {new Date(log.changedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex items-center gap-1.5 flex-wrap text-[11.5px]">
+                    <span className="text-[var(--color-text-muted)]">Changed by:</span>
+                    <span className="font-semibold text-[var(--color-text)]">{log.changedByName || 'Staff Member'}</span>
+                    {log.oldValue && (
+                      <>
+                        <span className="text-[var(--color-text-muted)]">| Old:</span>
+                        <span className="line-through text-rose-600 dark:text-rose-400 mono">{log.oldValue}</span>
+                      </>
+                    )}
+                    <span className="text-[var(--color-text-muted)]">→ New:</span>
+                    <span className="font-medium text-emerald-700 dark:text-emerald-400 mono">{log.newValue}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

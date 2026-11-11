@@ -1080,6 +1080,9 @@ static async Task SeedDevelopmentDataAsync(HospitalCrmDbContext db)
     // backfill only covers users that existed before it ran; a fresh install seeds after.
     foreach (var clinicUser in new[] { admin, owner, doctor, receptionist, pharmacist, nurse }.Concat(additionalDoctors))
     {
+        // A doctor cannot sign a consultation without these, and there is no in-app screen that
+        // writes them yet. Synthetic but well-formed values keep the sign → dispense path usable.
+        var isDoctor = clinicUser.Role == UserRole.Doctor;
         db.TenantMemberships.Add(new TenantMembership
         {
             Id = Guid.NewGuid(),
@@ -1088,6 +1091,8 @@ static async Task SeedDevelopmentDataAsync(HospitalCrmDbContext db)
             ClinicId = clinic.Id,
             Role = clinicUser.Role,
             Specialty = clinicUser.Specialty,
+            RegistrationNumber = isDoctor ? $"KMC-{clinicUser.Id.ToString("N")[..6].ToUpperInvariant()}" : null,
+            Qualifications = isDoctor ? "MBBS" : null,
             IsDefault = true,
             Status = "active",
             CreatedAt = DateTimeOffset.UtcNow,

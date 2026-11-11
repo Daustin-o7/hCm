@@ -25,7 +25,7 @@ public class InvoicesController : ControllerBase
     private readonly RazorpayOrderClient _razorpay;
     private readonly ITenantContext? _tenantContext;
     private readonly ITimezoneService _timezone;
-    private const string AccountingTimezone = "Asia/Kolkata";
+    private const string AccountingTimezone = AccountingTimezones.Kolkata;
 
     public InvoicesController(HospitalCrmDbContext db, IConfiguration config, RazorpayOrderClient razorpay,
         ITenantContext? tenantContext = null, ITimezoneService? timezone = null)

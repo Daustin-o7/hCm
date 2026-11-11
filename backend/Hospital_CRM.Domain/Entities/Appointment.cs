@@ -35,6 +35,10 @@ public class Appointment : ITenantScoped
 
     public Guid? TriageConfirmedBy { get; set; }
     public DateTimeOffset? TriageConfirmedAt { get; set; }
+
+    // Set when staff call this patient from the queue; drives the waiting-room display.
+    public DateTimeOffset? CalledAt { get; set; }
+    public Guid? CalledByUserId { get; set; }
     
     public DateTimeOffset CreatedAt { get; set; }
     [ConcurrencyCheck]

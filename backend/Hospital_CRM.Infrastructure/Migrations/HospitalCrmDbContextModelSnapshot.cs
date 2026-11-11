@@ -28,6 +28,12 @@ namespace Hospital_CRM.Infrastructure.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
+                    b.Property<DateTimeOffset?>("CalledAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid?>("CalledByUserId")
+                        .HasColumnType("uuid");
+
                     b.Property<Guid>("ClinicId")
                         .HasColumnType("uuid");
 

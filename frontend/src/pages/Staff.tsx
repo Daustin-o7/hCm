@@ -62,6 +62,9 @@ interface StaffMember {
   specialty?: string
   status: string
   joinedAt: string
+  // Doctor signing credentials (FR-14). Both are required before a consultation can be finalized.
+  registrationNumber?: string | null
+  qualifications?: string | null
   // Nurse-specific fields
   licenseNumber?: string
   licenseExpiryDate?: string
@@ -136,6 +139,11 @@ function getInitials(name: string) {
   return name.split(' ').slice(0, 2).map(w => w[0]).join('').toUpperCase()
 }
 
+// The API sends role/status lower-case; every comparison and badge in this page is Title-case.
+function titleCase(value?: string | null) {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : ''
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function Staff() {
   const [staff, setStaff]             = useState<StaffMember[]>([])
@@ -149,6 +157,13 @@ export default function Staff() {
   const [copyStatus, setCopyStatus] = useState('')
   const [revoking, setRevoking] = useState<StaffMember | null>(null)
   const [revokeBusy, setRevokeBusy] = useState(false)
+
+  // Doctor signing credentials: a doctor without these cannot finalize a consultation.
+  const [credStaff, setCredStaff] = useState<StaffMember | null>(null)
+  const [credReg, setCredReg] = useState('')
+  const [credQual, setCredQual] = useState('')
+  const [credBusy, setCredBusy] = useState(false)
+  const [credError, setCredError] = useState('')
 
   const showToast = (msg: string) => {
     setToast(msg)
@@ -299,10 +314,15 @@ export default function Staff() {
         api.get('/staff/invites').catch(() => ({ data: [] }))
       ])
       const activeMembers: StaffMember[] = Array.isArray(res.data)
-        ? res.data.map((s: any) => ({
-            ...s,
-            specialty: s.specialty || (s.role === 'Doctor' ? 'general' : undefined)
-          }))
+        ? res.data.map((s: any) => {
+            const role = titleCase(s.role)
+            return {
+              ...s,
+              role,
+              status: titleCase(s.status),
+              specialty: s.specialty || (role === 'Doctor' ? 'general' : undefined)
+            }
+          })
         : []
 
       const pendingInvites: StaffMember[] = Array.isArray(invitesRes?.data)
@@ -340,6 +360,36 @@ export default function Staff() {
       showToast(friendlyError(err) || 'Failed to revoke invite')
     } finally {
       setRevokeBusy(false)
+    }
+  }
+
+  const openCredentials = (s: StaffMember) => {
+    setCredStaff(s)
+    setCredReg(s.registrationNumber ?? '')
+    setCredQual(s.qualifications ?? '')
+    setCredError('')
+  }
+
+  const saveCredentials = async () => {
+    if (!credStaff || credBusy) return
+    if (!credReg.trim() || !credQual.trim()) {
+      setCredError('Both the registration number and qualifications are required to sign.')
+      return
+    }
+    setCredBusy(true)
+    setCredError('')
+    try {
+      await api.patch(`/staff/${credStaff.id}/credentials`, {
+        registrationNumber: credReg.trim(),
+        qualifications: credQual.trim(),
+      })
+      setCredStaff(null)
+      showToast('Signing credentials saved')
+      void fetchStaff()
+    } catch (err) {
+      setCredError(friendlyError(err))
+    } finally {
+      setCredBusy(false)
     }
   }
 
@@ -629,6 +679,15 @@ export default function Staff() {
                             </span>
                           )}
                           {nurseBadge}
+                          {s.role === 'Doctor' && s.status === 'Active' && !s.registrationNumber && (
+                            <span
+                              className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-lg border bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
+                              title="Finalizing a consultation is refused until these are set"
+                            >
+                              <span>⚠</span>
+                              <span>No signing credentials</span>
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td>
@@ -658,6 +717,13 @@ export default function Staff() {
                             className="btn btn-secondary btn-sm cursor-pointer"
                           >
                             View profile
+                          </button>
+                        ) : s.role === 'Doctor' ? (
+                          <button
+                            onClick={() => openCredentials(s)}
+                            className="btn btn-secondary btn-sm cursor-pointer"
+                          >
+                            Signing credentials
                           </button>
                         ) : (
                           <span className="text-[11px] font-semibold text-[var(--color-text-muted)]">Authorized</span>
@@ -757,6 +823,49 @@ export default function Staff() {
             {nurseFields}
           </div>
         </form>
+      </Modal>
+
+      {/* ── Doctor Signing Credentials Modal ── */}
+      <Modal
+        open={credStaff !== null}
+        onClose={() => { if (!credBusy) setCredStaff(null) }}
+        title={credStaff ? `${credStaff.name} — Signing Credentials` : 'Signing Credentials'}
+        description="These are printed on every prescription this doctor signs. Required before a consultation can be finalized."
+        footer={
+          <>
+            <button className="btn btn-secondary" onClick={() => setCredStaff(null)} disabled={credBusy}>Cancel</button>
+            <button className="btn btn-primary" onClick={saveCredentials} disabled={credBusy}>
+              {credBusy && <span className="spinner spinner-sm" />}
+              {credBusy ? 'Saving…' : 'Save credentials'}
+            </button>
+          </>
+        }
+      >
+        {credError && <div style={{ marginBottom: 16 }}><Alert variant="error" onDismiss={() => setCredError('')}>{credError}</Alert></div>}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div>
+            <label htmlFor="cred-registration" className="form-label">Medical registration number *</label>
+            <input
+              id="cred-registration"
+              className="form-input"
+              value={credReg}
+              onChange={e => setCredReg(e.target.value)}
+              placeholder="KMC-123456"
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <label htmlFor="cred-qualifications" className="form-label">Qualifications *</label>
+            <input
+              id="cred-qualifications"
+              className="form-input"
+              value={credQual}
+              onChange={e => setCredQual(e.target.value)}
+              placeholder="MBBS, MD (General Medicine)"
+              autoComplete="off"
+            />
+          </div>
+        </div>
       </Modal>
 
       {/* ── Nurse Profile Modal ── */}
