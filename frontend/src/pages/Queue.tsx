@@ -5,7 +5,8 @@ import { Modal } from '../components/ui/Modal'
 import { EmptyState, SkeletonTableRow } from '../components/ui/EmptyState'
 import { friendlyError } from '../components/ui/Alert'
 import { useToast } from '../context/ToastContext'
-import { CLINICAL_SPECIALTIES, getDoctorSpecialty } from '../constants/clinicalSpecialties'
+import { useBranding } from '../context/BrandingContext'
+import { getDoctorSpecialty, getScopedSpecialties } from '../constants/clinicalSpecialties'
 
 export const STRUCTURED_TRIAGE_REASONS = [
   { code: 'chest_pain', label: 'Severe Chest Pain / Pressure', severe: true },
@@ -24,8 +25,9 @@ interface QueueAppointment {
   tokenNumber: string
   patientName: string
   doctorName: string
+  doctorSpecialty?: string
   time: string
-  status: 'expected' | 'waiting' | 'in_nursing' | 'in_consultation' | 'completed'
+  status: 'expected' | 'waiting' | 'in_nursing' | 'in_consultation' | 'completed' | 'parked'
   priority: 'normal' | 'emergency'
   triageReasonCode?: string
   triageConfirmed?: boolean
@@ -51,12 +53,27 @@ const mapStatus = (status: string): QueueAppointment['status'] => {
   if (s === 'in_nursing' || s === 'innursing') return 'in_nursing'
   if (s === 'in_consultation' || s === 'inconsultation') return 'in_consultation'
   if (s === 'completed') return 'completed'
+  if (s === 'parked') return 'parked'
   return 'expected'
+}
+
+// Parked, completed, cancelled and no-show rows must never be announced as "now calling".
+const isActiveQueueRow = (a: QueueAppointment) =>
+  a.status === 'waiting' || a.status === 'in_nursing' || a.status === 'in_consultation'
+
+const pickNowServing = (rows: QueueAppointment[]): QueueAppointment | null => {
+  const active = rows.filter(isActiveQueueRow)
+  const inConsult = active.find(a => a.status === 'in_consultation')
+  if (inConsult) return inConsult
+  const called = active.filter(a => a.calledAt)
+  if (called.length === 0) return null
+  return called.reduce((latest, a) => (a.calledAt! > latest.calledAt! ? a : latest))
 }
 
 export default function Queue() {
   const navigate = useNavigate()
   const { toast } = useToast()
+  const { branding } = useBranding()
   const [selectedDoctor, setSelectedDoctor] = useState('all')
   const [selectedSpecialty, setSelectedSpecialty] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
@@ -72,6 +89,8 @@ export default function Queue() {
   const [reasonError, setReasonError] = useState('')
   const [saving, setSaving] = useState(false)
 
+  const scopedSpecialties = useMemo(() => getScopedSpecialties(branding.specialties), [branding.specialties])
+
   const fetchQueue = useCallback(async (quiet = false) => {
     try {
       if (!quiet) setLoading(true)
@@ -83,6 +102,7 @@ export default function Queue() {
         tokenNumber: a.queueToken != null ? `A-${String(a.queueToken).padStart(2, '0')}` : a.time,
         patientName: a.patientName,
         doctorName: a.doctorName,
+        doctorSpecialty: a.doctorSpecialty ?? undefined,
         time: a.time,
         status: mapStatus(a.status),
         priority: a.priority === 'emergency' ? 'emergency' : 'normal',
@@ -122,12 +142,39 @@ export default function Queue() {
     }
   }
 
-  // The board shows the most recent persisted call, so it survives reloads and other desks see it.
-  const nowServing = useMemo(() => {
-    const called = appointments.filter(a => a.calledAt)
-    if (called.length === 0) return null
-    return called.reduce((latest, a) => (a.calledAt! > latest.calledAt! ? a : latest))
-  }, [appointments])
+  const handleCheckIn = async (patient: QueueAppointment) => {
+    try {
+      const res = await api.post(`/appointments/${patient.id}/check-in`)
+      const token = res.data.queueToken ? `A-${String(res.data.queueToken).padStart(2, '0')}` : 'Checked In'
+      toast(`✅ Checked in ${patient.patientName}. Issued Token ${token}`)
+      fetchQueue(true)
+    } catch (err) {
+      toast(friendlyError(err))
+    }
+  }
+
+  // Group queue by active doctor to display doctor rooms, readiness, and next in line
+  const doctorRoomStates = useMemo(() => {
+    return doctors.map(docName => {
+      const docAppts = appointments.filter(a => a.doctorName === docName)
+      const inConsult = docAppts.find(a => a.status === 'in_consultation')
+      const waitingList = docAppts.filter(a => a.status === 'waiting')
+      const nextWaiting = waitingList[0] || null
+      const spec = getDoctorSpecialty(docName, docAppts[0]?.doctorSpecialty)
+
+      return {
+        doctorName: docName,
+        specialty: spec,
+        inConsult,
+        waitingCount: waitingList.length,
+        nextWaiting,
+        isReady: !inConsult && waitingList.length > 0,
+      }
+    })
+  }, [doctors, appointments])
+
+  // The board shows the patient inside the room, or the latest persisted call while they walk in.
+  const nowServing = useMemo(() => pickNowServing(appointments), [appointments])
 
   const handleTransitionStatus = async (patient: QueueAppointment, newStatus: string) => {
     try {
@@ -140,7 +187,7 @@ export default function Queue() {
   }
 
   const handleStartConsultation = async (patient: QueueAppointment) => {
-    const spec = getDoctorSpecialty(patient.doctorName)
+    const spec = getDoctorSpecialty(patient.doctorName, patient.doctorSpecialty)
     try {
       if (patient.status === 'waiting' || patient.status === 'in_nursing') {
         await api.put(`/appointments/${patient.id}`, { status: 'in_consultation' })
@@ -217,7 +264,7 @@ export default function Queue() {
       if (selectedDoctor !== 'all' && q.doctorName !== selectedDoctor) return false
 
       if (selectedSpecialty !== 'all') {
-        const spec = getDoctorSpecialty(q.doctorName)
+        const spec = getDoctorSpecialty(q.doctorName, q.doctorSpecialty)
         if (spec.id !== selectedSpecialty) return false
       }
 
@@ -290,8 +337,136 @@ export default function Queue() {
             </div>
           </div>
           <span className="badge bg-white text-teal-800 font-mono text-xs">
-            {new Date(nowServing.calledAt!).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+            {nowServing.calledAt
+              ? new Date(nowServing.calledAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
+              : 'In room'}
           </span>
+        </div>
+      )}
+
+      {/* ── Receptionist Action Center: Doctor Consultation Rooms & Calling Desk ── */}
+      {doctorRoomStates.length > 0 && (
+        <div className="card p-4 space-y-3 bg-[var(--color-surface-raised)] border border-[var(--color-border)] shadow-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-[var(--color-border)] pb-2.5 gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🛎️</span>
+              <div>
+                <h2 className="text-xs font-bold text-[var(--color-text)] uppercase tracking-wider font-heading">
+                  Receptionist Calling &amp; Doctor Readiness Desk
+                </h2>
+                <p className="text-[11px] text-[var(--color-text-muted)]">
+                  Live room occupancy, doctor readiness, and one-click patient announcements into consulting rooms.
+                </p>
+              </div>
+            </div>
+            <span className="badge badge-neutral text-[10px] self-start sm:self-auto font-mono">
+              {doctorRoomStates.length} Active {doctorRoomStates.length === 1 ? 'Desk' : 'Desks'} Today
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {doctorRoomStates.map((room, idx) => {
+              const spec = room.specialty
+              return (
+                <div
+                  key={room.doctorName}
+                  className={`p-3.5 rounded-xl border flex flex-col justify-between transition-all ${
+                    room.isReady
+                      ? 'bg-emerald-50/50 dark:bg-emerald-950/20 border-emerald-300 dark:border-emerald-800/60 shadow-xs'
+                      : room.inConsult
+                        ? 'bg-teal-50/40 dark:bg-teal-950/20 border-teal-300 dark:border-teal-800/50'
+                        : 'bg-[var(--color-surface)] border-[var(--color-border)]'
+                  }`}
+                >
+                  <div className="space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="font-bold text-xs text-[var(--color-text)]">Room {idx + 1}: {room.doctorName}</div>
+                        <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 mt-0.5 rounded border ${spec.badgeBg} ${spec.badgeText} ${spec.badgeBorder}`}>
+                          <span>{spec.icon}</span>
+                          <span>{spec.name}</span>
+                        </span>
+                      </div>
+
+                      {room.inConsult ? (
+                        <span className="badge badge-brand text-[10px] shrink-0 font-semibold">
+                          <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse"></span>
+                          In Consult
+                        </span>
+                      ) : room.isReady ? (
+                        <span className="badge badge-success text-[10px] shrink-0 font-semibold">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                          Ready for Patient
+                        </span>
+                      ) : (
+                        <span className="badge badge-neutral text-[10px] shrink-0">Idle / Clear</span>
+                      )}
+                    </div>
+
+                    {/* Room Occupancy Status */}
+                    {room.inConsult ? (
+                      <div className="p-2 rounded-lg bg-[var(--color-surface)] dark:bg-slate-900 border border-[var(--color-border)] text-xs">
+                        <div className="text-[10px] text-[var(--color-text-muted)] font-mono uppercase tracking-wide">Inside Consulting Room:</div>
+                        <div className="font-bold text-[var(--color-text)] flex items-center justify-between mt-0.5">
+                          <span>{room.inConsult.tokenNumber} · {room.inConsult.patientName}</span>
+                          <span className="text-[10px] text-teal-600 dark:text-teal-400 font-mono">Exam in progress</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="p-2 rounded-lg bg-[var(--color-surface)] dark:bg-slate-900 border border-[var(--color-border)] text-xs">
+                        <div className="text-[10px] text-[var(--color-text-muted)] font-mono uppercase tracking-wide">Doctor Room Status:</div>
+                        <div className="font-medium text-slate-700 dark:text-slate-300 mt-0.5 text-[11px]">
+                          {room.waitingCount > 0 ? 'Consulting room free — ready to call next patient' : 'No patients currently waiting for this doctor'}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Next In Line for this Doctor */}
+                    {room.nextWaiting ? (
+                      <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-bold text-[var(--color-text-secondary)]">Next Patient in Waiting Line:</span>
+                          <span className="queue-token font-mono font-bold text-[11px] py-0.5 px-1.5">
+                            {room.nextWaiting.tokenNumber}
+                          </span>
+                        </div>
+                        <div className="font-bold text-[var(--color-text)] truncate">{room.nextWaiting.patientName}</div>
+                        <div className="text-[10px] text-[var(--color-text-muted)]">Slot: {room.nextWaiting.time} · {room.waitingCount} in waiting line</div>
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-[var(--color-text-muted)] italic py-1 text-center">
+                        Queue is currently clear for this room.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Actions for Receptionist */}
+                  <div className="pt-2.5 mt-2 border-t border-[var(--color-border)] flex items-center justify-between gap-1.5">
+                    {room.nextWaiting ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleCallPatient(room.nextWaiting!)}
+                          className="btn btn-primary btn-sm text-xs flex-1 flex items-center justify-center gap-1 font-semibold"
+                          title="Call patient forward from front desk into consulting room"
+                        >
+                          <span>📢 Call to Room</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleTransitionStatus(room.nextWaiting!, 'parked')}
+                          className="btn btn-secondary btn-sm text-xs"
+                          title="Patient stepped away or missing from lobby — put on hold and proceed to next"
+                        >
+                          <span>⏸️ Hold</span>
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
         </div>
       )}
 
@@ -374,9 +549,9 @@ export default function Queue() {
           )}
         </div>
 
-        {/* Clinical Disciplines Pills */}
+        {/* Clinical Disciplines Pills (Scoped to Clinic Specialties) */}
         <div className="flex items-center gap-1.5 overflow-x-auto pt-2 border-t border-slate-200 dark:border-slate-800 scrollbar-none">
-          {CLINICAL_SPECIALTIES.map(spec => {
+          {scopedSpecialties.map(spec => {
             const isSelected = selectedSpecialty === spec.id
             return (
               <button
@@ -445,7 +620,7 @@ export default function Queue() {
                 )}
 
                 {!loading && filteredQueue.map((patient) => {
-                  const spec = getDoctorSpecialty(patient.doctorName)
+                  const spec = getDoctorSpecialty(patient.doctorName, patient.doctorSpecialty)
                   const isWaiting = patient.status === 'waiting'
                   const isCompleted = patient.status === 'completed'
 
@@ -486,15 +661,31 @@ export default function Queue() {
                             <span className="badge badge-primary">
                               <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse"></span> In Consultation
                             </span>
+                          ) : patient.status === 'parked' ? (
+                            <span className="badge badge-neutral">
+                              <span>⏸️ On Hold</span>
+                            </span>
                           ) : isCompleted ? (
                             <span className="badge badge-success">Completed</span>
                           ) : (
-                            <span className="badge badge-neutral">Scheduled</span>
+                            <span className="badge badge-neutral">Expected</span>
                           )}
                         </div>
                       </td>
                       <td className="text-right">
                         <div className="flex items-center justify-end gap-1.5">
+                          {patient.status === 'expected' && (
+                            <button
+                              type="button"
+                              onClick={() => handleCheckIn(patient)}
+                              className="btn btn-primary btn-sm flex items-center gap-1 font-semibold"
+                              title="Check in patient at front desk & issue atomic queue token"
+                              style={{ fontSize: '11px', padding: '3px 10px' }}
+                            >
+                              <span>📥 Check In</span>
+                            </button>
+                          )}
+
                           {isWaiting && (
                             <>
                               <button
@@ -526,6 +717,15 @@ export default function Queue() {
                               </button>
                               <button
                                 type="button"
+                                onClick={() => handleTransitionStatus(patient, 'parked')}
+                                className="btn btn-ghost btn-sm text-xs"
+                                title="Patient stepped away (restroom, pharmacy, outside) — put on hold"
+                                style={{ fontSize: '11px', padding: '3px 6px' }}
+                              >
+                                ⏸️
+                              </button>
+                              <button
+                                type="button"
                                 onClick={() => openEmergencyModal(patient)}
                                 className={`btn btn-sm ${
                                   patient.priority === 'emergency' ? 'btn-secondary' : 'btn-danger'
@@ -544,6 +744,18 @@ export default function Queue() {
                                 🔗
                               </button>
                             </>
+                          )}
+
+                          {patient.status === 'parked' && (
+                            <button
+                              type="button"
+                              onClick={() => handleTransitionStatus(patient, 'checked_in')}
+                              className="btn btn-secondary btn-sm flex items-center gap-1 font-semibold"
+                              title="Patient returned to lobby — resume in live waiting line"
+                              style={{ fontSize: '11px', padding: '3px 9px' }}
+                            >
+                              <span>▶️ Resume</span>
+                            </button>
                           )}
 
                           {patient.status === 'in_nursing' && (

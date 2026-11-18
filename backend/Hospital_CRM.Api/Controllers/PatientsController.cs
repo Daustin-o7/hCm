@@ -248,7 +248,7 @@ public class PatientsController : ControllerBase
     }
 
     [HttpGet("summary")]
-    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
+    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist", "Nurse")]
     [RequirePermission(Permissions.PatientsRead)]
     public async Task<IActionResult> Summary(CancellationToken ct)
     {
@@ -260,7 +260,7 @@ public class PatientsController : ControllerBase
     }
 
     [HttpGet("paged")]
-    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
+    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist", "Nurse")]
     [RequirePermission(Permissions.PatientsRead)]
     public async Task<IActionResult> GetPaged(
         [FromQuery] int page = 1,
@@ -351,7 +351,7 @@ public class PatientsController : ControllerBase
     }
 
     [HttpGet]
-    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist")]
+    [AuthorizeRoles("ClinicAdmin", "Doctor", "Receptionist", "Nurse")]
     [RequirePermission(Permissions.PatientsRead)]
     public async Task<IActionResult> GetAll(CancellationToken ct)
     {

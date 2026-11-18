@@ -14,9 +14,19 @@ namespace Hospital_CRM.Api.Controllers;
 [RequireModule(ModuleRegistry.Wishlist)]
 public class WishlistItemsController : ControllerBase
 {
+    // Matches WishlistItem.Text HasMaxLength; a longer value would fail in PostgreSQL as a 500.
+    private const int MaxTextLength = 1000;
     private readonly HospitalCrmDbContext _db;
 
     public WishlistItemsController(HospitalCrmDbContext db) => _db = db;
+
+    private static bool TryParseDefined<TEnum>(string? value, out TEnum result) where TEnum : struct, Enum
+    {
+        result = default;
+        return !string.IsNullOrWhiteSpace(value) &&
+               Enum.TryParse(value, true, out result) &&
+               Enum.IsDefined(result);
+    }
 
     [HttpGet]
     [AuthorizeRoles("Doctor", "ClinicAdmin")]
@@ -25,9 +35,10 @@ public class WishlistItemsController : ControllerBase
         var tenantId = User.GetTenantId() ?? Guid.Empty;
         var query = _db.WishlistItems.Where(w => w.TenantId == tenantId);
 
-        if (!string.IsNullOrWhiteSpace(status) &&
-            Enum.TryParse<WishlistStatus>(status, true, out var statusEnum))
+        if (!string.IsNullOrWhiteSpace(status))
         {
+            if (!TryParseDefined<WishlistStatus>(status, out var statusEnum))
+                return BadRequest(new { error = "invalid_status" });
             query = query.Where(w => w.Status == statusEnum);
         }
 
@@ -41,6 +52,8 @@ public class WishlistItemsController : ControllerBase
                 category = w.Category.ToString().ToLower(),
                 status = w.Status.ToString().ToLower(),
                 createdBy = w.CreatedBy,
+                // Correlated lookup, not a navigation join: a missing or out-of-scope author must not drop the row.
+                createdByName = _db.Users.Where(u => u.Id == w.CreatedBy).Select(u => u.Name).FirstOrDefault(),
                 createdAt = w.CreatedAt,
                 updatedAt = w.UpdatedAt
             })
@@ -56,7 +69,11 @@ public class WishlistItemsController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.Text))
             return BadRequest(new { error = "text_required" });
 
-        if (!Enum.TryParse<WishlistCategory>(request.Category, true, out var category))
+        var text = request.Text.Trim();
+        if (text.Length > MaxTextLength)
+            return BadRequest(new { error = "text_too_long", maxLength = MaxTextLength });
+
+        if (!TryParseDefined<WishlistCategory>(request.Category, out var category))
             return BadRequest(new { error = "invalid_category" });
 
         var userId = User.GetUserId();
@@ -69,7 +86,7 @@ public class WishlistItemsController : ControllerBase
             Id = Guid.NewGuid(),
             TenantId = tenantId,
             CreatedBy = userId.Value,
-            Text = request.Text,
+            Text = text,
             Category = category,
             Status = WishlistStatus.Open,
             CreatedAt = DateTimeOffset.UtcNow
@@ -95,16 +112,29 @@ public class WishlistItemsController : ControllerBase
         if (item is null)
             return NotFound(new { error = "item_not_found" });
 
-        if (!string.IsNullOrWhiteSpace(request.Text))
-            item.Text = request.Text;
+        if (request.Text is not null)
+        {
+            var text = request.Text.Trim();
+            if (text.Length == 0)
+                return BadRequest(new { error = "text_required" });
+            if (text.Length > MaxTextLength)
+                return BadRequest(new { error = "text_too_long", maxLength = MaxTextLength });
+            item.Text = text;
+        }
 
-        if (!string.IsNullOrWhiteSpace(request.Category) &&
-            Enum.TryParse<WishlistCategory>(request.Category, true, out var category))
+        if (request.Category is not null)
+        {
+            if (!TryParseDefined<WishlistCategory>(request.Category, out var category))
+                return BadRequest(new { error = "invalid_category" });
             item.Category = category;
+        }
 
-        if (!string.IsNullOrWhiteSpace(request.Status) &&
-            Enum.TryParse<WishlistStatus>(request.Status, true, out var status))
+        if (request.Status is not null)
+        {
+            if (!TryParseDefined<WishlistStatus>(request.Status, out var status))
+                return BadRequest(new { error = "invalid_status" });
             item.Status = status;
+        }
 
         item.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(ct);

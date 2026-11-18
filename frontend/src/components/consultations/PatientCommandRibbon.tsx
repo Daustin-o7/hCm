@@ -18,6 +18,8 @@ interface PatientCommandRibbonProps {
   onRecallPatient?: () => void
   onToggleContextPanel?: () => void
   isContextPanelOpen?: boolean
+  onPrintPrescription?: () => void
+  canPrint?: boolean
 }
 
 export default function PatientCommandRibbon({
@@ -34,7 +36,9 @@ export default function PatientCommandRibbon({
   onParkPatient,
   onRecallPatient,
   onToggleContextPanel,
-  isContextPanelOpen
+  isContextPanelOpen,
+  onPrintPrescription,
+  canPrint
 }: PatientCommandRibbonProps) {
   const [copiedPhone, setCopiedPhone] = useState(false)
 
@@ -72,9 +76,9 @@ export default function PatientCommandRibbon({
         <EmptyState
           illustration={
             <svg width="60" height="60" viewBox="0 0 80 80" fill="none" aria-hidden="true">
-              <circle cx="40" cy="40" r="36" stroke="currentColor" strokeWidth="1.5" strokeDasharray="8 4" opacity="0.3"/>
-              <path d="M24 40 L40 24 L56 40 L40 56 Z" stroke="currentColor" strokeWidth="2" fill="none" opacity="0.5"/>
-              <circle cx="40" cy="40" r="4" fill="currentColor" opacity="0.6"/>
+              <circle cx="40" cy="40" r="36" stroke="currentColor" strokeWidth="1.5" strokeDasharray="8 4" opacity="0.3" />
+              <path d="M24 40 L40 24 L56 40 L40 56 Z" stroke="currentColor" strokeWidth="2" fill="none" opacity="0.5" />
+              <circle cx="40" cy="40" r="4" fill="currentColor" opacity="0.6" />
             </svg>
           }
           title="No patients in today's queue"
@@ -176,11 +180,10 @@ export default function PatientCommandRibbon({
             <button
               type="button"
               onClick={onToggleContextPanel}
-              className={`btn btn-xs flex items-center gap-1 transition-colors ${
-                isContextPanelOpen
-                  ? 'btn-primary'
-                  : 'btn-secondary text-teal-800 border-teal-200 hover:bg-teal-50'
-              }`}
+              className={`btn btn-xs flex items-center gap-1 transition-colors ${isContextPanelOpen
+                ? 'btn-primary'
+                : 'btn-secondary text-teal-800 border-teal-200 hover:bg-teal-50'
+                }`}
               title="Toggle Clinical History, Vitals & Allergies"
             >
               <span>📊 Context &amp; Vitals</span>
@@ -197,15 +200,15 @@ export default function PatientCommandRibbon({
               {(selectedAppointment.status === 'CheckedIn' ||
                 selectedAppointment.status === 'Waiting' ||
                 selectedAppointment.status === 'InNursing') && onClaimPatient && (
-                <button
-                  type="button"
-                  onClick={onClaimPatient}
-                  className="btn btn-xs bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center gap-1 shadow-2xs"
-                  title="Claim this patient for consultation (atomic)"
-                >
-                  <span>🩺 Claim Patient</span>
-                </button>
-              )}
+                  <button
+                    type="button"
+                    onClick={onClaimPatient}
+                    className="btn btn-xs bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center gap-1 shadow-2xs"
+                    title="Claim this patient for consultation (atomic)"
+                  >
+                    <span>🩺 Claim Patient</span>
+                  </button>
+                )}
 
               {/* Park Button: when patient steps out for urine/lab test */}
               {selectedAppointment.status === 'InConsultation' && onParkPatient && (
@@ -228,6 +231,18 @@ export default function PatientCommandRibbon({
                   title="Recall parked patient back to consultation"
                 >
                   <span>▶️ Recall</span>
+                </button>
+              )}
+
+              {/* Direct Reprint Button: when consultation is finalized */}
+              {canPrint && onPrintPrescription && (
+                <button
+                  type="button"
+                  onClick={onPrintPrescription}
+                  className="btn btn-xs bg-slate-700 hover:bg-slate-800 text-white font-semibold flex items-center gap-1 shadow-2xs"
+                  title="Print / Download Official Prescription Slip"
+                >
+                  <span>🖨️ Print Rx</span>
                 </button>
               )}
             </>

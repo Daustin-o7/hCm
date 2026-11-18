@@ -22,9 +22,10 @@ export const CLINICAL_SPECIALTIES: SpecialtyMeta[] = [
   { id: 'ayurveda', name: 'Ayurveda & AYUSH', icon: '🌿', badgeBg: 'bg-teal-50 dark:bg-teal-950/60', badgeText: 'text-teal-700 dark:text-teal-300', badgeBorder: 'border-teal-200 dark:border-teal-800' },
 ]
 
-export function getDoctorSpecialty(doctorName: string, explicitSpecialty?: string): SpecialtyMeta {
+export function getDoctorSpecialty(doctorName: string, explicitSpecialty?: string | null): SpecialtyMeta {
   if (explicitSpecialty) {
-    const found = CLINICAL_SPECIALTIES.find(s => s.id === explicitSpecialty)
+    const key = explicitSpecialty.trim().toLowerCase()
+    const found = CLINICAL_SPECIALTIES.find(s => s.id === key || s.name.toLowerCase() === key)
     if (found) return found
   }
   const lower = doctorName.toLowerCase()
@@ -56,4 +57,14 @@ export function getDoctorSpecialty(doctorName: string, explicitSpecialty?: strin
     return CLINICAL_SPECIALTIES.find(s => s.id === 'ayurveda')!
   }
   return CLINICAL_SPECIALTIES.find(s => s.id === 'general')!
+}
+
+export function getScopedSpecialties(clinicSpecialties?: string[] | null): SpecialtyMeta[] {
+  if (!clinicSpecialties || clinicSpecialties.length === 0) {
+    return CLINICAL_SPECIALTIES
+  }
+  const allowed = new Set(clinicSpecialties.map(s => s.toLowerCase()))
+  const filtered = CLINICAL_SPECIALTIES.filter(s => s.id !== 'all' && allowed.has(s.id.toLowerCase()))
+  if (filtered.length === 0) return CLINICAL_SPECIALTIES
+  return [CLINICAL_SPECIALTIES[0], ...filtered]
 }

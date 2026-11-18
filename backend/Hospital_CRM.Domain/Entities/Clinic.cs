@@ -15,6 +15,9 @@ public class Clinic : ITenantScoped
     [MaxLength(100)]
     public string? OrganizationType { get; set; }
 
+    [MaxLength(500)]
+    public string? Specialties { get; set; }
+
     [MaxLength(255)]
     public string? LegalName { get; set; }
 

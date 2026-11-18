@@ -61,19 +61,22 @@ public class InventoryController : ControllerBase
     [AuthorizeRoles("ClinicAdmin", "Receptionist")]
     public async Task<IActionResult> CreateItem([FromBody] CreateInventoryItemRequest request, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Unit))
+        var name = request.Name?.Trim();
+        var unit = request.Unit?.Trim();
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(unit))
             return BadRequest(new { error = "name_and_unit_required" });
 
-        if (!Enum.TryParse<InventoryTier>(request.Tier, true, out var tier))
+        // Enum.TryParse alone accepts "99", which is not a tier.
+        if (!Enum.TryParse<InventoryTier>(request.Tier, true, out var tier) || !Enum.IsDefined(tier))
             return BadRequest(new { error = "invalid_tier" });
 
         var item = new InventoryItem
         {
             Id = Guid.NewGuid(),
             TenantId = User.GetTenantId() ?? Guid.Empty,
-            Name = request.Name,
+            Name = name,
             Tier = tier,
-            Unit = request.Unit,
+            Unit = unit,
             LowStockThreshold = request.LowStockThreshold ?? 0,
             Active = true,
             CreatedAt = DateTimeOffset.UtcNow
@@ -101,8 +104,18 @@ public class InventoryController : ControllerBase
             return NotFound(new { error = "item_not_found" });
 
         // Soft-deactivate only — historical stock_movements must still reference this row
-        if (!string.IsNullOrWhiteSpace(request.Name)) item.Name = request.Name;
-        if (!string.IsNullOrWhiteSpace(request.Unit)) item.Unit = request.Unit;
+        if (request.Name is not null)
+        {
+            var name = request.Name.Trim();
+            if (name.Length == 0) return BadRequest(new { error = "name_required" });
+            item.Name = name;
+        }
+        if (request.Unit is not null)
+        {
+            var unit = request.Unit.Trim();
+            if (unit.Length == 0) return BadRequest(new { error = "unit_required" });
+            item.Unit = unit;
+        }
         if (request.LowStockThreshold.HasValue) item.LowStockThreshold = request.LowStockThreshold.Value;
         if (request.Active.HasValue) item.Active = request.Active.Value;
         item.UpdatedAt = DateTimeOffset.UtcNow;
@@ -128,7 +141,8 @@ public class InventoryController : ControllerBase
         if (request.Quantity <= 0)
             return BadRequest(new { error = "quantity_must_be_positive" });
 
-        if (!Enum.TryParse<MovementDirection>(request.Direction, true, out var direction))
+        // TryParse alone accepts "99", which is neither in nor out.
+        if (!Enum.TryParse<MovementDirection>(request.Direction, true, out var direction) || !Enum.IsDefined(direction))
             return BadRequest(new { error = "invalid_direction" });
 
         var tenantId = User.GetTenantId() ?? Guid.Empty;
@@ -208,6 +222,7 @@ public class InventoryController : ControllerBase
                 direction = m.Direction.ToString().ToLower(),
                 note = m.Note,
                 recordedBy = m.RecordedBy,
+                recordedByName = m.Recorder.Name,
                 recordedAt = m.RecordedAt
             })
             .ToListAsync(ct);
@@ -225,23 +240,30 @@ public class InventoryController : ControllerBase
             .Where(i => i.TenantId == tenantId && i.Active && i.LowStockThreshold > 0)
             .ToListAsync(ct);
 
-        var report = new List<object>();
-        foreach (var item in items)
-        {
-            var balance = await GetBalanceAsync(item.Id, ct);
-            if (balance <= item.LowStockThreshold)
+        // One grouped query instead of one per item (FR-09-03 performance NFR).
+        var balances = await _db.StockMovements
+            .Where(m => m.TenantId == tenantId)
+            .GroupBy(m => m.ItemId)
+            .Select(g => new
             {
-                report.Add(new
-                {
-                    itemId = item.Id,
-                    name = item.Name,
-                    tier = item.Tier.ToString().ToLower(),
-                    unit = item.Unit,
-                    balance,
-                    lowStockThreshold = item.LowStockThreshold
-                });
-            }
-        }
+                ItemId = g.Key,
+                Total = g.Sum(m => m.Direction == MovementDirection.In ? m.Quantity : -m.Quantity)
+            })
+            .ToDictionaryAsync(x => x.ItemId, x => x.Total, ct);
+
+        var report = items
+            .Select(item => new { item, balance = balances.GetValueOrDefault(item.Id, 0) })
+            .Where(x => x.balance <= x.item.LowStockThreshold)
+            .Select(x => new
+            {
+                itemId = x.item.Id,
+                name = x.item.Name,
+                tier = x.item.Tier.ToString().ToLower(),
+                unit = x.item.Unit,
+                balance = x.balance,
+                lowStockThreshold = x.item.LowStockThreshold
+            })
+            .ToList();
         return Ok(report);
     }
 }

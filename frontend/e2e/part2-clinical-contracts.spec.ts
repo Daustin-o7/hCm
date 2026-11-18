@@ -548,3 +548,19 @@ test('PDF helper validates authenticated binary responses and releases object UR
   expect(await page.locator('a[download]').count()).toBe(0)
   expect(unexpected).toEqual([])
 })
+
+test('consultation ribbon never invents a token or patient demographics', async ({ page }) => {
+  const visitWithoutIdentity = { id: ids.visit, patientId: ids.patient, patientName: 'Synthetic Alpha', status: 'InConsultation' }
+  const unexpected = await openClinical(page, path => {
+    if (path === '/appointments') return { json: [visitWithoutIdentity] }
+    if (path.endsWith('/clinical-context')) return { json: { patient: { id: ids.patient, name: 'Synthetic Alpha', phone: '', allergies: [] } } }
+    return undefined
+  })
+
+  await expect(page.getByRole('heading', { name: 'Synthetic Alpha' })).toBeVisible()
+  await expect(page.getByText('+91 98765 43210')).toHaveCount(0)
+  await expect(page.getByText('Female, 28y')).toHaveCount(0)
+  await expect(page.getByText(/Token #/)).toHaveCount(0)
+  await expect(page.getByText('Phone not recorded')).toBeVisible()
+  expect(unexpected).toEqual([])
+})

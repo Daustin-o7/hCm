@@ -5,6 +5,7 @@ using System.Text.Json;
 using Hospital_CRM.Api.Controllers;
 using Hospital_CRM.Api.Services;
 using Hospital_CRM.Domain.Entities;
+using Hospital_CRM.Domain.Enums;
 using Hospital_CRM.Infrastructure.Data;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
@@ -189,6 +190,77 @@ public sealed class Part2FilesJobsLabTests : IDisposable
         var huge = new FormFile(new MemoryStream(Pdf), 0, LabFileStorage.MaxFileSizeBytes + 1L, "file", "large.pdf");
         Assert.Equal(413, Assert.IsType<ObjectResult>(await controller.EnterResult(_order, null, false, null, null, huge, default)).StatusCode);
         Assert.Empty(await db.LabResults.ToListAsync());
+    }
+
+    [Theory]
+    [InlineData("report.pdf", "%PDF-1.7 ok", true)]
+    [InlineData("report.png", "\u0089PNG\r\n\u001a\nok", true)]
+    [InlineData("report.jpg", "\u00ff\u00d8\u00ffok", true)]
+    [InlineData("report.csv", "test,value\nCBC,5", true)]
+    [InlineData("report.pdf", "<html>not a pdf", false)]
+    [InlineData("report.png", "not a png", false)]
+    [InlineData("report.jpg", "not a jpeg", false)]
+    [InlineData("report.csv", "<html>", false)]
+    [InlineData("report.dcm", "not dicom", false)]
+    public async Task Upload_requires_content_matching_the_extension(string name, string content, bool accepted)
+    {
+        await using var db = Database();
+        var controller = Controller(db, _tenant, "Doctor");
+        var response = await controller.EnterResult(_order, null, false, null, null,
+            Upload(Encoding.Latin1.GetBytes(content), name), default);
+
+        if (accepted)
+        {
+            Assert.IsType<ObjectResult>(response);
+            Assert.Single(await db.LabResults.ToListAsync());
+        }
+        else
+        {
+            Assert.IsType<BadRequestObjectResult>(response);
+            Assert.Empty(await db.LabResults.ToListAsync());
+        }
+    }
+
+    [Fact]
+    public async Task Upload_accepts_a_dicom_file_with_the_magic_at_offset_128()
+    {
+        await using var db = Database();
+        var bytes = new byte[132];
+        Encoding.ASCII.GetBytes("DICM").CopyTo(bytes, 128);
+        var response = await Controller(db, _tenant, "Doctor")
+            .EnterResult(_order, null, false, null, null, Upload(bytes, "scan.dcm"), default);
+        Assert.IsType<ObjectResult>(response);
+    }
+
+    [Fact]
+    public async Task CollectSample_Stores_SpecimenType_And_Barcode_And_Advances_Status()
+    {
+        await using var db = Database();
+        var controller = Controller(db, _tenant, "Nurse");
+        var req = new CollectSampleRequest("EDTA Whole Blood (Purple Top)", "LAB-20261114-001", "Sample collected by Phlebotomist");
+        var result = Assert.IsType<OkObjectResult>(await controller.CollectSample(_order, req, default));
+
+        var order = await db.LabOrders.FindAsync(_order);
+        Assert.NotNull(order);
+        Assert.Equal(LabOrderStatus.SampleCollected, order.Status);
+        Assert.Equal("EDTA Whole Blood (Purple Top)", order.SpecimenType);
+        Assert.Equal("LAB-20261114-001", order.SampleBarcode);
+        Assert.NotNull(order.SampleCollectedAt);
+    }
+
+    [Fact]
+    public async Task CollectSample_cannot_regress_a_resulted_or_reviewed_order()
+    {
+        await using var db = Database();
+        var order = await db.LabOrders.FindAsync(_order);
+        order!.Status = LabOrderStatus.ReviewedByDoctor;
+        await db.SaveChangesAsync();
+
+        var response = await Controller(db, _tenant, "Nurse")
+            .CollectSample(_order, new CollectSampleRequest("Serum", "B-1", null), default);
+
+        Assert.IsType<ConflictObjectResult>(response);
+        Assert.Equal(LabOrderStatus.ReviewedByDoctor, (await db.LabOrders.FindAsync(_order))!.Status);
     }
 
     public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }

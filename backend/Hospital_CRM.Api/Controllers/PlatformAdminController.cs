@@ -81,6 +81,8 @@ public class PlatformAdminController : ControllerBase
                 subscriptionTier = t.SubscriptionTier.ToString().ToLower(),
                 subscriptionStatus = t.SubscriptionStatus.ToString().ToLower(),
                 activatedModules = ModuleRegistry.Parse(t.ActivatedModules),
+                organizationType = t.Clinic != null ? t.Clinic.OrganizationType : null,
+                specialties = t.Clinic != null ? t.Clinic.Specialties : null,
                 createdAt = t.CreatedAt,
                 subscriptionEndsAt = t.SubscriptionEndsAt
             })
@@ -105,6 +107,8 @@ public class PlatformAdminController : ControllerBase
             subscriptionTier = t.SubscriptionTier.ToString().ToLower(),
             subscriptionStatus = t.SubscriptionStatus.ToString().ToLower(),
             activatedModules = ModuleRegistry.Parse(t.ActivatedModules),
+            organizationType = t.Clinic?.OrganizationType,
+            specialties = t.Clinic?.Specialties,
             subscriptionEndsAt = t.SubscriptionEndsAt
         });
     }
@@ -203,6 +207,14 @@ public class PlatformAdminController : ControllerBase
             if (t.Clinic != null) t.Clinic.SubscriptionEndsAt = request.SubscriptionEndsAt;
         }
 
+        if (t.Clinic != null)
+        {
+            if (request.OrganizationType != null)
+                t.Clinic.OrganizationType = string.IsNullOrWhiteSpace(request.OrganizationType) ? null : request.OrganizationType.Trim();
+            if (request.Specialties != null)
+                t.Clinic.Specialties = string.IsNullOrWhiteSpace(request.Specialties) ? null : request.Specialties.Trim();
+        }
+
         t.UpdatedAt = DateTimeOffset.UtcNow;
         if (t.Clinic != null) t.Clinic.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(ct);
@@ -213,7 +225,9 @@ public class PlatformAdminController : ControllerBase
             id = t.Id,
             subscriptionTier = t.SubscriptionTier.ToString().ToLower(),
             subscriptionStatus = t.SubscriptionStatus.ToString().ToLower(),
-            activatedModules = ModuleRegistry.Parse(t.ActivatedModules)
+            activatedModules = ModuleRegistry.Parse(t.ActivatedModules),
+            organizationType = t.Clinic?.OrganizationType,
+            specialties = t.Clinic?.Specialties
         });
     }
 
@@ -609,6 +623,8 @@ public class PlatformAdminController : ControllerBase
                 Id = clinicId,
                 TenantId = tenantId,
                 Name = (request.ClinicName ?? request.Name).Trim(),
+                OrganizationType = string.IsNullOrWhiteSpace(request.OrganizationType) ? null : request.OrganizationType.Trim(),
+                Specialties = string.IsNullOrWhiteSpace(request.Specialties) ? null : request.Specialties.Trim(),
                 Timezone = request.Timezone ?? AccountingTimezones.Kolkata,
                 Currency = request.Currency ?? "INR",
                 SubscriptionTier = tier,
@@ -647,7 +663,9 @@ public class PlatformAdminController : ControllerBase
             // Commit the sole send attempt before calling the provider; a crash leaves an honest unknown outcome.
             response = new(tenantId, clinicId, inviteId, adminInviteToken, adminInviteExpiresAt,
                 _email is null || IdentityEmail.Link(_config, "accept-invite", adminInviteToken) is null ? "not_configured" : "unknown",
-                tier.ToString().ToLowerInvariant(), status.ToString().ToLowerInvariant(), ModuleRegistry.Parse(modules));
+                tier.ToString().ToLowerInvariant(), status.ToString().ToLowerInvariant(), ModuleRegistry.Parse(modules),
+                string.IsNullOrWhiteSpace(request.OrganizationType) ? null : request.OrganizationType.Trim(),
+                string.IsNullOrWhiteSpace(request.Specialties) ? null : request.Specialties.Trim());
             receipt = new TenantProvisioningReceipt
             {
                 Id = Guid.NewGuid(),
@@ -672,14 +690,21 @@ public class PlatformAdminController : ControllerBase
     }
 
     private sealed record ProvisionTenantResponse(Guid tenantId, Guid clinicId, Guid inviteId, string inviteToken,
-        DateTimeOffset inviteExpiresAt, string emailStatus, string subscriptionTier, string subscriptionStatus, string[] activatedModules)
+        DateTimeOffset inviteExpiresAt, string emailStatus, string subscriptionTier, string subscriptionStatus, string[] activatedModules,
+        string? organizationType = null, string? specialties = null)
     {
         public string? emailRetry => emailStatus == "handoff" ? null : "Share the generated link; do not repeat tenant provisioning to resend an invitation.";
     }
 }
 
 
-public record UpdateTenantRequest(string? SubscriptionTier, string? SubscriptionStatus, string[]? ActivatedModules, DateTimeOffset? SubscriptionEndsAt);
+public record UpdateTenantRequest(
+    string? SubscriptionTier,
+    string? SubscriptionStatus,
+    string[]? ActivatedModules,
+    DateTimeOffset? SubscriptionEndsAt,
+    string? OrganizationType = null,
+    string? Specialties = null);
 public record StartImpersonationRequest(Guid TenantId, Guid UserId, string? Reason, int? DurationMinutes = 30);
 public record SetFlagRequest(bool Enabled);
 
@@ -693,4 +718,6 @@ public record ProvisionTenantRequest(
     string[]? ActivatedModules = null,
     DateTimeOffset? SubscriptionEndsAt = null,
     string? Timezone = null,
-    string? Currency = null);
+    string? Currency = null,
+    string? OrganizationType = null,
+    string? Specialties = null);

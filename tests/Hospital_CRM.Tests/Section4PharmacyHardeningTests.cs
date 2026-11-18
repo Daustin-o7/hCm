@@ -495,4 +495,51 @@ public class Section4PharmacyHardeningTests
         Assert.Equal(2, doc.GetProperty("latestVersion").GetInt32());
         Assert.Contains("superseded", doc.GetProperty("statusDescription").GetString(), StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task ComplianceCsv_NeutralisesFormulaInjectionInBatchAndPrescriberFields()
+    {
+        var tenantId = Guid.NewGuid();
+        var userId = Guid.NewGuid();
+        var context = new TenantContext();
+        using var scope = context.PushTenant(tenantId);
+        using var db = CreateInMemoryDb(context);
+
+        var drugId = Guid.NewGuid();
+        db.Drugs.Add(new Drug { Id = drugId, TenantId = tenantId, Name = "Synthetic drug", GenericName = "Synthetic generic" });
+        db.ControlledSubstanceRegisters.Add(new ControlledSubstanceRegister
+        {
+            TenantId = tenantId,
+            DrugId = drugId,
+            ScheduleClass = ScheduleClass.ScheduleH1,
+            DrugName = "Synthetic drug",
+            BatchNumber = "=cmd|' /C calc'!A0",
+            Quantity = 1,
+            PatientName = "Synthetic patient",
+            PatientAddress = "Synthetic address",
+            PrescriberName = "Synthetic prescriber",
+            PrescriberRegNo = "@SUM(1+1)",
+            DispenserName = "Synthetic dispenser",
+            DispensedBy = userId,
+            DispensedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync();
+
+        var controller = new PharmacyComplianceController(db, NullLogger<PharmacyComplianceController>.Instance)
+        {
+            ControllerContext = new ControllerContext
+            {
+                HttpContext = new DefaultHttpContext { User = CreateUserPrincipal(userId, tenantId, "Pharmacist") },
+            },
+        };
+
+        var result = await controller.GetComplianceRegister(null, null, null, exportCsv: true, ct: CancellationToken.None);
+
+        var file = Assert.IsType<FileContentResult>(result);
+        var csv = System.Text.Encoding.UTF8.GetString(file.FileContents);
+        // BatchNumber and PrescriberRegNo are staff-entered, so both need the SEC-015 prefix.
+        Assert.Contains("\"'=cmd|", csv);
+        Assert.Contains("\"'@SUM(1+1)\"", csv);
+        Assert.DoesNotContain("\"=cmd", csv);
+    }
 }

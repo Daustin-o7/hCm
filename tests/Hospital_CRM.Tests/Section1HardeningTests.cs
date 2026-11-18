@@ -257,6 +257,43 @@ public class Section1HardeningTests(Part2TenantBoundaryPostgresFixture postgres)
     }
 
     [Fact]
+    public async Task ReceptionistHoldAndResume_ReturnsPatientToWaitingQueue()
+    {
+        var db = CreateInMemoryDb();
+        var (controller, userId, clinicId, tenantId) = CreateAppointmentsController(db);
+
+        var apt = new Appointment
+        {
+            Id = Guid.NewGuid(),
+            ClinicId = clinicId,
+            TenantId = tenantId,
+            DoctorId = Guid.NewGuid(),
+            PatientId = Guid.NewGuid(),
+            Date = DateOnly.FromDateTime(DateTime.UtcNow),
+            TimeSlot = "10:00",
+            Status = AppointmentStatus.CheckedIn,
+            QueueToken = 1,
+            CalledAt = DateTimeOffset.UtcNow,
+            CalledByUserId = userId
+        };
+        db.Appointments.Add(apt);
+        await db.SaveChangesAsync();
+
+        // Waiting -> Parked (receptionist hold)
+        var hold = await controller.Update(apt.Id, new UpdateAppointmentRequest("parked"), CancellationToken.None);
+        Assert.IsType<OkObjectResult>(hold);
+        Assert.Equal(AppointmentStatus.Parked, (await db.Appointments.FindAsync(apt.Id))!.Status);
+
+        // Parked -> CheckedIn (resume) clears the old call so the board does not re-announce them.
+        var resume = await controller.Update(apt.Id, new UpdateAppointmentRequest("checked_in"), CancellationToken.None);
+        Assert.IsType<OkObjectResult>(resume);
+        var resumed = await db.Appointments.FindAsync(apt.Id);
+        Assert.Equal(AppointmentStatus.CheckedIn, resumed!.Status);
+        Assert.Null(resumed.CalledAt);
+        Assert.Null(resumed.CalledByUserId);
+    }
+
+    [Fact]
     public async Task PatientRegistration_GeneratesUhid_AndAllowsFamilySharingPhone()
     {
         var db = CreateInMemoryDb();

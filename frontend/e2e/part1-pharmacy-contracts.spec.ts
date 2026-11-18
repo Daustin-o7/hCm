@@ -28,6 +28,7 @@ async function openPharmacy(page: Page, handle: (path: string, request: Request)
     if (reply) return reply
     if (request.method() !== 'GET') return undefined
     if (path === '/pharmacy/drugs') return { json: { drugs: [{ ...drug, gstRate: options.gstRate ?? 12 }] } }
+    if (path === '/pharmacy/stats') return { json: { totalDrugs: 1, todaySales: 0, todayInvoicesCount: 0, expiringSoonBatches: 0, expiredBatches: 0, recalledBatches: 0, lowStockCount: 0, scheduleH1Today: 0 } }
     if (path === `/pharmacy/drugs/${drugId}/batches/fefo`) return { json: options.batches ?? [batch] }
     if (path === '/pharmacy/prescriptions/pending') return { json: [{ prescriptionId: rxId, patientName: prescription.patientName,
       doctorName: prescription.doctorName, itemCount: 2, pendingItemCount: 2, createdAt: savedAt }] }

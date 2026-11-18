@@ -8,9 +8,10 @@ import { useToast } from '../context/ToastContext'
 import TwoFactorSettings from '../components/TwoFactorSettings'
 import { fmtDate } from '../utils/format'
 import api, { getSessionGeneration } from '../services/api'
+import { CLINICAL_SPECIALTIES } from '../constants/clinicalSpecialties'
 
 // Mirrors ModuleRegistry (backend, A2). The API rejects unknown codes with 400 unknown_module_code.
-const MODULE_CODES = ['core', 'pharmacy', 'lab', 'inventory', 'finance', 'wishlist', 'emergency', 'precheck', 'notifications']
+const MODULE_CODES = ['core', 'pharmacy', 'lab', 'inventory', 'finance', 'wishlist', 'emergency', 'precheck', 'notifications', 'staff_roster']
 // SubscriptionTier.Trial/Suspended(99) are legacy values, so the picker offers only real tiers.
 const TIERS = ['trial', 'starter', 'professional', 'enterprise', 'enterpriseplus', 'private']
 const STATUSES = ['trial', 'active', 'pastdue', 'suspended', 'cancelled']
@@ -33,6 +34,8 @@ interface Tenant {
   subscriptionTier: string
   subscriptionStatus: string
   activatedModules: string[] | null
+  organizationType?: string | null
+  specialties?: string | null
   createdAt: string
   subscriptionEndsAt: string | null
 }
@@ -43,6 +46,8 @@ interface TenantDetail {
   subscriptionTier: string
   subscriptionStatus: string
   activatedModules: string[] | null
+  organizationType?: string | null
+  specialties?: string | null
   subscriptionEndsAt: string | null
 }
 
@@ -80,6 +85,8 @@ interface TenantForm {
   status: string
   endsAt: string
   modules: string[]
+  organizationType: string
+  specialties: string[]
 }
 
 const toDateInput = (iso: string | null | undefined) => (iso ? iso.slice(0, 10) : '')
@@ -105,7 +112,7 @@ export default function PlatformAdmin() {
 
   const [saving, setSaving] = useState(false)
   const [savingFlag, setSavingFlag] = useState<string | null>(null)
-  const [confirmState, setConfirmState] = useState({ open: false, title: '', description: '', run: () => {} })
+  const [confirmState, setConfirmState] = useState({ open: false, title: '', description: '', run: () => { } })
 
   const [impTarget, setImpTarget] = useState<TenantUser | null>(null)
   const [impReason, setImpReason] = useState('')
@@ -132,6 +139,8 @@ export default function PlatformAdmin() {
   const [inviteCopyStatus, setInviteCopyStatus] = useState('')
   const [prov, setProv] = useState({
     name: '', clinicName: '', adminName: '', adminEmail: '',
+    organizationType: 'Clinic',
+    specialties: ['general'] as string[],
     tier: 'trial', status: 'trial', endsAt: '', timezone: 'Asia/Kolkata', currency: 'INR',
     modules: ['core'] as string[],
   })
@@ -188,11 +197,16 @@ export default function PlatformAdmin() {
       setUsers(Array.isArray(u.data) ? u.data : [])
       setFlags(Array.isArray(f.data) ? f.data : [])
       setLogs(Array.isArray(l.data) ? l.data : [])
+      const specList = tenant.specialties
+        ? tenant.specialties.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        : []
       setForm({
         tier: tenant.subscriptionTier,
         status: tenant.subscriptionStatus,
         endsAt: toDateInput(tenant.subscriptionEndsAt),
         modules: Array.isArray(tenant.activatedModules) ? tenant.activatedModules : [],
+        organizationType: tenant.organizationType || '',
+        specialties: specList,
       })
     } catch (err) {
       setDetailError(friendlyError(err))
@@ -216,7 +230,9 @@ export default function PlatformAdmin() {
     form.tier !== detail.subscriptionTier ||
     form.status !== detail.subscriptionStatus ||
     form.endsAt !== toDateInput(detail.subscriptionEndsAt) ||
-    !sameSet(form.modules, Array.isArray(detail.activatedModules) ? detail.activatedModules : [])
+    !sameSet(form.modules, Array.isArray(detail.activatedModules) ? detail.activatedModules : []) ||
+    form.organizationType !== (detail.organizationType || '') ||
+    !sameSet(form.specialties, detail.specialties ? detail.specialties.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : [])
   )
 
   const doSave = async () => {
@@ -227,6 +243,8 @@ export default function PlatformAdmin() {
         subscriptionTier: form.tier,
         subscriptionStatus: form.status,
         activatedModules: form.modules,
+        organizationType: form.organizationType || null,
+        specialties: form.specialties.length > 0 ? form.specialties.join(',') : null,
       }
       // Send UTC midnight so the stored value round-trips to the same calendar date.
       if (form.endsAt) body.subscriptionEndsAt = new Date(`${form.endsAt}T00:00:00Z`).toISOString()
@@ -237,9 +255,11 @@ export default function PlatformAdmin() {
         subscriptionTier: res.data.subscriptionTier,
         subscriptionStatus: res.data.subscriptionStatus,
         activatedModules: res.data.activatedModules,
+        organizationType: res.data.organizationType,
+        specialties: res.data.specialties,
         subscriptionEndsAt: form.endsAt ? `${form.endsAt}T00:00:00Z` : d.subscriptionEndsAt,
       } : d)
-      toast('Subscription updated', 'success')
+      toast('Tenant configuration updated', 'success')
       void fetchTenants(query.trim())
     } catch (err) {
       toast(friendlyError(err), 'error')
@@ -369,6 +389,8 @@ export default function PlatformAdmin() {
           clinicName: prov.clinicName.trim() || null,
           adminName: prov.adminName.trim(),
           adminEmail: prov.adminEmail.trim(),
+          organizationType: prov.organizationType || null,
+          specialties: prov.specialties.length > 0 ? prov.specialties.join(',') : null,
           subscriptionTier: prov.tier,
           subscriptionStatus: prov.status,
           activatedModules: prov.modules,
@@ -447,7 +469,12 @@ export default function PlatformAdmin() {
           onClick={() => {
             if (sessionGeneration !== getSessionGeneration()) return
             if (!provAttempt || provResult) {
-              setProv({ name: '', clinicName: '', adminName: '', adminEmail: '', tier: 'trial', status: 'trial', endsAt: '', timezone: 'Asia/Kolkata', currency: 'INR', modules: ['core'] })
+              setProv({
+                name: '', clinicName: '', adminName: '', adminEmail: '',
+                organizationType: 'Clinic', specialties: ['general'],
+                tier: 'trial', status: 'trial', endsAt: '', timezone: 'Asia/Kolkata', currency: 'INR',
+                modules: ['core'],
+              })
               setProvError(null)
               setProvResult(null)
               setProvAttempt(null)
@@ -530,7 +557,14 @@ export default function PlatformAdmin() {
                   <tr key={t.id} className="cursor-pointer" onClick={() => openTenant(t.id)}>
                     <td>
                       <div className="font-bold text-[var(--color-text)]">{t.name}</div>
-                      <div className="mono text-[11px] text-[var(--color-text-muted)]">{t.id.slice(0, 8)}…</div>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <span className="mono text-[11px] text-[var(--color-text-muted)]">{t.id.slice(0, 8)}…</span>
+                        {t.organizationType && (
+                          <span className="badge badge-brand text-[10px] py-0 px-1.5 font-normal">
+                            {t.organizationType}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td><span className="badge badge-neutral">{label(t.subscriptionTier)}</span></td>
                     <td><span className={statusBadge(t.subscriptionStatus)}>{label(t.subscriptionStatus)}</span></td>
@@ -579,7 +613,7 @@ export default function PlatformAdmin() {
             <button className="btn btn-secondary" onClick={closeTenant} disabled={saving}>Close</button>
             <button className="btn btn-primary" onClick={requestSave} disabled={!dirty || saving}>
               {saving && <span className="spinner spinner-sm" />}
-              Save subscription
+              Save changes
             </button>
           </>
         }
@@ -644,6 +678,63 @@ export default function PlatformAdmin() {
                 After the end date the tenant is read-only for 3 days, then blocked. Setting status to Suspended or
                 Cancelled signs users out immediately. The end date can be moved but not cleared.
               </p>
+            </section>
+
+            {/* Facility Configuration & Scope of Practice */}
+            <section className="space-y-3">
+              <div>
+                <h3 className="text-sm font-bold text-[var(--color-text)]">Facility Configuration &amp; Scope of Practice</h3>
+                <p className="text-xs text-[var(--color-text-muted)]">
+                  Configures whether this clinic operates as a single-specialty practice or multi-specialty polyclinic, scoping clinical departments and queue room matrices across the CRM.
+                </p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label htmlFor="tenant-org-type" className="form-label">Organization Type</label>
+                  <select
+                    id="tenant-org-type"
+                    className="form-select w-full"
+                    value={form.organizationType}
+                    onChange={(e) => setForm({ ...form, organizationType: e.target.value })}
+                  >
+                    <option value="">— Unspecified —</option>
+                    <option value="Clinic">Clinic (Single Specialty)</option>
+                    <option value="Polyclinic">Polyclinic (Multi-Specialty)</option>
+                    <option value="Hospital">Hospital</option>
+                    <option value="Diagnostic Center">Diagnostic Center</option>
+                    <option value="Other">Other</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="form-label">Registered Clinical Specialties</label>
+                <div className="flex flex-wrap gap-2 mt-1">
+                  {CLINICAL_SPECIALTIES.filter(s => s.id !== 'all').map(spec => {
+                    const isSelected = form.specialties.includes(spec.id.toLowerCase())
+                    return (
+                      <button
+                        key={spec.id}
+                        type="button"
+                        onClick={() => {
+                          const next = isSelected
+                            ? form.specialties.filter(s => s !== spec.id.toLowerCase())
+                            : [...form.specialties, spec.id.toLowerCase()]
+                          setForm({ ...form, specialties: next })
+                        }}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${isSelected
+                            ? 'bg-teal-50 dark:bg-teal-950/50 text-teal-700 dark:text-teal-300 border-teal-300 dark:border-teal-700 shadow-xs'
+                            : 'bg-[var(--color-surface)] text-[var(--color-text-secondary)] border-[var(--color-border)] hover:bg-[var(--color-surface-hover)]'
+                          }`}
+                      >
+                        <span>{spec.icon}</span>
+                        <span>{spec.name}</span>
+                        {isSelected && <span className="ml-1 text-teal-600 font-bold">✓</span>}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
             </section>
 
             {/* Entitlement and effectiveness */}
@@ -926,75 +1017,118 @@ export default function PlatformAdmin() {
             </p>}
 
             <fieldset disabled={!!provAttempt || provSaving} className="space-y-4">
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div>
-                <label htmlFor="prov-name" className="form-label">Tenant name</label>
-                <input id="prov-name" className="form-input w-full" value={prov.name}
-                  onChange={(e) => setProv(p => ({ ...p, name: e.target.value }))} placeholder="Sunrise Multispecialty" />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label htmlFor="prov-name" className="form-label">Tenant name</label>
+                  <input id="prov-name" className="form-input w-full" value={prov.name}
+                    onChange={(e) => setProv(p => ({ ...p, name: e.target.value }))} placeholder="Sunrise Multispecialty" />
+                </div>
+                <div>
+                  <label htmlFor="prov-clinic" className="form-label">Clinic display name (optional)</label>
+                  <input id="prov-clinic" className="form-input w-full" value={prov.clinicName}
+                    onChange={(e) => setProv(p => ({ ...p, clinicName: e.target.value }))} placeholder="Defaults to the tenant name" />
+                </div>
+                <div>
+                  <label htmlFor="prov-org-type" className="form-label">Organization type</label>
+                  <select id="prov-org-type" className="form-select w-full" value={prov.organizationType}
+                    onChange={(e) => setProv(p => ({ ...p, organizationType: e.target.value }))}>
+                    <option value="Clinic">Clinic (Single Specialty)</option>
+                    <option value="Polyclinic">Polyclinic (Multi-Specialty)</option>
+                    <option value="Hospital">Hospital</option>
+                    <option value="Diagnostic Center">Diagnostic Center</option>
+                    <option value="Other">Other</option>
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="prov-admin" className="form-label">Clinic admin name</label>
+                  <input id="prov-admin" className="form-input w-full" value={prov.adminName}
+                    onChange={(e) => setProv(p => ({ ...p, adminName: e.target.value }))} placeholder="Dr. Meera Rao" />
+                </div>
+                <div>
+                  <label htmlFor="prov-email" className="form-label">Clinic admin email</label>
+                  <input id="prov-email" type="email" className="form-input w-full" value={prov.adminEmail}
+                    onChange={(e) => setProv(p => ({ ...p, adminEmail: e.target.value }))} placeholder="admin@clinic.example" />
+                </div>
+                <div>
+                  <label htmlFor="prov-tier" className="form-label">Tier</label>
+                  <select id="prov-tier" className="form-select w-full" value={prov.tier}
+                    onChange={(e) => setProv(p => ({ ...p, tier: e.target.value }))}>
+                    {TIERS.map(t => <option key={t} value={t}>{label(t)}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="prov-status" className="form-label">Status</label>
+                  <select id="prov-status" className="form-select w-full" value={prov.status}
+                    onChange={(e) => setProv(p => ({ ...p, status: e.target.value }))}>
+                    {STATUSES.map(s => <option key={s} value={s}>{label(s)}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="prov-ends" className="form-label">Subscription ends (optional)</label>
+                  <input id="prov-ends" type="date" className="form-input w-full" value={prov.endsAt}
+                    onChange={(e) => setProv(p => ({ ...p, endsAt: e.target.value }))} />
+                </div>
+                <div>
+                  <label htmlFor="prov-tz" className="form-label">Timezone</label>
+                  <input id="prov-tz" className="form-input w-full" value={prov.timezone}
+                    onChange={(e) => setProv(p => ({ ...p, timezone: e.target.value }))} />
+                </div>
               </div>
-              <div>
-                <label htmlFor="prov-clinic" className="form-label">Clinic display name (optional)</label>
-                <input id="prov-clinic" className="form-input w-full" value={prov.clinicName}
-                  onChange={(e) => setProv(p => ({ ...p, clinicName: e.target.value }))} placeholder="Defaults to the tenant name" />
-              </div>
-              <div>
-                <label htmlFor="prov-admin" className="form-label">Clinic admin name</label>
-                <input id="prov-admin" className="form-input w-full" value={prov.adminName}
-                  onChange={(e) => setProv(p => ({ ...p, adminName: e.target.value }))} placeholder="Dr. Meera Rao" />
-              </div>
-              <div>
-                <label htmlFor="prov-email" className="form-label">Clinic admin email</label>
-                <input id="prov-email" type="email" className="form-input w-full" value={prov.adminEmail}
-                  onChange={(e) => setProv(p => ({ ...p, adminEmail: e.target.value }))} placeholder="admin@clinic.example" />
-              </div>
-              <div>
-                <label htmlFor="prov-tier" className="form-label">Tier</label>
-                <select id="prov-tier" className="form-select w-full" value={prov.tier}
-                  onChange={(e) => setProv(p => ({ ...p, tier: e.target.value }))}>
-                  {TIERS.map(t => <option key={t} value={t}>{label(t)}</option>)}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="prov-status" className="form-label">Status</label>
-                <select id="prov-status" className="form-select w-full" value={prov.status}
-                  onChange={(e) => setProv(p => ({ ...p, status: e.target.value }))}>
-                  {STATUSES.map(s => <option key={s} value={s}>{label(s)}</option>)}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="prov-ends" className="form-label">Subscription ends (optional)</label>
-                <input id="prov-ends" type="date" className="form-input w-full" value={prov.endsAt}
-                  onChange={(e) => setProv(p => ({ ...p, endsAt: e.target.value }))} />
-              </div>
-              <div>
-                <label htmlFor="prov-tz" className="form-label">Timezone</label>
-                <input id="prov-tz" className="form-input w-full" value={prov.timezone}
-                  onChange={(e) => setProv(p => ({ ...p, timezone: e.target.value }))} />
-              </div>
-            </div>
 
-            <fieldset>
-              <legend className="form-label">Modules</legend>
-              <div className="flex flex-wrap gap-x-4 gap-y-2 mt-1">
-                {MODULE_CODES.map(code => (
-                  <label key={code} className="flex items-center gap-2 text-sm text-[var(--color-text)]">
-                    <input
-                      type="checkbox"
-                      checked={prov.modules.includes(code)}
-                      disabled={code === 'core'}
-                      onChange={(e) => setProv(p => ({
-                        ...p,
-                        modules: e.target.checked
-                          ? [...new Set([...p.modules, code])]
-                          : p.modules.filter(m => m !== code),
-                      }))}
-                    />
-                    <span className="capitalize">{code}</span>
-                  </label>
-                ))}
-              </div>
-              <p className="text-xs text-[var(--color-text-muted)] mt-1">Core is always included.</p>
-            </fieldset>
+              <fieldset>
+                <legend className="form-label">Registered Clinical Specialties</legend>
+                <p className="text-xs text-[var(--color-text-muted)] mb-2">
+                  Pre-configures clinical departments for appointments, OPD queue room matrix, and consultations.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {CLINICAL_SPECIALTIES.filter(s => s.id !== 'all').map(spec => {
+                    const isSelected = prov.specialties.includes(spec.id.toLowerCase())
+                    return (
+                      <button
+                        key={spec.id}
+                        type="button"
+                        onClick={() => {
+                          const next = isSelected
+                            ? prov.specialties.filter(s => s !== spec.id.toLowerCase())
+                            : [...prov.specialties, spec.id.toLowerCase()]
+                          setProv(p => ({ ...p, specialties: next }))
+                        }}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${isSelected
+                            ? 'bg-teal-50 dark:bg-teal-950/50 text-teal-700 dark:text-teal-300 border-teal-300 dark:border-teal-700 shadow-xs'
+                            : 'bg-[var(--color-surface)] text-[var(--color-text-secondary)] border-[var(--color-border)] hover:bg-[var(--color-surface-hover)]'
+                          }`}
+                      >
+                        <span>{spec.icon}</span>
+                        <span>{spec.name}</span>
+                        {isSelected && <span className="ml-1 text-teal-600 font-bold">✓</span>}
+                      </button>
+                    )
+                  })}
+                </div>
+              </fieldset>
+
+              <fieldset>
+                <legend className="form-label">Modules</legend>
+                <div className="flex flex-wrap gap-x-4 gap-y-2 mt-1">
+                  {MODULE_CODES.map(code => (
+                    <label key={code} className="flex items-center gap-2 text-sm text-[var(--color-text)]">
+                      <input
+                        type="checkbox"
+                        checked={prov.modules.includes(code)}
+                        disabled={code === 'core'}
+                        onChange={(e) => setProv(p => ({
+                          ...p,
+                          modules: e.target.checked
+                            ? [...new Set([...p.modules, code])]
+                            : p.modules.filter(m => m !== code),
+                        }))}
+                      />
+                      <span className="capitalize">{code}</span>
+                    </label>
+                  ))}
+                </div>
+                <p className="text-xs text-[var(--color-text-muted)] mt-1">Core is always included.</p>
+              </fieldset>
             </fieldset>
           </div>
         )}

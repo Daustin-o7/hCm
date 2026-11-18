@@ -44,11 +44,16 @@ public class NotificationRulesController : ControllerBase
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> Create([FromBody] CreateNotificationRuleRequest request, CancellationToken ct)
     {
-        if (!Enum.TryParse<NotificationRuleType>(request.RuleType, true, out var ruleType))
+        if (!Enum.TryParse<NotificationRuleType>(request.RuleType, true, out var ruleType) || !Enum.IsDefined(ruleType))
             return BadRequest(new { error = "invalid_rule_type" });
 
-        if (request.TimingConfig is null)
-            return BadRequest(new { error = "timing_config_required" });
+        // FR-13-01 allows a fixed set of cadence rules. Confirmation and the 1-day reminder are
+        // owned by booking and ReminderSchedulerService; a rule row for them would never fire.
+        if (ruleType is not (NotificationRuleType.RemindNDaysBefore or NotificationRuleType.RemindIfNoVisitNMonths))
+            return BadRequest(new { error = "rule_type_managed_by_system" });
+
+        if (NormalizeTiming(ruleType, request.TimingConfig) is not { } timing)
+            return BadRequest(new { error = "invalid_timing_config" });
 
         var tenantId = User.GetTenantId() ?? Guid.Empty;
         var template = await _db.MessageTemplates.FindAsync([request.TemplateId], ct);
@@ -60,7 +65,7 @@ public class NotificationRulesController : ControllerBase
             Id = Guid.NewGuid(),
             TenantId = tenantId,
             RuleType = ruleType,
-            TimingConfigJson = request.TimingConfig.Value.GetRawText(),
+            TimingConfigJson = timing,
             TemplateId = request.TemplateId,
             Active = request.Active ?? true,
             CreatedAt = DateTimeOffset.UtcNow
@@ -72,6 +77,7 @@ public class NotificationRulesController : ControllerBase
         {
             id = rule.Id,
             ruleType = rule.RuleType.ToString().ToLower(),
+            timingConfig = JsonSerializer.Deserialize<JsonElement>(rule.TimingConfigJson),
             templateId = rule.TemplateId,
             active = rule.Active
         });
@@ -90,6 +96,22 @@ public class NotificationRulesController : ControllerBase
         await _db.SaveChangesAsync(ct);
 
         return Ok(new { id = rule.Id, active = rule.Active });
+    }
+
+    /// <summary>
+    /// Stores only the key the worker reads (NotificationRulesWorker.GetDaysBefore/GetMonths), so a
+    /// rule can never be saved with a timing shape the evaluator silently ignores.
+    /// </summary>
+    private static string? NormalizeTiming(NotificationRuleType ruleType, JsonElement? timing)
+    {
+        if (timing is not { ValueKind: JsonValueKind.Object } config) return null;
+        var key = ruleType == NotificationRuleType.RemindNDaysBefore ? "daysBefore" : "months";
+        if (!config.TryGetProperty(key, out var value) || value.ValueKind != JsonValueKind.Number ||
+            !value.TryGetInt32(out var number)) return null;
+
+        var (min, max) = ruleType == NotificationRuleType.RemindNDaysBefore ? (0, 365) : (1, 24);
+        if (number < min || number > max) return null;
+        return JsonSerializer.Serialize(new Dictionary<string, int> { [key] = number });
     }
 }
 

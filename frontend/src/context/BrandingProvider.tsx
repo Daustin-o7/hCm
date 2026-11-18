@@ -105,6 +105,9 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
         currency:         data.currency,
         dateFormat:       data.dateFormat,
         timeFormat:       data.timeFormat,
+        specialties:      typeof data.specialties === 'string'
+          ? data.specialties.split(',').map((s: string) => s.trim()).filter(Boolean)
+          : Array.isArray(data.specialties) ? data.specialties : null,
         enabledModules:   Array.isArray(data.activatedModules) ? data.activatedModules : null,
       }
       setBranding(resolved)

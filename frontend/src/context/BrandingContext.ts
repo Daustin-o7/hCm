@@ -2,7 +2,7 @@ import { createContext, useContext } from 'react'
 
 export interface OrganizationBranding {
   organizationName: string
-  organizationType?: 'practitioner' | 'clinic' | 'hospital'
+  organizationType?: string
   logoUrl?: string
   logoDarkUrl?: string
   logoLightUrl?: string
@@ -20,6 +20,7 @@ export interface OrganizationBranding {
   currency?: string
   dateFormat?: string
   timeFormat?: string
+  specialties?: string[] | null
   /** Modules the tenant is entitled to (Tenant.ActivatedModules). null = unknown, show everything. */
   enabledModules?: string[] | null
 }

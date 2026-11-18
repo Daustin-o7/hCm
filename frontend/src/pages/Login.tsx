@@ -1,120 +1,98 @@
 import { useState, lazy, Suspense } from 'react'
 import { Link } from 'react-router-dom'
-import { useAuth, type TenantMembership } from '../context/AuthContext'
+import { useAuth } from '../context/AuthContext'
 import api from '../services/api'
 import { Alert, friendlyError } from '../components/ui/Alert'
 import { BrandLogo } from '../components/ui/BrandLogo'
 const Medical3DCanvas = lazy(() => import('../components/ui/Medical3DCanvas').then(m => ({ default: m.Medical3DCanvas })))
 import ServerAddress from '../components/ServerAddress'
+import { useMachine } from '../machines/useMachine'
+import { signInBusy, signInMachine } from '../machines/signIn'
 
 
 export default function Login() {
   const [email, setEmail]         = useState('')
   const [password, setPassword]   = useState('')
   const [showPassword, setShowPassword] = useState(false)
-  const [error, setError]         = useState('')
-  const [loading, setLoading]     = useState(false)
-  const [mfaChallenge, setMfaChallenge] = useState<string | null>(null)
   const [mfaCode, setMfaCode]     = useState('')
-  const [mfaMethod, setMfaMethod] = useState<'totp' | 'email'>('totp')
-  const [resending, setResending] = useState(false)
-  const [resent, setResent]       = useState(false)
-  const [selectableMemberships, setSelectableMemberships] = useState<TenantMembership[]>([])
-  const [selectionToken, setSelectionToken] = useState<string | null>(null)
+  const { snapshot, send } = useMachine(signInMachine)
+  const { state, context } = snapshot
+  const busy = signInBusy(snapshot)
   const { login, loginWithEntra, isEntraEnabled, completeMfa, selectTenant } = useAuth()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    setError('')
-    if (!email.trim()) {
-      setError('Please enter your email address.')
-      return
-    }
-    if (!password) {
-      setError('Please enter your password.')
-      return
-    }
-    setLoading(true)
+    if (!email.trim()) return send({ type: 'FAILED', message: 'Please enter your email address.' })
+    if (!password) return send({ type: 'FAILED', message: 'Please enter your password.' })
+    send({ type: 'SUBMIT' })
     try {
       const result = await login(email.trim(), password)
       // With a second factor enrolled the password only yields a challenge token.
       if (result.mfaRequired && result.challengeToken) {
-        setMfaChallenge(result.challengeToken)
-        setMfaMethod(result.method === 'email' ? 'email' : 'totp')
-        setMfaCode('')
-        setResent(false)
+        send({ type: 'MFA_REQUIRED', challenge: result.challengeToken, method: result.method === 'email' ? 'email' : 'totp' })
       } else if (result.requiresTenantSelection && result.selectionToken && result.memberships) {
-        setSelectionToken(result.selectionToken)
-        setSelectableMemberships(result.memberships)
+        send({ type: 'TENANTS_REQUIRED', selectionToken: result.selectionToken, memberships: result.memberships })
+      } else {
+        send({ type: 'SIGNED_IN' })
       }
     } catch (err: any) {
-      setError(friendlyError(err))
-    } finally {
-      setLoading(false)
+      send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
   const handleMfaSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    setError('')
     if (!/^\d{6}$/.test(mfaCode.trim())) {
-      setError(
-        mfaMethod === 'email'
+      send({
+        type: 'FAILED',
+        message: context.method === 'email'
           ? 'Enter the 6-digit code we emailed you.'
           : 'Enter the 6-digit code from your authenticator app.',
-      )
+      })
       return
     }
-    setLoading(true)
+    send({ type: 'SUBMIT_CODE' })
     try {
-      const result = await completeMfa(mfaChallenge!, mfaCode.trim())
+      const result = await completeMfa(context.challenge!, mfaCode.trim())
       if (result && result.requiresTenantSelection && result.selectionToken && result.memberships) {
-        setMfaChallenge(null)
-        setSelectionToken(result.selectionToken)
-        setSelectableMemberships(result.memberships)
+        send({ type: 'TENANTS_REQUIRED', selectionToken: result.selectionToken, memberships: result.memberships })
+      } else {
+        send({ type: 'SIGNED_IN' })
       }
     } catch (err: any) {
-      setError(friendlyError(err))
-    } finally {
-      setLoading(false)
+      send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
   const handleSelectClinic = async (tenantId: string, clinicId?: string | null) => {
-    setError('')
-    setLoading(true)
+    send({ type: 'SELECT_TENANT' })
     try {
-      await selectTenant(tenantId, selectionToken || undefined, clinicId ?? null)
+      await selectTenant(tenantId, context.selectionToken || undefined, clinicId ?? null)
+      send({ type: 'SIGNED_IN' })
     } catch (err: any) {
-      setError(friendlyError(err))
-    } finally {
-      setLoading(false)
+      send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
   const handleResend = async () => {
-    setError('')
-    setResending(true)
+    send({ type: 'RESEND' })
     try {
-      await api.post('/auth/mfa/resend', { challengeToken: mfaChallenge })
-      setResent(true)
+      await api.post('/auth/mfa/resend', { challengeToken: context.challenge })
+      send({ type: 'RESENT' })
     } catch (err: any) {
-      setError(friendlyError(err))
-    } finally {
-      setResending(false)
+      send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
   const handleEntraLogin = async () => {
-    setError('')
     try {
       await loginWithEntra()
     } catch (err: any) {
-      setError(err.message || 'Failed to initialize Single Sign-On (OIDC)')
+      send({ type: 'FAILED', message: err.message || 'Failed to initialize Single Sign-On (OIDC)' })
     }
   }
 
-  const preset = (e: string, p: string) => { setEmail(e); setPassword(p); setError('') }
+  const preset = (e: string, p: string) => { setEmail(e); setPassword(p); send({ type: 'START_OVER' }) }
 
   return (
     <div style={{ minHeight: '100dvh', display: 'flex', background: 'var(--color-bg)' }}>
@@ -245,10 +223,10 @@ export default function Login() {
             style={{ padding: '28px 28px 24px' }}
           >
             {/* Error alert */}
-            {error && (
+            {context.error && (
               <div style={{ marginBottom: 20 }}>
-                <Alert variant="error" onDismiss={() => setError('')}>
-                  {error}
+                <Alert variant="error" onDismiss={() => send({ type: 'DISMISS' })}>
+                  {context.error}
                 </Alert>
               </div>
             )}
@@ -277,17 +255,17 @@ export default function Login() {
               </div>
             )}
 
-            {selectionToken && selectableMemberships.length > 0 ? (
+            {state === 'choosingTenant' || state === 'enteringTenant' ? (
               <div>
                 <p style={{ fontSize: 13.5, color: 'var(--color-text-muted)', marginBottom: 18 }}>
                   Your account is registered with multiple clinics. Choose a practice to enter your session:
                 </p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
-                  {selectableMemberships.map((m) => (
+                  {context.memberships.map((m) => (
                     <button
                       key={`${m.tenantId}:${m.clinicId ?? ''}`}
                       type="button"
-                      disabled={loading}
+                      disabled={busy}
                       onClick={() => handleSelectClinic(m.tenantId, m.clinicId)}
                       className="card"
                       style={{
@@ -326,22 +304,22 @@ export default function Login() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => { setSelectionToken(null); setSelectableMemberships([]); setError(''); }}
+                  onClick={() => send({ type: 'START_OVER' })}
                   className="mt-3 w-full text-center text-xs font-semibold text-[var(--color-text-muted)] hover:underline"
                 >
                   Back to Sign In
                 </button>
               </div>
-            ) : mfaChallenge ? (
+            ) : state === 'mfa' || state === 'verifyingMfa' || state === 'resendingMfa' ? (
               <form onSubmit={handleMfaSubmit} noValidate>
                 <p style={{ fontSize: 13.5, color: 'var(--color-text-muted)', marginBottom: 18 }}>
-                  {mfaMethod === 'email'
+                  {context.method === 'email'
                     ? 'We emailed you a 6-digit code. Enter it to finish signing in.'
                     : 'Enter the 6-digit code from your authenticator app to finish signing in.'}
                 </p>
                 <div style={{ marginBottom: 24 }}>
                   <label htmlFor="login-mfa" className="form-label">
-                    {mfaMethod === 'email' ? 'Email code' : 'Authenticator code'}
+                    {context.method === 'email' ? 'Email code' : 'Authenticator code'}
                   </label>
                   <input
                     id="login-mfa"
@@ -354,31 +332,31 @@ export default function Login() {
                     value={mfaCode}
                     onChange={e => setMfaCode(e.target.value.replace(/\D/g, ''))}
                     required
-                    disabled={loading}
+                    disabled={busy}
                     autoFocus
                   />
                 </div>
                 <button
                   type="submit"
                   className="btn btn-primary"
-                  disabled={loading}
+                  disabled={busy}
                   style={{ width: '100%', justifyContent: 'center', padding: '11px 20px', fontSize: 14 }}
                 >
-                  {loading ? 'Verifying…' : 'Verify and sign in'}
+                  {state === 'verifyingMfa' ? 'Verifying…' : 'Verify and sign in'}
                 </button>
-                {mfaMethod === 'email' && (
+                {context.method === 'email' && (
                   <button
                     type="button"
                     onClick={handleResend}
-                    disabled={resending}
+                    disabled={state === 'resendingMfa' || state === 'verifyingMfa'}
                     className="mt-3 w-full text-center text-xs font-semibold text-[var(--color-accent)] hover:underline"
                   >
-                    {resending ? 'Sending…' : resent ? 'Code sent again — check your inbox' : 'Email me a new code'}
+                    {state === 'resendingMfa' ? 'Sending…' : context.notice || 'Email me a new code'}
                   </button>
                 )}
                 <button
                   type="button"
-                  onClick={() => { setMfaChallenge(null); setMfaCode(''); setError(''); setResent(false) }}
+                  onClick={() => { send({ type: 'START_OVER' }); setMfaCode('') }}
                   className="mt-3 w-full text-center text-xs font-semibold text-[var(--color-text-muted)] hover:underline"
                 >
                   Use a different account
@@ -398,7 +376,7 @@ export default function Login() {
                   placeholder="you@clinic.com"
                   autoComplete="email"
                   required
-                  disabled={loading}
+                  disabled={busy}
                 />
               </div>
 
@@ -420,7 +398,7 @@ export default function Login() {
                     placeholder="••••••••"
                     autoComplete="current-password"
                     required
-                    disabled={loading}
+                    disabled={busy}
                     style={{ paddingRight: 44 }}
                   />
                   <button
@@ -452,10 +430,10 @@ export default function Login() {
               <button
                 type="submit"
                 className="btn btn-primary"
-                disabled={loading}
+                disabled={busy}
                 style={{ width: '100%', justifyContent: 'center', padding: '11px 20px', fontSize: 14 }}
               >
-                {loading ? (
+                {state === 'authenticating' ? (
                   <>
                     <span className="spinner spinner-sm" />
                     Signing in…

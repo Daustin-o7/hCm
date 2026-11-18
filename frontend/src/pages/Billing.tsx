@@ -182,7 +182,7 @@ const refundOutcomeSchema = z.object({
   refundedAt: savedTimeSchema.nullable(), isPharmacyReturn: z.boolean(), stockRestored: z.boolean(),
 }).refine(result => result.status === 'refunded'
   ? result.verificationStatus === 'confirmed' && Boolean(result.refundReference?.trim()) && Boolean(result.refundedAt)
-    && result.stockRestored === result.isPharmacyReturn
+  && result.stockRestored === result.isPharmacyReturn
   : result.verificationStatus === (result.status === 'failed' ? 'rejected' : 'pending') && !result.refundedAt && !result.stockRestored)
 type RefundOutcome = z.infer<typeof refundOutcomeSchema>
 
@@ -317,7 +317,11 @@ export default function Billing() {
   const isClinicAdmin = user?.role === 'clinicadmin' || user?.role === 'owner'
   const canRecordPayments = isClinicAdmin || user?.role === 'receptionist'
 
-  const [activeTab, setActiveTab] = useState<'invoices' | 'daily' | 'outstanding' | 'deposits' | 'expenses' | 'ledger'>('invoices')
+  const [activeTab, setActiveTab] = useState<'invoices' | 'daily' | 'outstanding' | 'deposits' | 'expenses' | 'ledger'>(() => {
+    // Reports deep-links the AR aging card to ?tab=outstanding; anything else falls back to invoices.
+    const tab = new URLSearchParams(window.location.search).get('tab')
+    return tab === 'outstanding' || tab === 'deposits' || tab === 'daily' ? tab : 'invoices'
+  })
   const [invoices, setInvoices] = useState<Invoice[]>([])
   const [invoiceTotal, setInvoiceTotal] = useState(0)
   const [invoicePage, setInvoicePage] = useState(1)
@@ -362,6 +366,7 @@ export default function Billing() {
 
   const [printModalOpen, setPrintModalOpen] = useState(false)
   const [printableData, setPrintableData] = useState<PrintableInvoice | null>(null)
+  const [printFormat, setPrintFormat] = useState<'a4' | 'thermal'>('a4')
 
   // Refunds (dual-control above the clinic threshold)
   const [refundModalOpen, setRefundModalOpen] = useState(false)
@@ -559,10 +564,14 @@ export default function Billing() {
         if (!data) return
         const session = captureOutboxSession()
         const idempotencyKey = `IDEMP-INV-${crypto.randomUUID()}`
-        const item: OutboxItem = { version: 1, id: crypto.randomUUID(), type: 2, idempotencyKey, createdAt: new Date().toISOString(),
-          payloadJson: JSON.stringify({ idempotencyKey, patientId: data.patientId, appointmentId: data.appointmentId,
+        const item: OutboxItem = {
+          version: 1, id: crypto.randomUUID(), type: 2, idempotencyKey, createdAt: new Date().toISOString(),
+          payloadJson: JSON.stringify({
+            idempotencyKey, patientId: data.patientId, appointmentId: data.appointmentId,
             discountAmount: data.discountAmount, discountReason: data.discountReason,
-            status: data.autoFinalize ? 'unpaid' : 'draft', lineItems: data.lineItems }) }
+            status: data.autoFinalize ? 'unpaid' : 'draft', lineItems: data.lineItems
+          })
+        }
         await enqueueOutbox(item, session)
         if (!active.current || generation !== getSessionGeneration()) return
         attempt = { item, session }
@@ -874,8 +883,10 @@ export default function Billing() {
       }
     }
     const scope = `refund-${refundInvoice.invoiceId}`
-    const expected = { invoiceId: refundInvoice.invoiceId, amount: refundAmount, method: refundMethod, sourcePaymentId: refundSourceId,
-      idempotencyKey: mutationKeys.current[scope] ??= `IDEMP-REF-${crypto.randomUUID()}` }
+    const expected = {
+      invoiceId: refundInvoice.invoiceId, amount: refundAmount, method: refundMethod, sourcePaymentId: refundSourceId,
+      idempotencyKey: mutationKeys.current[scope] ??= `IDEMP-REF-${crypto.randomUUID()}`
+    }
     try {
       setActionLoading('refund')
       const res = await api.post<RefundOutcome>(`/invoices/${refundInvoice.invoiceId}/refund`, {
@@ -913,8 +924,10 @@ export default function Billing() {
     if (!refundInvoice) return
     const refund = refundDetail?.payments.find(p => p.id === refundId)
     if (!refund) return
-    const expected = { invoiceId: refundInvoice.invoiceId, refundId, amount: Math.abs(refund.amount), method: refund.method,
-      sourcePaymentId: refund.refundSourcePaymentId, idempotencyKey: refund.idempotencyKey }
+    const expected = {
+      invoiceId: refundInvoice.invoiceId, refundId, amount: Math.abs(refund.amount), method: refund.method,
+      sourcePaymentId: refund.refundSourcePaymentId, idempotencyKey: refund.idempotencyKey
+    }
     try {
       setActionLoading(`approve-${refundId}`)
       const res = await api.post<RefundOutcome>(`/invoices/${refundInvoice.invoiceId}/refunds/${refundId}/approve`, {})
@@ -934,8 +947,10 @@ export default function Billing() {
 
   const handleCheckRefund = async (payment: LedgerPayment) => {
     if (!refundInvoice || !payment.idempotencyKey || !payment.refundReason) return
-    const expected = { invoiceId: refundInvoice.invoiceId, refundId: payment.id, amount: Math.abs(payment.amount), method: payment.method,
-      sourcePaymentId: payment.refundSourcePaymentId, idempotencyKey: payment.idempotencyKey }
+    const expected = {
+      invoiceId: refundInvoice.invoiceId, refundId: payment.id, amount: Math.abs(payment.amount), method: payment.method,
+      sourcePaymentId: payment.refundSourcePaymentId, idempotencyKey: payment.idempotencyKey
+    }
     try {
       setActionLoading(`refund-check-${payment.id}`)
       const path = payment.isPharmacyReturn ? `/pharmacy/returns/${refundInvoice.invoiceId}` : `/invoices/${refundInvoice.invoiceId}/refund`
@@ -1113,8 +1128,8 @@ export default function Billing() {
         <div className="flex items-start gap-3">
           <span className="p-2 rounded-md bg-teal-500/10 text-teal-600 dark:text-teal-400">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              <path d="m9 12 2 2 4-4"/>
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              <path d="m9 12 2 2 4-4" />
             </svg>
           </span>
           <div>
@@ -1245,8 +1260,8 @@ export default function Billing() {
           {invoices.length === 0 ? (
             <EmptyState
               illustration={<svg width="60" height="60" viewBox="0 0 60 60" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <rect x="10" y="10" width="40" height="40" rx="6" stroke="currentColor" strokeWidth="2" fill="none" opacity="0.4"/>
-                <path d="M20 25h20M20 35h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" opacity="0.6"/>
+                <rect x="10" y="10" width="40" height="40" rx="6" stroke="currentColor" strokeWidth="2" fill="none" opacity="0.4" />
+                <path d="M20 25h20M20 35h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" opacity="0.6" />
               </svg>}
               title="No Invoices Found"
               description="Create your first patient consultation invoice with per-line tax calculations."
@@ -1945,6 +1960,15 @@ export default function Billing() {
               </div>
             )}
 
+            <div className="flex justify-center pt-1">
+              <a
+                href={`upi://pay?pa=${encodeURIComponent(qrData.account.vpa)}&pn=${encodeURIComponent(qrData.account.bankName || 'Clinic')}&am=${qrData.amount}&cu=INR&tn=${encodeURIComponent(qrData.invoiceNumber)}`}
+                className="btn btn-secondary btn-sm flex items-center gap-1.5"
+              >
+                <span>📱 Open UPI App (Mobile / Tablet)</span>
+              </a>
+            </div>
+
             <div className="flex items-center justify-between gap-3 pt-3 border-t border-[var(--color-border)]">
               <button
                 type="button"
@@ -2331,108 +2355,222 @@ export default function Billing() {
         size="lg"
       >
         {printableData && (
-          <div className="space-y-4 p-4 border border-[var(--color-border)] rounded-lg bg-white text-gray-900 font-sans print:border-none">
-            {/* Header */}
-            <div className="flex justify-between items-start border-b border-gray-200 pb-3">
-              <div>
-                <h2 className="text-lg font-bold text-gray-900">{printableData.clinic.name}</h2>
-                <p className="text-xs text-gray-600">{printableData.clinic.legalName}</p>
-                <p className="text-xs text-gray-500">{printableData.clinic.address} • Ph: {printableData.clinic.phone}</p>
-              </div>
-              <div className="text-right">
-                <span className={`px-2.5 py-1 rounded text-xs font-mono font-bold ${printableData.watermark === 'ORIGINAL' ? 'bg-teal-100 text-teal-800' : 'bg-amber-100 text-amber-800'}`}>
-                  {printableData.watermark}
-                </span>
-                <p className="text-xs font-mono font-bold mt-1 text-gray-800">{printableData.invoiceNumber}</p>
-                <p className="text-[11px] text-gray-500">{printableData.documentType}</p>
+          <div className="space-y-4 invoice-print-root">
+            {/* Print isolation: only this receipt reaches paper, at the roll width when thermal is selected. */}
+            <style>{`
+              @media print {
+                @page { size: ${printFormat === 'thermal' ? '80mm auto' : 'A4 portrait'}; margin: ${printFormat === 'thermal' ? '3mm' : '12mm'}; }
+                body * { visibility: hidden; }
+                .invoice-print-root, .invoice-print-root * { visibility: visible; }
+                .invoice-print-root { position: absolute; left: 0; top: 0; width: ${printFormat === 'thermal' ? '74mm' : '100%'}; }
+              }
+            `}</style>
+            {/* Format Selector */}
+            <div className="flex items-center justify-between border-b border-[var(--color-border)] pb-2 print:hidden">
+              <span className="text-xs font-medium text-[var(--color-text-muted)]">Select Format:</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setPrintFormat('a4')}
+                  className={`btn btn-sm ${printFormat === 'a4' ? 'btn-primary' : 'btn-secondary'}`}
+                >
+                  📄 A4 Bill of Supply
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPrintFormat('thermal')}
+                  className={`btn btn-sm ${printFormat === 'thermal' ? 'btn-primary' : 'btn-secondary'}`}
+                >
+                  🧾 80mm Thermal POS
+                </button>
               </div>
             </div>
 
-            {/* Patient & Doctor Meta */}
-            <div className="grid grid-cols-2 gap-4 text-xs py-2 border-b border-gray-100">
-              <div>
-                <span className="text-gray-500 font-medium">Patient Details:</span>
-                <p className="font-bold text-gray-900">{printableData.patient.name}</p>
-                <p className="text-gray-600">UHID: {printableData.patient.uhid || '—'} • Ph: {printableData.patient.phone || '—'}</p>
-              </div>
-              <div className="text-right">
-                <span className="text-gray-500 font-medium">Treating Practitioner:</span>
-                <p className="font-bold text-gray-900">{printableData.doctor?.name || 'Authorized Medical Officer'}</p>
-                <p className="text-gray-500">{new Date(printableData.createdAt).toLocaleDateString('en-IN')}</p>
-              </div>
-            </div>
-
-            {/* Table of Line Items */}
-            <table className="w-full text-xs text-left">
-              <thead>
-                <tr className="border-b border-gray-200 text-gray-500">
-                  <th className="py-1.5">Description</th>
-                  <th className="py-1.5">SAC/HSN</th>
-                  <th className="py-1.5 text-center">Tax Cat</th>
-                  <th className="py-1.5 text-center">Qty</th>
-                  <th className="py-1.5 text-right">Rate</th>
-                  <th className="py-1.5 text-right">Amount</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {printableData.lineItems.map((li, idx) => (
-                  <tr key={idx}>
-                    <td className="py-1.5 font-medium text-gray-800">{li.description}</td>
-                    <td className="py-1.5 font-mono text-gray-500">{li.hsnSacCode}</td>
-                    <td className="py-1.5 text-center font-mono text-[11px]">
-                      {li.taxCategory === 'Exempt' ? '0% (Exempt)' : `${li.gstRate}%`}
-                    </td>
-                    <td className="py-1.5 text-center font-mono">{li.quantity}</td>
-                    <td className="py-1.5 text-right font-mono">₹{li.unitPrice}</td>
-                    <td className="py-1.5 text-right font-mono font-bold">₹{li.totalAmount}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            {/* Totals */}
-            <div className="border-t border-gray-200 pt-2 flex justify-end">
-              <div className="w-56 text-xs space-y-1 font-mono">
-                <div className="flex justify-between text-gray-600">
-                  <span>Subtotal:</span>
-                  <span>₹{printableData.subtotal}</span>
+            {printFormat === 'thermal' ? (
+              /* 80mm Compact Thermal Roll View */
+              <div className="p-4 border border-dashed border-gray-400 rounded bg-white text-gray-900 font-mono text-xs max-w-sm mx-auto shadow-xs print:border-none print:shadow-none">
+                <div className="text-center space-y-0.5 border-b border-dashed border-gray-300 pb-2">
+                  <h3 className="font-bold text-sm tracking-tight">{printableData.clinic.name}</h3>
+                  <p className="text-[10px] text-gray-600">{printableData.clinic.address}</p>
+                  <p className="text-[10px] text-gray-600">Ph: {printableData.clinic.phone}</p>
                 </div>
-                <div className="flex justify-between text-gray-600">
-                  <span>GST (Exempt lines: 0%):</span>
-                  <span>₹{printableData.gstAmount}</span>
-                </div>
-                {printableData.discountAmount > 0 && (
-                  <div className="flex justify-between text-emerald-600">
-                    <span>Discount:</span>
-                    <span>-₹{printableData.discountAmount}</span>
+
+                <div className="text-[11px] space-y-0.5 border-b border-dashed border-gray-300 py-1.5">
+                  <div className="flex justify-between">
+                    <span>Invoice: <strong>{printableData.invoiceNumber}</strong></span>
+                    <span className="font-bold text-[10px] bg-gray-100 px-1 rounded">{printableData.watermark}</span>
                   </div>
-                )}
-                <div className="flex justify-between text-sm font-bold text-gray-900 border-t border-gray-300 pt-1">
-                  <span>Total Amount:</span>
-                  <span>₹{printableData.total}</span>
+                  <div className="flex justify-between text-gray-600 text-[10px]">
+                    <span>Date: {new Date(printableData.createdAt).toLocaleDateString('en-IN')}</span>
+                    <span>{new Date(printableData.createdAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Patient: <strong>{printableData.patient.name}</strong></span>
+                    <span>{printableData.patient.phone || ''}</span>
+                  </div>
+                  {printableData.doctor && (
+                    <div className="text-gray-600 text-[10px]">
+                      Doctor: {printableData.doctor.name}
+                    </div>
+                  )}
                 </div>
-                <div className="flex justify-between text-gray-600">
-                  <span>Paid Amount:</span>
-                  <span>₹{printableData.paidAmount}</span>
+
+                <div className="border-b border-dashed border-gray-300 py-1.5 space-y-1">
+                  <div className="flex justify-between font-bold text-[10px] text-gray-500 border-b border-gray-200 pb-0.5">
+                    <span>Item</span>
+                    <span>Qty × Rate</span>
+                    <span>Amt</span>
+                  </div>
+                  {printableData.lineItems.map((li, idx) => (
+                    <div key={idx} className="flex justify-between items-baseline text-[11px]">
+                      <span className="truncate max-w-[130px]">{li.description}</span>
+                      <span className="text-gray-500 text-[10px]">{li.quantity} × ₹{li.unitPrice}</span>
+                      <span className="font-bold">₹{li.totalAmount}</span>
+                    </div>
+                  ))}
                 </div>
-                <div className="flex justify-between text-xs font-bold text-rose-600">
-                  <span>Balance Due:</span>
-                  <span>₹{printableData.balanceDue}</span>
+
+                <div className="space-y-1 text-[11px] border-b border-dashed border-gray-300 py-1.5">
+                  <div className="flex justify-between">
+                    <span>Subtotal:</span>
+                    <span>₹{printableData.subtotal}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>GST (Exempt: 0%):</span>
+                    <span>₹{printableData.gstAmount}</span>
+                  </div>
+                  {printableData.discountAmount > 0 && (
+                    <div className="flex justify-between text-emerald-600">
+                      <span>Discount:</span>
+                      <span>-₹{printableData.discountAmount}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between font-bold text-sm border-t border-gray-300 pt-1">
+                    <span>NET TOTAL:</span>
+                    <span>₹{printableData.total}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Paid Amount:</span>
+                    <span>₹{printableData.paidAmount}</span>
+                  </div>
+                  {printableData.balanceDue > 0 && (
+                    <div className="flex justify-between font-bold text-rose-600">
+                      <span>Due Balance:</span>
+                      <span>₹{printableData.balanceDue}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-center text-[10px] text-gray-400 pt-1">
+                  Thank you for visiting! Computer generated slip.
                 </div>
               </div>
-            </div>
+            ) : (
+              /* A4 Bill of Supply View */
+              <div className="space-y-4 p-4 border border-[var(--color-border)] rounded-lg bg-white text-gray-900 font-sans print:border-none">
+                {/* Header */}
+                <div className="flex justify-between items-start border-b border-gray-200 pb-3">
+                  <div>
+                    <h2 className="text-lg font-bold text-gray-900">{printableData.clinic.name}</h2>
+                    <p className="text-xs text-gray-600">{printableData.clinic.legalName}</p>
+                    <p className="text-xs text-gray-500">{printableData.clinic.address} • Ph: {printableData.clinic.phone}</p>
+                  </div>
+                  <div className="text-right">
+                    <span className={`px-2.5 py-1 rounded text-xs font-mono font-bold ${printableData.watermark === 'ORIGINAL' ? 'bg-teal-100 text-teal-800' : 'bg-amber-100 text-amber-800'}`}>
+                      {printableData.watermark}
+                    </span>
+                    <p className="text-xs font-mono font-bold mt-1 text-gray-800">{printableData.invoiceNumber}</p>
+                    <p className="text-[11px] text-gray-500">{printableData.documentType}</p>
+                  </div>
+                </div>
 
-            <div className="text-[10px] text-gray-400 text-center pt-2 border-t border-gray-100">
-              Healthcare services exempt from GST under Notification No. 12/2017-Central Tax (Rate). Computer generated invoice.
-            </div>
+                {/* Patient & Doctor Meta */}
+                <div className="grid grid-cols-2 gap-4 text-xs py-2 border-b border-gray-100">
+                  <div>
+                    <span className="text-gray-500 font-medium">Patient Details:</span>
+                    <p className="font-bold text-gray-900">{printableData.patient.name}</p>
+                    <p className="text-gray-600">UHID: {printableData.patient.uhid || '—'} • Ph: {printableData.patient.phone || '—'}</p>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-gray-500 font-medium">Treating Practitioner:</span>
+                    <p className="font-bold text-gray-900">{printableData.doctor?.name || 'Authorized Medical Officer'}</p>
+                    <p className="text-gray-500">{new Date(printableData.createdAt).toLocaleDateString('en-IN')}</p>
+                  </div>
+                </div>
 
-            <div className="flex justify-end gap-2 pt-2">
+                {/* Table of Line Items */}
+                <table className="w-full text-xs text-left">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-gray-500">
+                      <th className="py-1.5">Description</th>
+                      <th className="py-1.5">SAC/HSN</th>
+                      <th className="py-1.5 text-center">Tax Cat</th>
+                      <th className="py-1.5 text-center">Qty</th>
+                      <th className="py-1.5 text-right">Rate</th>
+                      <th className="py-1.5 text-right">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {printableData.lineItems.map((li, idx) => (
+                      <tr key={idx}>
+                        <td className="py-1.5 font-medium text-gray-800">{li.description}</td>
+                        <td className="py-1.5 font-mono text-gray-500">{li.hsnSacCode}</td>
+                        <td className="py-1.5 text-center font-mono text-[11px]">
+                          {li.taxCategory === 'Exempt' ? '0% (Exempt)' : `${li.gstRate}%`}
+                        </td>
+                        <td className="py-1.5 text-center font-mono">{li.quantity}</td>
+                        <td className="py-1.5 text-right font-mono">₹{li.unitPrice}</td>
+                        <td className="py-1.5 text-right font-mono font-bold">₹{li.totalAmount}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                {/* Totals */}
+                <div className="border-t border-gray-200 pt-2 flex justify-end">
+                  <div className="w-56 text-xs space-y-1 font-mono">
+                    <div className="flex justify-between text-gray-600">
+                      <span>Subtotal:</span>
+                      <span>₹{printableData.subtotal}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-600">
+                      <span>GST (Exempt lines: 0%):</span>
+                      <span>₹{printableData.gstAmount}</span>
+                    </div>
+                    {printableData.discountAmount > 0 && (
+                      <div className="flex justify-between text-emerald-600">
+                        <span>Discount:</span>
+                        <span>-₹{printableData.discountAmount}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between text-sm font-bold text-gray-900 border-t border-gray-300 pt-1">
+                      <span>Total Amount:</span>
+                      <span>₹{printableData.total}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-600">
+                      <span>Paid Amount:</span>
+                      <span>₹{printableData.paidAmount}</span>
+                    </div>
+                    <div className="flex justify-between text-xs font-bold text-rose-600">
+                      <span>Balance Due:</span>
+                      <span>₹{printableData.balanceDue}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-[10px] text-gray-400 text-center pt-2 border-t border-gray-100">
+                  Healthcare services exempt from GST under Notification No. 12/2017-Central Tax (Rate). Computer generated invoice.
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2 print:hidden">
               <button
                 type="button"
                 onClick={() => window.print()}
                 className="btn btn-primary btn-sm"
               >
-                Print / Download PDF
+                Print / Download ({printFormat === 'thermal' ? '80mm Thermal' : 'A4 PDF'})
               </button>
             </div>
           </div>
@@ -2463,242 +2601,242 @@ export default function Billing() {
           className="space-y-4"
         >
           <fieldset disabled={invoicePending || actionLoading === 'create-invoice'} className="min-w-0 space-y-4 border-0 p-0">
-          <div className="form-group">
-            <label htmlFor="invoice-patient" className="form-label">Patient</label>
-            <select
-              id="invoice-patient"
-              className="form-select"
-              disabled={patients.length === 0}
-              {...register('patientId')}
-              onChange={e => {
-                void register('patientId').onChange(e)
-                void handleSelectPatient(e.target.value)
-              }}
-            >
-              <option value="">{patients.length === 0 ? 'No patients available' : 'Select patient…'}</option>
-              {patients.map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.name}{p.phone ? ` · ${p.phone}` : ''}
-                </option>
-              ))}
-            </select>
-            {errors.patientId && <p className="form-error">{errors.patientId.message}</p>}
-          </div>
-
-          <div className="form-group">
-            <label htmlFor="invoice-appointment" className="form-label">Completed appointment</label>
-            <select
-              id="invoice-appointment"
-              className="form-select"
-              disabled={!selectedPatientId || appointmentsLoading || patientAppointments.length === 0}
-              {...register('appointmentId')}
-            >
-              <option value="">
-                {appointmentsLoading
-                  ? 'Loading appointments…'
-                  : !selectedPatientId
-                    ? 'Select a patient first'
-                  : patientAppointments.length === 0
-                    ? 'No completed appointment found'
-                    : 'Select appointment…'}
-              </option>
-              {patientAppointments.map(a => (
-                <option key={a.appointmentId} value={a.appointmentId}>
-                  {fmtDate(a.date)} · {a.time} · {a.doctorName}
-                </option>
-              ))}
-            </select>
-            {errors.appointmentId && <p className="form-error">{errors.appointmentId.message}</p>}
-            {selectedPatientId && !appointmentsLoading && patientAppointments.length === 0 && (
-              <p className="text-xs text-[var(--color-text-muted)] mt-1">
-                Complete this patient’s appointment before creating the consultation invoice.
-              </p>
-            )}
-          </div>
-
-          {/* Quick Add Presets */}
-          <div>
-            <span className="text-[10.5px] font-bold text-[var(--color-text-muted)] uppercase tracking-wider block mb-1 font-mono">
-              Quick Add Healthcare Services (Exempt 0% GST):
-            </span>
-            <div className="flex flex-wrap gap-1.5">
-              {[
-                { desc: 'OPD General Consultation', amt: 800, sac: '999312', cat: 'Exempt' as const },
-                { desc: 'Follow-up Consultation', amt: 400, sac: '999312', cat: 'Exempt' as const },
-                { desc: 'Specialist Consultation', amt: 1200, sac: '999312', cat: 'Exempt' as const },
-                { desc: 'Wound Dressing & Nursing', amt: 350, sac: '999312', cat: 'Exempt' as const },
-                { desc: 'In-Clinic ECG Procedure', amt: 500, sac: '999312', cat: 'Exempt' as const },
-              ].map(srv => (
-                <button
-                  key={srv.desc}
-                  type="button"
-                  onClick={() => append({ description: srv.desc, quantity: 1, unitPrice: srv.amt, taxCategory: srv.cat, hsnSacCode: srv.sac, gstRate: 0 })}
-                  className="btn btn-secondary btn-sm text-[10.5px]"
-                >
-                  + {srv.desc} (₹{srv.amt})
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Line Items List */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="form-label mb-0">Billed Services &amp; Goods</label>
-              <button
-                type="button"
-                onClick={() => append({ description: '', quantity: 1, unitPrice: 500, taxCategory: 'Exempt', hsnSacCode: '999312', gstRate: 0 })}
-                className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline cursor-pointer"
+            <div className="form-group">
+              <label htmlFor="invoice-patient" className="form-label">Patient</label>
+              <select
+                id="invoice-patient"
+                className="form-select"
+                disabled={patients.length === 0}
+                {...register('patientId')}
+                onChange={e => {
+                  void register('patientId').onChange(e)
+                  void handleSelectPatient(e.target.value)
+                }}
               >
-                + Add Custom Service Line
-              </button>
+                <option value="">{patients.length === 0 ? 'No patients available' : 'Select patient…'}</option>
+                {patients.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}{p.phone ? ` · ${p.phone}` : ''}
+                  </option>
+                ))}
+              </select>
+              {errors.patientId && <p className="form-error">{errors.patientId.message}</p>}
             </div>
 
-            {fields.map((field, idx) => (
-              <div key={field.id} className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)] space-y-2">
-                <div className="flex gap-2 items-center">
-                  <input
-                    type="text"
-                    {...register(`lineItems.${idx}.description` as const)}
-                    aria-label={`Service description ${idx + 1}`}
-                    placeholder="Service description"
-                    className="form-input flex-1 text-xs"
-                  />
-                  <input
-                    type="number"
-                    {...register(`lineItems.${idx}.quantity` as const, { valueAsNumber: true })}
-                    aria-label={`Quantity ${idx + 1}`}
-                    placeholder="Qty"
-                    className="form-input w-16 font-mono text-xs"
-                    min="1"
-                    step="1"
-                  />
-                  <input
-                    type="number"
-                    {...register(`lineItems.${idx}.unitPrice` as const, { valueAsNumber: true })}
-                    aria-label={`Unit price ${idx + 1}`}
-                    placeholder="Rate"
-                    className="form-input w-24 font-mono text-xs"
-                    min="0.01"
-                    step="0.01"
-                  />
-                  {fields.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => remove(idx)}
-                      className="text-[var(--color-text-muted)] hover:text-rose-500 p-1 cursor-pointer"
-                      title="Remove line"
-                      aria-label={`Remove service line ${idx + 1}`}
-                    >
-                      ✕
-                    </button>
-                  )}
-                </div>
-                {errors.lineItems?.[idx] && <p className="form-error">{errors.lineItems[idx]?.description?.message ?? errors.lineItems[idx]?.quantity?.message ?? errors.lineItems[idx]?.unitPrice?.message ?? errors.lineItems[idx]?.gstRate?.message}</p>}
-
-                <div className="grid grid-cols-3 gap-2 text-xs">
-                  <div>
-                    <label className="text-[10px] text-[var(--color-text-muted)]">Tax Category</label>
-                    <select
-                      {...register(`lineItems.${idx}.taxCategory` as const)}
-                      aria-label={`Tax category ${idx + 1}`}
-                      className="form-select text-xs py-1"
-                    >
-                      <option value="Exempt">Exempt (0% - Notif 12/2017)</option>
-                      <option value="Nil">Nil-Rated</option>
-                      <option value="Taxable">Taxable Goods</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-[var(--color-text-muted)]">SAC / HSN Code</label>
-                    <input
-                      type="text"
-                      {...register(`lineItems.${idx}.hsnSacCode` as const)}
-                      aria-label={`SAC / HSN code ${idx + 1}`}
-                      placeholder="999312"
-                      className="form-input text-xs py-1 font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-[var(--color-text-muted)]">GST Rate (%)</label>
-                    <input
-                      type="number"
-                      {...register(`lineItems.${idx}.gstRate` as const, { valueAsNumber: true })}
-                      aria-label={`GST rate ${idx + 1}`}
-                      placeholder="0"
-                      className="form-input text-xs py-1 font-mono"
-                      min="0"
-                      max="100"
-                      step="0.01"
-                    />
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Discount & Finalize Toggle */}
-          <div className="grid grid-cols-2 gap-3 pt-2">
-            <div>
-              <label htmlFor="invoice-discount" className="form-label text-xs">Discount amount (₹)</label>
-              <input
-                id="invoice-discount"
-                type="number"
-                {...register('discountAmount', { valueAsNumber: true })}
-                placeholder="0"
-                className="form-input font-mono text-xs"
-                min="0"
-                step="0.01"
-              />
-              {errors.discountAmount && <p className="form-error">{errors.discountAmount.message}</p>}
-            </div>
-            <div>
-              <label className="form-label text-xs">Discount Reason Code</label>
-              <input
-                type="text"
-                {...register('discountReason')}
-                placeholder="SeniorCitizen / StaffFamily / Discretion"
-                className="form-input text-xs"
-              />
-              {errors.discountReason && (
-                <p className="text-[11px] text-rose-600 font-medium mt-1">{errors.discountReason.message}</p>
+            <div className="form-group">
+              <label htmlFor="invoice-appointment" className="form-label">Completed appointment</label>
+              <select
+                id="invoice-appointment"
+                className="form-select"
+                disabled={!selectedPatientId || appointmentsLoading || patientAppointments.length === 0}
+                {...register('appointmentId')}
+              >
+                <option value="">
+                  {appointmentsLoading
+                    ? 'Loading appointments…'
+                    : !selectedPatientId
+                      ? 'Select a patient first'
+                      : patientAppointments.length === 0
+                        ? 'No completed appointment found'
+                        : 'Select appointment…'}
+                </option>
+                {patientAppointments.map(a => (
+                  <option key={a.appointmentId} value={a.appointmentId}>
+                    {fmtDate(a.date)} · {a.time} · {a.doctorName}
+                  </option>
+                ))}
+              </select>
+              {errors.appointmentId && <p className="form-error">{errors.appointmentId.message}</p>}
+              {selectedPatientId && !appointmentsLoading && patientAppointments.length === 0 && (
+                <p className="text-xs text-[var(--color-text-muted)] mt-1">
+                  Complete this patient’s appointment before creating the consultation invoice.
+                </p>
               )}
             </div>
-          </div>
 
-          {/* Totals Summary */}
-          <div className="p-3 bg-[var(--color-surface-raised)] border border-[var(--color-border)] rounded-xl font-mono text-xs space-y-1">
-            <div className="flex justify-between">
-              <span className="text-[var(--color-text-muted)]">Subtotal:</span>
-              <span>₹{calculatedSubtotal.toLocaleString('en-IN')}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-[var(--color-text-muted)]">Tax Amount (Exempt Lines: 0%):</span>
-              <span>₹{calculatedTax.toLocaleString('en-IN')}</span>
-            </div>
-            {watchedDiscount > 0 && (
-              <div className="flex justify-between text-emerald-600">
-                <span>Discount:</span>
-                <span>-₹{watchedDiscount.toLocaleString('en-IN')}</span>
+            {/* Quick Add Presets */}
+            <div>
+              <span className="text-[10.5px] font-bold text-[var(--color-text-muted)] uppercase tracking-wider block mb-1 font-mono">
+                Quick Add Healthcare Services (Exempt 0% GST):
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { desc: 'OPD General Consultation', amt: 800, sac: '999312', cat: 'Exempt' as const },
+                  { desc: 'Follow-up Consultation', amt: 400, sac: '999312', cat: 'Exempt' as const },
+                  { desc: 'Specialist Consultation', amt: 1200, sac: '999312', cat: 'Exempt' as const },
+                  { desc: 'Wound Dressing & Nursing', amt: 350, sac: '999312', cat: 'Exempt' as const },
+                  { desc: 'In-Clinic ECG Procedure', amt: 500, sac: '999312', cat: 'Exempt' as const },
+                ].map(srv => (
+                  <button
+                    key={srv.desc}
+                    type="button"
+                    onClick={() => append({ description: srv.desc, quantity: 1, unitPrice: srv.amt, taxCategory: srv.cat, hsnSacCode: srv.sac, gstRate: 0 })}
+                    className="btn btn-secondary btn-sm text-[10.5px]"
+                  >
+                    + {srv.desc} (₹{srv.amt})
+                  </button>
+                ))}
               </div>
-            )}
-            <div className="flex justify-between text-sm font-bold text-[var(--color-text)] border-t border-[var(--color-border)] pt-1">
-              <span>Total Payable:</span>
-              <span>₹{calculatedGrandTotal.toLocaleString('en-IN')}</span>
             </div>
-          </div>
 
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="autoFinalize"
-              {...register('autoFinalize')}
-              className="rounded text-teal-600 focus:ring-teal-500"
-            />
-            <label htmlFor="autoFinalize" className="text-xs text-[var(--color-text-secondary)] cursor-pointer">
-              Finalize immediately and assign sequential invoice number (locks record)
-            </label>
-          </div>
+            {/* Line Items List */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="form-label mb-0">Billed Services &amp; Goods</label>
+                <button
+                  type="button"
+                  onClick={() => append({ description: '', quantity: 1, unitPrice: 500, taxCategory: 'Exempt', hsnSacCode: '999312', gstRate: 0 })}
+                  className="text-xs font-semibold text-teal-600 dark:text-teal-400 hover:underline cursor-pointer"
+                >
+                  + Add Custom Service Line
+                </button>
+              </div>
+
+              {fields.map((field, idx) => (
+                <div key={field.id} className="p-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)] space-y-2">
+                  <div className="flex gap-2 items-center">
+                    <input
+                      type="text"
+                      {...register(`lineItems.${idx}.description` as const)}
+                      aria-label={`Service description ${idx + 1}`}
+                      placeholder="Service description"
+                      className="form-input flex-1 text-xs"
+                    />
+                    <input
+                      type="number"
+                      {...register(`lineItems.${idx}.quantity` as const, { valueAsNumber: true })}
+                      aria-label={`Quantity ${idx + 1}`}
+                      placeholder="Qty"
+                      className="form-input w-16 font-mono text-xs"
+                      min="1"
+                      step="1"
+                    />
+                    <input
+                      type="number"
+                      {...register(`lineItems.${idx}.unitPrice` as const, { valueAsNumber: true })}
+                      aria-label={`Unit price ${idx + 1}`}
+                      placeholder="Rate"
+                      className="form-input w-24 font-mono text-xs"
+                      min="0.01"
+                      step="0.01"
+                    />
+                    {fields.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => remove(idx)}
+                        className="text-[var(--color-text-muted)] hover:text-rose-500 p-1 cursor-pointer"
+                        title="Remove line"
+                        aria-label={`Remove service line ${idx + 1}`}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                  {errors.lineItems?.[idx] && <p className="form-error">{errors.lineItems[idx]?.description?.message ?? errors.lineItems[idx]?.quantity?.message ?? errors.lineItems[idx]?.unitPrice?.message ?? errors.lineItems[idx]?.gstRate?.message}</p>}
+
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div>
+                      <label className="text-[10px] text-[var(--color-text-muted)]">Tax Category</label>
+                      <select
+                        {...register(`lineItems.${idx}.taxCategory` as const)}
+                        aria-label={`Tax category ${idx + 1}`}
+                        className="form-select text-xs py-1"
+                      >
+                        <option value="Exempt">Exempt (0% - Notif 12/2017)</option>
+                        <option value="Nil">Nil-Rated</option>
+                        <option value="Taxable">Taxable Goods</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-[var(--color-text-muted)]">SAC / HSN Code</label>
+                      <input
+                        type="text"
+                        {...register(`lineItems.${idx}.hsnSacCode` as const)}
+                        aria-label={`SAC / HSN code ${idx + 1}`}
+                        placeholder="999312"
+                        className="form-input text-xs py-1 font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-[var(--color-text-muted)]">GST Rate (%)</label>
+                      <input
+                        type="number"
+                        {...register(`lineItems.${idx}.gstRate` as const, { valueAsNumber: true })}
+                        aria-label={`GST rate ${idx + 1}`}
+                        placeholder="0"
+                        className="form-input text-xs py-1 font-mono"
+                        min="0"
+                        max="100"
+                        step="0.01"
+                      />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Discount & Finalize Toggle */}
+            <div className="grid grid-cols-2 gap-3 pt-2">
+              <div>
+                <label htmlFor="invoice-discount" className="form-label text-xs">Discount amount (₹)</label>
+                <input
+                  id="invoice-discount"
+                  type="number"
+                  {...register('discountAmount', { valueAsNumber: true })}
+                  placeholder="0"
+                  className="form-input font-mono text-xs"
+                  min="0"
+                  step="0.01"
+                />
+                {errors.discountAmount && <p className="form-error">{errors.discountAmount.message}</p>}
+              </div>
+              <div>
+                <label className="form-label text-xs">Discount Reason Code</label>
+                <input
+                  type="text"
+                  {...register('discountReason')}
+                  placeholder="SeniorCitizen / StaffFamily / Discretion"
+                  className="form-input text-xs"
+                />
+                {errors.discountReason && (
+                  <p className="text-[11px] text-rose-600 font-medium mt-1">{errors.discountReason.message}</p>
+                )}
+              </div>
+            </div>
+
+            {/* Totals Summary */}
+            <div className="p-3 bg-[var(--color-surface-raised)] border border-[var(--color-border)] rounded-xl font-mono text-xs space-y-1">
+              <div className="flex justify-between">
+                <span className="text-[var(--color-text-muted)]">Subtotal:</span>
+                <span>₹{calculatedSubtotal.toLocaleString('en-IN')}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[var(--color-text-muted)]">Tax Amount (Exempt Lines: 0%):</span>
+                <span>₹{calculatedTax.toLocaleString('en-IN')}</span>
+              </div>
+              {watchedDiscount > 0 && (
+                <div className="flex justify-between text-emerald-600">
+                  <span>Discount:</span>
+                  <span>-₹{watchedDiscount.toLocaleString('en-IN')}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-sm font-bold text-[var(--color-text)] border-t border-[var(--color-border)] pt-1">
+                <span>Total Payable:</span>
+                <span>₹{calculatedGrandTotal.toLocaleString('en-IN')}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="autoFinalize"
+                {...register('autoFinalize')}
+                className="rounded text-teal-600 focus:ring-teal-500"
+              />
+              <label htmlFor="autoFinalize" className="text-xs text-[var(--color-text-secondary)] cursor-pointer">
+                Finalize immediately and assign sequential invoice number (locks record)
+              </label>
+            </div>
           </fieldset>
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-[var(--color-border)]">

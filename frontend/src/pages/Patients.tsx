@@ -149,8 +149,11 @@ function getInitials(name: string) {
 export default function Patients() {
   const navigate = useNavigate()
   const { hasRole } = useAuth()
-  const canEdit = hasRole(['clinicadmin', 'doctor', 'receptionist'])
-  const canWithdrawConsent = hasRole(['clinicadmin', 'receptionist'])
+  const canEdit = hasRole(['clinicadmin', 'owner', 'doctor', 'receptionist'])
+  const canWithdrawConsent = hasRole(['clinicadmin', 'owner', 'receptionist'])
+  const canBook = hasRole(['clinicadmin', 'owner', 'doctor', 'receptionist', 'nurse'])
+  const canInvoice = hasRole(['clinicadmin', 'owner', 'doctor', 'receptionist'])
+  const canConsult = hasRole(['doctor'])
   const { branding } = useBranding()
   const today = getTodayDateString(branding.timezone || 'UTC')
   const [patients, setPatients] = useState<Patient[]>([])
@@ -608,14 +611,14 @@ export default function Patients() {
             {loading ? 'Synchronizing patient registry…' : `${patientTotal} active patient profile${patientTotal !== 1 ? 's' : ''} in electronic database`}
           </p>
         </div>
-        <button
+        {canEdit && <button
           id="register-patient-btn"
           className="btn btn-primary"
           onClick={() => { if (!registrationAttempt.current) setSubmitError(''); setShowRegister(true) }}
         >
           <PlusIcon />
           <span>New Patient Registration</span>
-        </button>
+        </button>}
       </div>
 
       {/* ── Search Bar & Filter Chips ── */}
@@ -764,9 +767,11 @@ export default function Patients() {
                   </svg>
                 }
                 title="No patients found"
-                description={filterType !== 'all' ? `No patients matched the "${filterType}" filter criteria.` : "Register your first patient to begin electronic health records."}
+                description={filterType !== 'all' ? `No patients matched the "${filterType}" filter criteria.` : canEdit
+                  ? 'Register your first patient to begin electronic health records.'
+                  : 'Patients will appear here after registration by authorized staff.'}
                 action={
-                  <button className="btn btn-primary btn-sm" onClick={() => setShowRegister(true)}>
+                  canEdit && <button className="btn btn-primary btn-sm" onClick={() => setShowRegister(true)}>
                     Register first patient
                   </button>
                 }
@@ -843,7 +848,7 @@ export default function Patients() {
                             <span>Edit</span>
                           </button>
                         )}
-                        <button
+                        {canConsult && <button
                           className="btn btn-primary btn-sm flex items-center gap-1"
                           onClick={e => {
                             e.stopPropagation()
@@ -853,7 +858,7 @@ export default function Patients() {
                         >
                           <span>🩺</span>
                           <span>Consult</span>
-                        </button>
+                        </button>}
                         <button
                           className="btn btn-ghost btn-sm"
                           onClick={e => { e.stopPropagation(); openPatient(p.id) }}
@@ -1332,8 +1337,8 @@ export default function Patients() {
             {/* Patient Clinical Quick Actions */}
             <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-3 border-t" style={{ borderColor: 'var(--color-border)' }}>
               <span className="text-xs font-medium text-[var(--color-text-muted)]">Direct Clinical Actions:</span>
-              <div className="flex items-center gap-2">
-                <button
+              <div className="flex flex-wrap items-center gap-2">
+                {canBook && <button
                   type="button"
                   onClick={() => {
                     const pid = viewingPatient.id
@@ -1343,8 +1348,8 @@ export default function Patients() {
                   className="btn btn-secondary btn-sm text-xs"
                 >
                   📅 Book OPD
-                </button>
-                <button
+                </button>}
+                {canInvoice && <button
                   type="button"
                   onClick={() => {
                     const pid = viewingPatient.id
@@ -1354,8 +1359,8 @@ export default function Patients() {
                   className="btn btn-secondary btn-sm text-xs"
                 >
                   💳 Invoice
-                </button>
-                <button
+                </button>}
+                {canConsult && <button
                   type="button"
                   onClick={() => {
                     const pid = viewingPatient.id
@@ -1365,7 +1370,7 @@ export default function Patients() {
                   className="btn btn-primary btn-sm text-xs flex items-center gap-1 font-semibold"
                 >
                   <span>🩺 Start Consultation</span>
-                </button>
+                </button>}
                 <button
                   onClick={() => setViewingPatient(null)}
                   className="btn btn-ghost btn-sm text-xs"

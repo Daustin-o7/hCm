@@ -4,13 +4,8 @@ import { useAuth } from '../context/AuthContext'
 import { friendlyError } from './ui/Alert'
 import { Skeleton } from './ui/Skeleton'
 import { Badge } from './ui/Badge'
-
-type Method = 'totp' | 'email'
-
-interface Status {
-  enabled: boolean
-  method: Method | null
-}
+import { useMachine } from '../machines/useMachine'
+import { twoFactorBusy, twoFactorMachine, type TwoFactorMethod } from '../machines/twoFactor'
 
 /**
  * Second factor. Some roles (admin, doctor, front-desk billing) must enrol before using the
@@ -19,16 +14,20 @@ interface Status {
  */
 export default function TwoFactorSettings() {
   const { adoptSession, user, mfaRequiredForRole, sessionGeneration } = useAuth()
-  const [status, setStatus] = useState<Status | null>(null)
-  const [method, setMethod] = useState<Method>('totp')
-  const [pending, setPending] = useState<{ secret: string; otpauthUri: string | null } | null>(null)
+  const { snapshot, send } = useMachine(twoFactorMachine)
+  const { state, context } = snapshot
+  const busy = twoFactorBusy(snapshot)
+  // On/Off is only meaningful once the server told us which it is; a failed load stays unknown.
+  const known = state !== 'loading' && state !== 'loadError'
+  const isOn = state === 'enabled' || state === 'disabling'
   const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
-  const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
-  const [msg, setMsg] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null)
   const [statusAttempt, setStatusAttempt] = useState(0)
   const lifetime = useRef(0)
+  const message = context.error
+    ? { text: context.error, kind: 'err' as const }
+    : context.notice ? { text: context.notice, kind: 'ok' as const } : null
 
   const captureCurrent = useCallback(() => {
     const instance = lifetime.current
@@ -38,18 +37,15 @@ export default function TwoFactorSettings() {
 
   useEffect(() => {
     const current = captureCurrent()
-    setStatus(null)
-    setPending(null)
+    send({ type: 'LOAD_START' })
     setCode('')
     setPassword('')
     setCopied(false)
-    setBusy(false)
-    setMsg(null)
     api.get('/auth/mfa/status')
-      .then(res => { if (current()) setStatus({ enabled: res.data.enabled, method: res.data.method }) })
-      .catch(() => { if (current()) setMsg({ text: 'Could not load two-factor status. Please retry.', kind: 'err' }) })
+      .then(res => { if (current()) send({ type: 'LOADED', enabled: res.data.enabled, method: res.data.method }) })
+      .catch(() => { if (current()) send({ type: 'LOAD_FAILED', message: 'Could not load two-factor status. Please retry.' }) })
     return () => { lifetime.current++ }
-  }, [sessionGeneration, statusAttempt, captureCurrent])
+  }, [sessionGeneration, statusAttempt, captureCurrent, send])
 
   const copyKey = async (secret: string) => {
     const current = captureCurrent()
@@ -63,72 +59,69 @@ export default function TwoFactorSettings() {
     }
   }
 
-  const start = async (next: Method) => {
+  const requestSetup = async (next: TwoFactorMethod) => {
     const current = captureCurrent()
-    setBusy(true)
-    setMsg(null)
     try {
       const res = await api.post('/auth/mfa/setup', { method: next })
       if (!current()) return
-      setMethod(next)
       setCode('')
-      setPending({ secret: res.data.secret, otpauthUri: res.data.otpauthUri })
-      setMsg(
-        next === 'email'
-          ? { text: `We emailed a 6-digit code to ${user?.email ?? 'your inbox'}.`, kind: 'ok' }
-          : { text: 'Add the key below to your authenticator app, then enter the code it shows.', kind: 'ok' },
-      )
+      send({
+        type: 'STARTED',
+        method: next,
+        secret: res.data.secret ?? null,
+        notice: next === 'email'
+          ? `We emailed a 6-digit code to ${user?.email ?? 'your inbox'}.`
+          : 'Add the key below to your authenticator app, then enter the code it shows.',
+      })
     } catch (err) {
-      if (current()) setMsg({ text: friendlyError(err), kind: 'err' })
-    } finally {
-      if (current()) setBusy(false)
+      if (current()) send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
+  const start = (next: TwoFactorMethod) => {
+    send({ type: 'START', method: next })
+    void requestSetup(next)
+  }
+
+  const resend = () => {
+    send({ type: 'RESEND' })
+    void requestSetup('email')
+  }
+
   const enable = async (e?: React.FormEvent) => {
+    e?.preventDefault()
     const current = captureCurrent()
-    if (e) e.preventDefault()
     if (!/^\d{6}$/.test(code.trim())) {
-      setMsg({ text: 'Enter the 6-digit code.', kind: 'err' })
+      send({ type: 'FAILED', message: 'Enter the 6-digit code.' })
       return
     }
-    setBusy(true)
-    setMsg(null)
+    send({ type: 'VERIFY' })
     try {
-      const res = await api.post('/auth/mfa/enable', { code: code.trim(), method })
+      const res = await api.post('/auth/mfa/enable', { code: code.trim(), method: context.method })
       if (!current()) return
       adoptSession(res.data)
-      setBusy(false)
-      setStatus({ enabled: true, method })
-      setPending(null)
       setCode('')
-      setMsg({ text: 'Two-factor authentication is on.', kind: 'ok' })
+      send({ type: 'VERIFIED', method: context.method })
     } catch (err) {
-      if (current()) setMsg({ text: friendlyError(err), kind: 'err' })
-    } finally {
-      if (current()) setBusy(false)
+      if (current()) send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
   const disable = async (e?: React.FormEvent) => {
+    e?.preventDefault()
     const current = captureCurrent()
-    if (e) e.preventDefault()
     if (!password) {
-      setMsg({ text: 'Enter your password to turn two-factor authentication off.', kind: 'err' })
+      send({ type: 'FAILED', message: 'Enter your password to turn two-factor authentication off.' })
       return
     }
-    setBusy(true)
-    setMsg(null)
+    send({ type: 'DISABLE' })
     try {
       await api.post('/auth/mfa/disable', { password })
       if (!current()) return
-      setStatus({ enabled: false, method: null })
       setPassword('')
-      setMsg({ text: 'Two-factor authentication is off.', kind: 'ok' })
+      send({ type: 'DISABLED' })
     } catch (err) {
-      if (current()) setMsg({ text: friendlyError(err), kind: 'err' })
-    } finally {
-      if (current()) setBusy(false)
+      if (current()) send({ type: 'FAILED', message: friendlyError(err) })
     }
   }
 
@@ -143,29 +136,31 @@ export default function TwoFactorSettings() {
               : 'A second step at sign-in. Optional — turn it on or off whenever you like.'}
           </p>
         </div>
-        {status && (
-          <Badge variant={status.enabled ? 'success' : 'neutral'} dot>
-            {status.enabled ? 'On' : 'Off'}
+        {known && (
+          <Badge variant={isOn ? 'success' : 'neutral'} dot>
+            {isOn ? 'On' : 'Off'}
           </Badge>
         )}
       </div>
 
-      {msg && (
-        <div className={`alert alert-${msg.kind === 'ok' ? 'success' : 'error'}`} role="status">
-          <span>{msg.text}</span>
+      {message && (
+        <div className={`alert alert-${message.kind === 'ok' ? 'success' : 'error'}`} role="status">
+          <span>{message.text}</span>
         </div>
       )}
 
-      {!status ? (
-        msg?.kind === 'err'
-          ? <button type="button" className="btn btn-secondary" onClick={() => setStatusAttempt(n => n + 1)}>Retry status</button>
-          : <Skeleton height={72} />
-      ) : status.enabled ? (
+      {state === 'loading' ? (
+        <Skeleton height={72} />
+      ) : state === 'loadError' ? (
+        <button type="button" className="btn btn-secondary" onClick={() => { send({ type: 'RETRY' }); setStatusAttempt(n => n + 1) }}>
+          Retry status
+        </button>
+      ) : isOn ? (
         mfaRequiredForRole ? (
           // The API rejects this for mandatory-MFA roles, so do not offer the control at all.
           <p className="text-sm text-[var(--color-text)]">
             Signing in needs{' '}
-            {status.method === 'email'
+            {context.activeMethod === 'email'
               ? 'a 6-digit code emailed to you'
               : 'a code from your authenticator app'}
             . Your role requires it, so it cannot be turned off.
@@ -174,7 +169,7 @@ export default function TwoFactorSettings() {
           <form onSubmit={disable} className="space-y-4">
             <p className="text-sm text-[var(--color-text)]">
               Signing in needs{' '}
-              {status.method === 'email'
+              {context.activeMethod === 'email'
                 ? 'a 6-digit code emailed to you'
                 : 'a code from your authenticator app'}
               .
@@ -197,9 +192,9 @@ export default function TwoFactorSettings() {
             </button>
           </form>
         )
-      ) : pending ? (
+      ) : state === 'pending' || state === 'verifying' || state === 'resending' ? (
         <form onSubmit={enable} className="space-y-4">
-          {method === 'totp' && (
+          {context.method === 'totp' && context.secret && (
             <div className="space-y-2">
               <div className="flex items-center justify-between">
                 <p className="text-xs font-bold uppercase tracking-wide text-[var(--color-text-muted)]">
@@ -207,14 +202,14 @@ export default function TwoFactorSettings() {
                 </p>
                 <button
                   type="button"
-                  onClick={() => copyKey(pending.secret)}
+                  onClick={() => copyKey(context.secret!)}
                   className="text-xs font-semibold text-[var(--color-accent)] hover:underline flex items-center gap-1"
                 >
                   {copied ? 'Copied!' : 'Copy key'}
                 </button>
               </div>
               <code className="block font-mono text-sm break-all rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2">
-                {pending.secret}
+                {context.secret}
               </code>
               <p className="text-xs text-[var(--color-text-muted)]">
                 In Google Authenticator, Authy or Microsoft Authenticator choose “Enter a setup key”,
@@ -224,7 +219,7 @@ export default function TwoFactorSettings() {
           )}
           <div>
             <label htmlFor="mfa-code" className="form-label">
-              {method === 'email' ? 'Emailed code' : 'Authenticator code'}
+              {context.method === 'email' ? 'Emailed code' : 'Authenticator code'}
             </label>
             <input
               id="mfa-code"
@@ -242,17 +237,17 @@ export default function TwoFactorSettings() {
           </div>
           <div className="flex flex-wrap gap-3">
             <button type="submit" className="btn btn-primary" disabled={busy}>
-              {busy ? 'Verifying…' : 'Verify and turn on'}
+              {state === 'verifying' ? 'Verifying…' : 'Verify and turn on'}
             </button>
-            {method === 'email' && (
-              <button type="button" className="btn btn-secondary" onClick={() => start('email')} disabled={busy}>
+            {context.method === 'email' && (
+              <button type="button" className="btn btn-secondary" onClick={resend} disabled={busy}>
                 Email a new code
               </button>
             )}
             <button
               type="button"
               className="btn btn-secondary"
-              onClick={() => { setPending(null); setCode(''); setMsg(null) }}
+              onClick={() => { send({ type: 'CANCEL' }); setCode('') }}
               disabled={busy}
             >
               Cancel
@@ -264,16 +259,16 @@ export default function TwoFactorSettings() {
           <p className="text-sm text-[var(--color-text)]">Choose how you want to get your second code.</p>
           <div className="grid gap-3 sm:grid-cols-2">
             {([
-              { id: 'totp' as Method, title: 'Authenticator app', body: 'Works offline. No messages, no cost.' },
-              { id: 'email' as Method, title: 'Email code', body: `Sent to ${user?.email ?? 'your email'} at sign-in.` },
+              { id: 'totp' as TwoFactorMethod, title: 'Authenticator app', body: 'Works offline. No messages, no cost.' },
+              { id: 'email' as TwoFactorMethod, title: 'Email code', body: `Sent to ${user?.email ?? 'your email'} at sign-in.` },
             ]).map(option => (
               <button
                 key={option.id}
                 type="button"
-                aria-pressed={method === option.id}
-                onClick={() => setMethod(option.id)}
+                aria-pressed={context.method === option.id}
+                onClick={() => send({ type: 'SELECT', method: option.id })}
                 className={`text-left rounded-xl border px-4 py-3 transition-colors ${
-                  method === option.id
+                  context.method === option.id
                     ? 'border-[var(--brand-primary)] bg-[var(--brand-primary-10)]'
                     : 'border-[var(--color-border)] hover:bg-[var(--color-surface-hover)]'
                 }`}
@@ -283,8 +278,8 @@ export default function TwoFactorSettings() {
               </button>
             ))}
           </div>
-          <button type="button" className="btn btn-primary" onClick={() => start(method)} disabled={busy}>
-            {busy ? 'Preparing…' : 'Turn on two-factor authentication'}
+          <button type="button" className="btn btn-primary" onClick={() => start(context.method)} disabled={busy}>
+            {state === 'starting' ? 'Preparing…' : 'Turn on two-factor authentication'}
           </button>
         </div>
       )}

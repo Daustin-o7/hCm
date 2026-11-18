@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import api from '../services/api'
 import { downloadPdf } from '../services/downloadPdf'
 import { useAuth } from '../context/AuthContext'
+import { useBranding } from '../context/BrandingContext'
 import { Alert, friendlyError } from '../components/ui/Alert'
 import { consultationSoapSchema } from '../schemas'
 import {
@@ -16,6 +17,22 @@ import {
   INITIAL_TEETH,
   toPrescriptionItem
 } from '../components/consultations/consultationTypes'
+
+const COMMON_LAB_TESTS = [
+  'Complete Blood Count (CBC)',
+  'HbA1c',
+  'Fasting Blood Sugar (FBS)',
+  'Post-Prandial Blood Sugar (PPBS)',
+  'Lipid Profile',
+  'Liver Function Test (LFT)',
+  'Kidney Function Test (KFT/RFT)',
+  'Serum Creatinine',
+  'Thyroid Profile (T3, T4, TSH)',
+  'Urine Routine & Micro (C/E)',
+  'Serum Electrolytes (Na+, K+, Cl-)',
+  'Chest X-Ray (PA View)',
+  '12-Lead ECG'
+]
 import type {
   SpecialtyId,
   ToothStatus,
@@ -31,6 +48,8 @@ import PrescriptionsEditor from '../components/consultations/PrescriptionsEditor
 import PatientContextPanel from '../components/consultations/PatientContextPanel'
 import FinalizeSuccessModal from '../components/consultations/FinalizeSuccessModal'
 import AmendmentModal from '../components/consultations/AmendmentModal'
+import { useMachine } from '../machines/useMachine'
+import { consultationMachine, consultationView, type DocumentStatus } from '../machines/consultation'
 
 export default function Consultations() {
   const { sessionGeneration } = useAuth()
@@ -46,6 +65,15 @@ function ConsultationDesk() {
   const queryAppointmentId = searchParams.get('appointmentId')
 
   // ── Doctor Specialization ──
+  const { branding } = useBranding()
+
+  const availableSpecialties = useMemo(() => {
+    if (!branding.specialties || branding.specialties.length === 0) return SPECIALTIES
+    const allowed = new Set(branding.specialties.map(s => s.toLowerCase()))
+    const filtered = SPECIALTIES.filter(s => allowed.has(s.id.toLowerCase()))
+    return filtered.length > 0 ? filtered : SPECIALTIES
+  }, [branding.specialties])
+
   const [selectedSpecialty, setSelectedSpecialty] = useState<SpecialtyId>(() => {
     if (querySpecialty && SPECIALTIES.some(s => s.id === querySpecialty)) {
       return querySpecialty
@@ -55,6 +83,12 @@ function ConsultationDesk() {
       return SPECIALTIES.some(s => s.id === saved) ? saved as SpecialtyId : 'general'
     } catch { return 'general' }
   })
+
+  useEffect(() => {
+    if (availableSpecialties.length > 0 && !availableSpecialties.some(s => s.id === selectedSpecialty)) {
+      setSelectedSpecialty(availableSpecialties[0].id)
+    }
+  }, [availableSpecialties, selectedSpecialty])
 
   // ── Appointment Queue ──
   const [appointments, setAppointments] = useState<AppointmentItem[]>([])
@@ -66,6 +100,7 @@ function ConsultationDesk() {
   const [clinicalContext, setClinicalContext] = useState<PatientClinicalContext | null>(null)
   const [isContextLoading, setIsContextLoading] = useState(false)
   const [isContextPanelOpen, setIsContextPanelOpen] = useState(true)
+  const [localRecoveryDraft, setLocalRecoveryDraft] = useState<any>(null)
   const [precheck, setPrecheck] = useState<{
     submitted: boolean
     submittedAt?: string
@@ -74,7 +109,6 @@ function ConsultationDesk() {
     medications?: string | null
     allergies?: string | null
   } | null>(null)
-  const [consultationStatus, setConsultationStatus] = useState<'draft' | 'finalized' | 'amended'>('draft')
   const [isFinalizeModalOpen, setIsFinalizeModalOpen] = useState(false)
   const [finalizeData, setFinalizeData] = useState<any>(null)
   const [isAmendmentModalOpen, setIsAmendmentModalOpen] = useState(false)
@@ -107,15 +141,16 @@ function ConsultationDesk() {
   // ── Status, Versioning, Validation ──
   const [activeConsultationId, setActiveConsultationId] = useState<string | null>(null)
   const [versionNumber, setVersionNumber] = useState(1)
-  const [submitting, setSubmitting] = useState(false)
   const [toast, setToast] = useState<{ msg: string; type?: 'success' | 'err' } | null>(null)
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({})
   const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null)
-  const [draftLoaded, setDraftLoaded] = useState(false)
   const [chartRead, setChartRead] = useState(0)
-  const [draftError, setDraftError] = useState<string | null>(null)
-  const [savingDraft, setSavingDraft] = useState(false)
   const [savedPayload, setSavedPayload] = useState<string | null>(null)
+  // The chart lifecycle lives in one machine, so "may autosave", "may amend" and "must reload" cannot
+  // disagree with each other or with what the screen is showing.
+  const { snapshot: chart, send } = useMachine(consultationMachine)
+  const { chartLoaded, status: consultationStatus, error: draftError, savingDraft, submitting,
+    canSaveDraft, canAutosave, canFinalize, canAmend } = consultationView(chart)
   const [clinicalMetadata, setClinicalMetadata] = useState({ icdCode: null as string | null, icdTitle: null as string | null,
     templateId: null as string | null, templateVersion: null as number | null, structuredObservationsJson: null as string | null })
   const draftRevision = useRef({ expectedConsultationId: null as string | null, expectedVersion: 0, expectedUpdatedAt: null as string | null })
@@ -141,10 +176,7 @@ function ConsultationDesk() {
     encounter.current.abort()
     encounter.current = new AbortController()
     saveInFlight.current = false
-    setDraftLoaded(false)
-    setDraftError(null)
-    setSavingDraft(false)
-    setSubmitting(false)
+    send({ type: 'SELECT_APPOINTMENT' })
     setSavedPayload(null)
     draftRevision.current = { expectedConsultationId: null, expectedVersion: 0, expectedUpdatedAt: null }
     setClinicalMetadata({ icdCode: null, icdTitle: null, templateId: null, templateVersion: null, structuredObservationsJson: null })
@@ -158,7 +190,6 @@ function ConsultationDesk() {
     setSelectedAppointment(appointment)
     setActiveConsultationId(null)
     setVersionNumber(1)
-    setConsultationStatus('draft')
     setChiefComplaint('')
     setObservations('')
     setDiagnosis('')
@@ -171,7 +202,8 @@ function ConsultationDesk() {
     setTeeth(INITIAL_TEETH)
     setDraftSavedAt(null)
     setValidationErrors({})
-  }, [])
+    setLocalRecoveryDraft(null)
+  }, [send])
 
   // ── Fetch Appointments Queue ──
   const fetchAppointments = useCallback(async (signal: AbortSignal) => {
@@ -181,18 +213,19 @@ function ConsultationDesk() {
       const res = await api.get(`/appointments?date=${todayISO}`, { signal })
       if (signal.aborted) return
       if (Array.isArray(res.data) && res.data.length > 0) {
-        const mapped: AppointmentItem[] = res.data.map((a: any, idx: number) => ({
+        const mapped: AppointmentItem[] = res.data.map((a: any) => ({
           id: a.id || a.appointmentId,
           patientId: a.patientId,
-          patientName: a.patientName || a.patient?.name || `Patient #${idx + 1}`,
-          patientPhone: a.patientPhone || a.patient?.phone || 'Not recorded',
-          patientGender: a.patientGender || a.patient?.gender || 'Unknown',
+          patientName: a.patientName || a.patient?.name || 'Unnamed patient',
+          patientPhone: a.patientPhone || a.patient?.phone || '',
+          patientGender: a.patientGender || a.patient?.gender || '',
           patientAge: a.patientAge ?? a.patient?.approxAge,
           patientDob: a.patientDob || a.patient?.dob,
-          doctorName: a.doctorName || a.doctor?.name || 'Dr. Practitioner',
+          doctorName: a.doctorName || a.doctor?.name || '',
           status: a.status || 'Waiting',
           appointmentDate: a.appointmentDate || a.date || todayISO,
-          queueNumber: a.queueToken || a.queueNumber || idx + 1,
+          // Never invent a token: a patient without one is not "#1".
+          queueNumber: a.queueToken ?? a.queueNumber,
           priority: a.priority || 'Normal',
           type: a.type || 'Scheduled'
         }))
@@ -313,6 +346,7 @@ function ConsultationDesk() {
     const appointmentId = selectedAppointment?.id
     if (!appointmentId) return
     const signal = encounterSignal
+    send({ type: 'CHART_LOADING' })
     const load = async () => {
       try {
         const list = await api.get('/consultations', { params: { appointmentId, pageSize: 1 }, signal })
@@ -347,17 +381,42 @@ function ConsultationDesk() {
             templateVersion: data.templateVersion ?? null, structuredObservationsJson: data.structuredObservationsJson ?? null })
           setActiveConsultationId(data.consultationId)
           setVersionNumber(data.version)
-          setConsultationStatus(data.status)
+          send({ type: 'CHART_LOADED', status: data.status as DocumentStatus })
           draftRevision.current = { expectedConsultationId: data.consultationId, expectedVersion: data.version, expectedUpdatedAt: data.updatedAt ?? null }
           setDraftSavedAt(data.updatedAt ? new Date(data.updatedAt).toLocaleTimeString() : null)
+
+          if (data.status === 'draft') {
+            try {
+              const localDraftStr = sessionStorage.getItem(`hospital_crm_recovery_${appointmentId}`)
+              if (localDraftStr) {
+                const parsed = JSON.parse(localDraftStr)
+                if (parsed && (parsed.chiefComplaint || parsed.observations || parsed.diagnosis || parsed.orderedLabTests?.length || parsed.prescriptions?.length)) {
+                  if (!data.chiefComplaint && parsed.chiefComplaint) {
+                    setLocalRecoveryDraft(parsed)
+                  }
+                }
+              }
+            } catch { /* noop */ }
+          }
         }
-        setDraftLoaded(true)
+        if (!latest) {
+          send({ type: 'CHART_LOADED', status: 'draft' })
+          try {
+            const localDraftStr = sessionStorage.getItem(`hospital_crm_recovery_${appointmentId}`)
+            if (localDraftStr) {
+              const parsed = JSON.parse(localDraftStr)
+              if (parsed && (parsed.chiefComplaint || parsed.observations || parsed.diagnosis || parsed.orderedLabTests?.length || parsed.prescriptions?.length)) {
+                setLocalRecoveryDraft(parsed)
+              }
+            }
+          } catch { /* noop */ }
+        }
       } catch {
-        if (!signal.aborted) setDraftError('Unable to load the server chart. Reload before editing or saving.')
+        if (!signal.aborted) send({ type: 'CHART_FAILED', message: 'Unable to load the server chart. Reload before editing or saving.' })
       }
     }
     void load()
-  }, [selectedAppointment?.id, encounterSignal, chartRead])
+  }, [selectedAppointment?.id, encounterSignal, chartRead, send])
 
   const draftPayload = useMemo(() => ({ ...clinicalMetadata, chiefComplaint, observations, diagnosis, advisedInvestigations,
     orderedLabTests,
@@ -367,11 +426,10 @@ function ConsultationDesk() {
   const serializedPayload = JSON.stringify(draftPayload)
 
   const saveDraft = useCallback(async () => {
-    if (!selectedAppointment || !draftLoaded || consultationStatus !== 'draft' || saveInFlight.current || submitting) return
+    if (!selectedAppointment || !canSaveDraft || saveInFlight.current) return
     const { signal } = encounter.current
     saveInFlight.current = true
-    setSavingDraft(true)
-    setDraftError(null)
+    send({ type: 'AUTOSAVE_START' })
     try {
       const { data } = await api.post(`/appointments/${selectedAppointment.id}/consultation/draft`, { ...draftPayload, ...draftRevision.current }, { signal })
       if (signal.aborted) return
@@ -385,20 +443,60 @@ function ConsultationDesk() {
       setVersionNumber(data.version)
       setSavedPayload(serializedPayload)
       setDraftSavedAt(new Date(data.updatedAt).toLocaleTimeString())
+      send({ type: 'AUTOSAVE_SAVED' })
     } catch (err) {
-      if (!signal.aborted) setDraftError(`Draft not saved. ${friendlyError(err)} Your current edits are still on this screen.`)
+      if (!signal.aborted) {
+        send({ type: 'AUTOSAVE_FAILED', message: `Draft not saved. ${friendlyError(err)} Your current edits are still on this screen.` })
+      }
     } finally {
-      if (!signal.aborted) { saveInFlight.current = false; setSavingDraft(false) }
+      if (!signal.aborted) saveInFlight.current = false
     }
-  }, [selectedAppointment, draftLoaded, consultationStatus, submitting, draftPayload, serializedPayload])
+  }, [selectedAppointment, canSaveDraft, draftPayload, serializedPayload, send])
 
   useEffect(() => {
-    if (!draftLoaded) return
+    if (!chartLoaded) return
     if (savedPayload === null) { setSavedPayload(serializedPayload); return }
-    if (serializedPayload === savedPayload || consultationStatus !== 'draft' || savingDraft || submitting || draftError) return
+    if (serializedPayload === savedPayload || !canAutosave) return
     const timer = window.setTimeout(() => void saveDraft(), 1200)
     return () => window.clearTimeout(timer)
-  }, [draftLoaded, savedPayload, serializedPayload, consultationStatus, savingDraft, submitting, draftError, saveDraft])
+  }, [chartLoaded, savedPayload, serializedPayload, canAutosave, saveDraft])
+
+  // Local session snapshot storage (protects against browser crashes / accidental tab closes).
+  // New prefix on purpose: legacy `hospital_crm_draft_*` bytes may hold old PHI and must never be read.
+  useEffect(() => {
+    if (!selectedAppointment?.id || consultationStatus !== 'draft') return
+    if (!chiefComplaint && !observations && !diagnosis && orderedLabTests.length === 0 && prescriptions.length === 0) return
+    const draftToStore = {
+      chiefComplaint,
+      observations,
+      diagnosis,
+      advisedInvestigations,
+      orderedLabTests,
+      followUpDate,
+      followUpNotes,
+      prescriptions,
+      teeth,
+      savedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
+    }
+    try {
+      sessionStorage.setItem(`hospital_crm_recovery_${selectedAppointment.id}`, JSON.stringify(draftToStore))
+    } catch { /* storage full / private mode */ }
+  }, [selectedAppointment?.id, consultationStatus, chiefComplaint, observations, diagnosis, advisedInvestigations, orderedLabTests, followUpDate, followUpNotes, prescriptions, teeth])
+
+  const handleRestoreLocalDraft = useCallback(() => {
+    if (!localRecoveryDraft) return
+    if (localRecoveryDraft.chiefComplaint) setChiefComplaint(localRecoveryDraft.chiefComplaint)
+    if (localRecoveryDraft.observations) setObservations(localRecoveryDraft.observations)
+    if (localRecoveryDraft.diagnosis) setDiagnosis(localRecoveryDraft.diagnosis)
+    if (localRecoveryDraft.advisedInvestigations) setAdvisedInvestigations(localRecoveryDraft.advisedInvestigations)
+    if (Array.isArray(localRecoveryDraft.orderedLabTests)) setOrderedLabTests(localRecoveryDraft.orderedLabTests)
+    if (localRecoveryDraft.followUpDate) setFollowUpDate(localRecoveryDraft.followUpDate)
+    if (localRecoveryDraft.followUpNotes) setFollowUpNotes(localRecoveryDraft.followUpNotes)
+    if (localRecoveryDraft.teeth) setTeeth(localRecoveryDraft.teeth)
+    if (Array.isArray(localRecoveryDraft.prescriptions)) setPrescriptions(localRecoveryDraft.prescriptions)
+    showToast('Restored draft notes from local browser snapshot.')
+    setLocalRecoveryDraft(null)
+  }, [localRecoveryDraft, showToast])
 
   // ── Fetch Specialty Templates from Backend ──
   const fetchTemplateForSpecialty = useCallback(async (spec: SpecialtyId) => {
@@ -543,7 +641,7 @@ function ConsultationDesk() {
 
   // ── Finalize & Sign (Single Atomic Transaction) ──
   const handleFinalizeConsultation = useCallback(async () => {
-    if (!draftLoaded || saveInFlight.current || submitting || consultationStatus !== 'draft') return
+    if (!canFinalize || saveInFlight.current) return
     if (!selectedAppointment) {
       showToast('Please select a patient appointment first.', 'err')
       return
@@ -576,7 +674,7 @@ function ConsultationDesk() {
     }
 
     const { signal } = encounter.current
-    setSubmitting(true)
+    send({ type: 'FINALIZE_START' })
     try {
       const payload = {
         ...draftPayload,
@@ -590,14 +688,12 @@ function ConsultationDesk() {
         (data.prescriptionId === null && prescriptions.length === 0)
       if (!data.consultationId || !prescriptionConfirmed || data.status !== 'finalized' || !Number.isInteger(data.version) || data.version < 1 ||
           (draftRevision.current.expectedConsultationId && data.consultationId !== draftRevision.current.expectedConsultationId)) {
-        setDraftLoaded(false)
-        setDraftError('Unable to confirm finalization. Reload the server chart before continuing.')
+        send({ type: 'FINALIZE_UNVERIFIED', message: 'Unable to confirm finalization. Reload the server chart before continuing.' })
         return
       }
       setActiveConsultationId(data.consultationId)
       setVersionNumber(data.version)
-      setConsultationStatus('finalized')
-      setDraftLoaded(false)
+      send({ type: 'FINALIZED' })
       setSavedPayload(null)
       setChartRead(value => value + 1)
       setFinalizeData(data)
@@ -608,6 +704,10 @@ function ConsultationDesk() {
       setAppointments(prev => prev.map(a => a.id === selectedAppointment.id ? { ...a, status: 'Completed' } : a))
 
       setDraftSavedAt(null)
+      try {
+        sessionStorage.removeItem(`hospital_crm_recovery_${selectedAppointment.id}`)
+      } catch { /* noop */ }
+      setLocalRecoveryDraft(null)
       showToast('Consultation sealed, signed, and appointment marked Completed.')
     } catch (err: any) {
       if (signal.aborted) return
@@ -620,13 +720,14 @@ function ConsultationDesk() {
         showToast(err?.response?.data?.message || friendlyError(err) || 'Failed to finalize consultation.', 'err')
       }
     } finally {
-      if (!signal.aborted) setSubmitting(false)
+      // Ignored once the seal succeeded; from `finalizing` it returns the note to the doctor.
+      if (!signal.aborted) send({ type: 'FINALIZE_REJECTED' })
     }
-  }, [selectedAppointment, chiefComplaint, observations, diagnosis, prescriptions, orderedLabTests, showToast, draftLoaded, submitting, consultationStatus, draftPayload])
+  }, [selectedAppointment, chiefComplaint, observations, diagnosis, prescriptions, orderedLabTests, showToast, canFinalize, draftPayload, send])
 
   // ── Clinical Amendment (FR-14 & FR-15 Non-destructive v2) ──
   const handleConfirmAmendment = useCallback(async (amendmentReason: string) => {
-    if (!activeConsultationId || !draftLoaded || submitting || consultationStatus === 'draft') throw new Error('Reload the current chart before amending.')
+    if (!activeConsultationId || !canAmend) throw new Error('Reload the current chart before amending.')
 
     const payload = {
       amendmentReason,
@@ -635,30 +736,33 @@ function ConsultationDesk() {
     }
 
     const { signal } = encounter.current
-    setSubmitting(true)
+    send({ type: 'AMEND_START' })
     try {
       const { data } = await api.post(`/consultations/${activeConsultationId}/amend`, payload, { signal })
       signal.throwIfAborted()
       if (!data.consultationId || data.previousVersionId !== activeConsultationId || data.version !== versionNumber + 1 || data.status !== 'amended') {
-        setDraftLoaded(false)
-        setDraftError('Unable to confirm amendment. Reload the server chart before continuing.')
+        send({ type: 'AMEND_UNVERIFIED', message: 'Unable to confirm amendment. Reload the server chart before continuing.' })
         throw new Error('Amendment acknowledgement missing or invalid.')
       }
       setActiveConsultationId(data.consultationId)
       setVersionNumber(data.version)
-      setConsultationStatus('amended')
-      setDraftLoaded(false)
+      send({ type: 'AMENDED' })
       setSavedPayload(null)
       setChartRead(value => value + 1)
+      try {
+        if (selectedAppointment?.id) sessionStorage.removeItem(`hospital_crm_recovery_${selectedAppointment.id}`)
+      } catch { /* noop */ }
+      setLocalRecoveryDraft(null)
       showToast(`Consultation amended successfully (Version ${data.version}). Prior version preserved.`)
     } finally {
-      if (!signal.aborted) setSubmitting(false)
+      // Ignored once the amendment was acknowledged; from `amending` it returns the sealed note.
+      if (!signal.aborted) send({ type: 'AMEND_REJECTED' })
     }
-  }, [activeConsultationId, draftLoaded, submitting, consultationStatus, versionNumber, draftPayload, showToast])
+  }, [activeConsultationId, canAmend, versionNumber, draftPayload, showToast, send])
 
   // ── Copy Previous Prescription into Current Draft ──
   const handleCopyPreviousRx = useCallback((previousItems: any[]) => {
-    if (!draftLoaded) return
+    if (!chartLoaded) return
     if (!previousItems || previousItems.length === 0) return
     const formatted: PrescriptionDraft[] = previousItems.map(p => ({
       medicine: p.brandName || p.genericName || '',
@@ -682,15 +786,15 @@ function ConsultationDesk() {
     setPrescriptions(prev => [...prev, ...formatted])
     setActiveTab('rx')
     showToast(`Copied ${formatted.length} medicines from previous visit into prescription.`)
-  }, [showToast, draftLoaded])
+  }, [showToast, chartLoaded])
 
   // ── Keyboard Shortcuts (Ctrl+S for Finalize, Alt+1/2/3/4) ──
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
-        if (!draftLoaded || submitting || savingDraft) return
-        if (consultationStatus !== 'draft') {
+        if (!chartLoaded || submitting || savingDraft) return
+        if (canAmend) {
           setIsAmendmentModalOpen(true)
         } else {
           handleFinalizeConsultation()
@@ -712,7 +816,7 @@ function ConsultationDesk() {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleFinalizeConsultation, consultationStatus, draftLoaded, submitting, savingDraft])
+  }, [handleFinalizeConsultation, canAmend, chartLoaded, submitting, savingDraft])
 
   // ── Queue Navigation ──
   const currentQueueIndex = useMemo(() => {
@@ -778,7 +882,7 @@ function ConsultationDesk() {
               className="bg-transparent text-xs font-bold text-slate-800 border-none outline-none cursor-pointer pr-1"
               aria-label="Select Doctor Specialty"
             >
-              {SPECIALTIES.map(s => (
+              {availableSpecialties.map(s => (
                 <option key={s.id} value={s.id}>
                   {s.icon} {s.name}
                 </option>
@@ -787,7 +891,7 @@ function ConsultationDesk() {
           </div>
 
           <span role="status" className="text-xs text-slate-500">
-            {!draftLoaded ? (selectedAppointment ? 'Loading server chart…' : 'Select an appointment') : savingDraft ? 'Saving draft…' :
+            {!chartLoaded ? (selectedAppointment ? 'Loading server chart…' : 'Select an appointment') : savingDraft ? 'Saving draft…' :
               draftError || serializedPayload !== savedPayload ? 'Unsaved changes' : draftSavedAt ? `Saved on server ${draftSavedAt}` : 'Server chart loaded'}
           </span>
 
@@ -796,7 +900,7 @@ function ConsultationDesk() {
             <button
               type="button"
               onClick={handleSaveDraft}
-              disabled={submitting || savingDraft || !draftLoaded}
+              disabled={submitting || savingDraft || !chartLoaded}
               className="btn btn-secondary btn-sm flex items-center gap-1 text-slate-700"
               title="Save non-binding draft"
             >
@@ -828,7 +932,7 @@ function ConsultationDesk() {
             <button
               type="button"
               onClick={() => setIsAmendmentModalOpen(true)}
-              disabled={submitting || !draftLoaded}
+              disabled={submitting || !chartLoaded}
               className="btn btn-secondary btn-sm flex items-center gap-1.5"
               title="Amend sealed note (Ctrl+S)"
             >
@@ -839,7 +943,7 @@ function ConsultationDesk() {
             <button
               type="button"
               onClick={handleFinalizeConsultation}
-              disabled={submitting || savingDraft || !draftLoaded}
+              disabled={submitting || savingDraft || !chartLoaded}
               className="btn btn-primary btn-sm flex items-center gap-1.5 shadow-sm"
               title="Finalize & Sign (Ctrl+S)"
             >
@@ -886,7 +990,51 @@ function ConsultationDesk() {
         onRecallPatient={handleRecallPatient}
         onToggleContextPanel={() => setIsContextPanelOpen(prev => !prev)}
         isContextPanelOpen={isContextPanelOpen}
+        onPrintPrescription={async () => {
+          if (!activeConsultationId) return
+          const { signal } = encounter.current
+          try {
+            await downloadPdf(`/consultations/${activeConsultationId}/prescription/pdf`, `Prescription-${selectedAppointment?.patientName || 'Patient'}_v${versionNumber}.pdf`, signal)
+          } catch (err) {
+            if (!signal.aborted) showToast(friendlyError(err), 'err')
+          }
+        }}
+        canPrint={consultationStatus !== 'draft' && Boolean(activeConsultationId)}
       />
+
+      {/* ── Local Recovery Draft Banner ── */}
+      {localRecoveryDraft && consultationStatus === 'draft' && (
+        <div className="card p-3.5 bg-amber-50 border border-amber-300 text-amber-900 flex items-center justify-between text-xs animate-fadein">
+          <div className="flex items-center gap-2.5">
+            <span className="text-xl">💾</span>
+            <div>
+              <span className="font-bold">Unsaved local recovery draft found ({localRecoveryDraft.savedAt})</span>
+              <p className="text-[11px] text-amber-800 m-0">Your previous draft notes were preserved in this browser. Would you like to restore them?</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRestoreLocalDraft}
+              className="btn btn-xs bg-amber-600 hover:bg-amber-700 text-white font-bold"
+            >
+              Restore Draft
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  if (selectedAppointment?.id) sessionStorage.removeItem(`hospital_crm_recovery_${selectedAppointment.id}`)
+                } catch { /* noop */ }
+                setLocalRecoveryDraft(null)
+              }}
+              className="btn btn-xs btn-outline border-amber-400 text-amber-900 hover:bg-amber-100"
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── 3. PATIENT CONTEXT PANEL (Allergies, Vitals & Prior Rx) ── */}
       <PatientContextPanel
@@ -898,7 +1046,7 @@ function ConsultationDesk() {
       />
 
       {/* ── 4. WORKSPACE NAVIGATION TABS ── */}
-      <fieldset disabled={!draftLoaded || submitting} className="min-w-0 space-y-4">
+      <fieldset disabled={!chartLoaded || submitting} className="min-w-0 space-y-4">
       <div className="flex items-center gap-1 border-b border-[var(--color-border)] pb-0 overflow-x-auto">
         <button
           onClick={() => setActiveTab('soap')}
@@ -1010,6 +1158,12 @@ function ConsultationDesk() {
             complaintInputRef={complaintInputRef}
             diagnosisInputRef={diagnosisInputRef}
             onSwitchTab={setActiveTab}
+            precheck={precheck}
+            triageObservations={
+              clinicalContext?.todayVitals
+                ? `BP: ${clinicalContext.todayVitals.systolicBp ?? '-'}/${clinicalContext.todayVitals.diastolicBp ?? '-'} mmHg, Pulse: ${clinicalContext.todayVitals.heartRate ?? '-'} bpm, SpO2: ${clinicalContext.todayVitals.spO2 ?? '-'}%, Temp: ${clinicalContext.todayVitals.temperature ?? '-'}°F, Wt: ${clinicalContext.todayVitals.weightKg ?? '-'} kg`
+                : null
+            }
           />
 
           {/* Core Advised Investigations & Follow-Up */}
@@ -1064,6 +1218,30 @@ function ConsultationDesk() {
                 Order Lab Tests (sent to Lab Worklist on signing)
               </label>
               <p className="text-xs text-slate-500 mb-2">Selections are included in draft saves. Orders are sent to the Lab Worklist only when you finalize.</p>
+              {/* Quick OPD Lab Test Chips */}
+              <div className="flex flex-wrap items-center gap-1.5 mb-2.5">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 py-0.5">Quick OPD Panels:</span>
+                {COMMON_LAB_TESTS.map(test => {
+                  const isSelected = orderedLabTests.includes(test)
+                  return (
+                    <button
+                      key={test}
+                      type="button"
+                      onClick={() => {
+                        setOrderedLabTests(prev => isSelected ? prev.filter(t => t !== test) : [...prev, test])
+                      }}
+                      className={`text-[11px] px-2.5 py-0.5 rounded-full border transition-colors ${
+                        isSelected
+                          ? 'bg-teal-600 text-white border-teal-600 font-semibold'
+                          : 'bg-slate-50 hover:bg-teal-50 text-slate-700 border-slate-200'
+                      }`}
+                    >
+                      {isSelected ? '✓ ' : '+ '}{test}
+                    </button>
+                  )
+                })}
+              </div>
+
               <div className="flex gap-2">
                 <input
                   id="consultation-lab-test"

@@ -1,13 +1,14 @@
-﻿import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useId } from 'react'
 import api from '../services/api'
 import { useTheme, type ThemeMode } from '../context/ThemeContext'
 import { useAuth } from '../context/AuthContext'
 import PaymentIntegrationSettings from '../components/PaymentIntegrationSettings'
 import MobilePaymentBridgeSettings from '../components/MobilePaymentBridgeSettings'
 import TwoFactorSettings from '../components/TwoFactorSettings'
+import DoctorSigningCredentialsSettings from '../components/DoctorSigningCredentialsSettings'
 import { CLINICAL_SPECIALTIES } from '../constants/clinicalSpecialties'
 import { SkeletonCard } from '../components/ui/Skeleton'
-import { friendlyError } from '../components/ui/Alert'
+import { Alert, friendlyError } from '../components/ui/Alert'
 
 interface WorkingHour {
   day: string
@@ -36,6 +37,7 @@ interface SpecialHour {
 interface ClinicProfile {
   name: string
   organizationType: string | null
+  specialties: string | null
   legalName: string | null
   address: string | null
   phone: string | null
@@ -89,11 +91,12 @@ const ALL_DAYS = [
 
 export default function Settings() {
   const [profile, setProfile] = useState<ClinicProfile | null>(null)
+  const [profileError, setProfileError] = useState('')
   const [loading, setLoading] = useState(false)
   const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null)
 
-  const { user } = useAuth()
-  const userRole = String(user?.role || 'doctor').toLowerCase()
+  const { user, sessionGeneration, currentTenantId, currentClinicId } = useAuth()
+  const userRole = String(user?.role || '').toLowerCase()
   const isAdmin = userRole === 'clinicadmin' || userRole === 'owner'
 
   const showToast = (msg: string, kind: 'ok' | 'err' = 'ok') => {
@@ -102,11 +105,12 @@ export default function Settings() {
   }
 
   const fetchProfile = useCallback(async () => {
+    setProfileError('')
     try {
       const res = await api.get('/clinic/profile')
       setProfile(res.data)
     } catch {
-      showToast('Failed to load clinic profile', 'err')
+      setProfileError('Could not load clinic profile. Please retry.')
     }
   }, [])
 
@@ -121,6 +125,7 @@ export default function Settings() {
       await api.put('/clinic/profile', {
         name: profile.name,
         organizationType: profile.organizationType,
+        specialties: profile.specialties,
         legalName: profile.legalName,
         timezone: profile.timezone,
         currency: profile.currency,
@@ -223,16 +228,6 @@ export default function Settings() {
     }
   }
 
-  if (!profile) {
-    return (
-      <div className="animate-fadein space-y-6 pb-12">
-        <SkeletonCard />
-        <SkeletonCard />
-        <SkeletonCard />
-      </div>
-    )
-  }
-
   return (
     <div className="animate-fadein" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       {/* ── Page header ── */}
@@ -242,11 +237,13 @@ export default function Settings() {
           <p className="page-description">
             {isAdmin
               ? 'Configure clinic profile, working hours, holidays, and operating rules.'
-              : 'Read-only view of clinic operating hours, holidays, and configuration.'}
+              : userRole === 'doctor'
+                ? 'Update your signing credentials and account preferences. Clinic configuration is read-only.'
+                : 'Manage account preferences and view clinic operating hours, holidays, and configuration.'}
           </p>
         </div>
         {!isAdmin && (
-          <span className="badge badge-info">Read-only</span>
+          <span className="badge badge-info">Clinic configuration is read-only</span>
         )}
       </div>
 
@@ -256,6 +253,9 @@ export default function Settings() {
           <span>{toast.msg}</span>
         </div>
       )}
+
+      {userRole === 'doctor' && <DoctorSigningCredentialsSettings
+        key={`${sessionGeneration}:${user?.id}:${currentTenantId}:${currentClinicId}`} />}
 
       {/* ── Account: optional two-factor authentication ── */}
       <TwoFactorSettings />
@@ -274,6 +274,7 @@ export default function Settings() {
       {/* ── B2.9: Android Hardware Payment Bridge (SMS & Soundbox) ── */}
       <MobilePaymentBridgeSettings isAdmin={isAdmin} />
 
+      {profile ? <>
       <WorkingHoursEditor
         initialHours={profile.workingHours}
         isAdmin={isAdmin}
@@ -302,6 +303,18 @@ export default function Settings() {
         onSave={onUpdateProfile}
         saving={loading}
       />
+      </> : profileError ? (
+        <div className="space-y-4">
+          <Alert variant="error">{profileError}</Alert>
+          <button type="button" className="btn btn-secondary" onClick={fetchProfile}>Retry clinic profile</button>
+        </div>
+      ) : (
+        <div className="space-y-6" role="status" aria-label="Loading clinic profile">
+          <SkeletonCard />
+          <SkeletonCard />
+          <SkeletonCard />
+        </div>
+      )}
     </div>
   )
 }
@@ -427,6 +440,7 @@ function WorkingHoursEditor({ initialHours, isAdmin, onSave, saving }: {
                 <div key={s.shiftIndex} className="flex items-center gap-2">
                   <input
                     type="time"
+                    aria-label={`${d.label} shift ${s.shiftIndex + 1} opening time`}
                     value={s.open}
                     onChange={e => updateShift(d.key, s.shiftIndex, 'open', e.target.value)}
                     disabled={!isAdmin}
@@ -435,6 +449,7 @@ function WorkingHoursEditor({ initialHours, isAdmin, onSave, saving }: {
                   <span className="text-xs text-[var(--color-text-secondary)] font-medium">to</span>
                   <input
                     type="time"
+                    aria-label={`${d.label} shift ${s.shiftIndex + 1} closing time`}
                     value={s.close}
                     onChange={e => updateShift(d.key, s.shiftIndex, 'close', e.target.value)}
                     disabled={!isAdmin}
@@ -473,6 +488,7 @@ function HolidaysEditor({ holidays, isAdmin, onAdd, onDelete }: {
   onAdd: (name: string, start: string, end: string, recurring: boolean) => void
   onDelete: (id: string) => void
 }) {
+  const uid = useId()
   const [showAdd, setShowAdd] = useState(false)
   const [name, setName] = useState('')
   const [start, setStart] = useState('')
@@ -504,8 +520,9 @@ function HolidaysEditor({ holidays, isAdmin, onAdd, onDelete }: {
         <div className="rounded-xl border border-[var(--color-border)] p-4 space-y-3 bg-[var(--color-surface-raised)]">
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
-              <label className="label">Holiday Name</label>
+              <label className="label" htmlFor={`${uid}-holiday-name`}>Holiday Name</label>
               <input
+                id={`${uid}-holiday-name`}
                 value={name}
                 onChange={e => setName(e.target.value)}
                 className="input-field"
@@ -524,8 +541,9 @@ function HolidaysEditor({ holidays, isAdmin, onAdd, onDelete }: {
               </label>
             </div>
             <div>
-              <label className="label">Start Date</label>
+              <label className="label" htmlFor={`${uid}-holiday-start`}>Start Date</label>
               <input
+                id={`${uid}-holiday-start`}
                 type="date"
                 value={start}
                 onChange={e => setStart(e.target.value)}
@@ -533,8 +551,9 @@ function HolidaysEditor({ holidays, isAdmin, onAdd, onDelete }: {
               />
             </div>
             <div>
-              <label className="label">End Date</label>
+              <label className="label" htmlFor={`${uid}-holiday-end`}>End Date</label>
               <input
+                id={`${uid}-holiday-end`}
                 type="date"
                 value={end}
                 onChange={e => setEnd(e.target.value)}
@@ -581,6 +600,7 @@ function SpecialHoursEditor({ specialHours, isAdmin, onAdd, onDelete }: {
   onAdd: (date: string, open: string, close: string, reason: string) => void
   onDelete: (id: string) => void
 }) {
+  const uid = useId()
   const [showAdd, setShowAdd] = useState(false)
   const [date, setDate] = useState('')
   const [open, setOpen] = useState('10:00')
@@ -613,8 +633,9 @@ function SpecialHoursEditor({ specialHours, isAdmin, onAdd, onDelete }: {
         <div className="rounded-xl border border-[var(--color-border)] p-4 space-y-3 bg-[var(--color-surface-raised)]">
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
-              <label className="form-label">Date</label>
+              <label className="form-label" htmlFor={`${uid}-special-date`}>Date</label>
               <input
+                id={`${uid}-special-date`}
                 type="date"
                 value={date}
                 onChange={e => setDate(e.target.value)}
@@ -622,8 +643,9 @@ function SpecialHoursEditor({ specialHours, isAdmin, onAdd, onDelete }: {
               />
             </div>
             <div>
-              <label className="form-label">Reason (optional)</label>
+              <label className="form-label" htmlFor={`${uid}-special-reason`}>Reason (optional)</label>
               <input
+                id={`${uid}-special-reason`}
                 value={reason}
                 onChange={e => setReason(e.target.value)}
                 className="form-input"
@@ -631,8 +653,9 @@ function SpecialHoursEditor({ specialHours, isAdmin, onAdd, onDelete }: {
               />
             </div>
             <div>
-              <label className="form-label">Open Time</label>
+              <label className="form-label" htmlFor={`${uid}-special-open`}>Open Time</label>
               <input
+                id={`${uid}-special-open`}
                 type="time"
                 value={open}
                 onChange={e => setOpen(e.target.value)}
@@ -640,8 +663,9 @@ function SpecialHoursEditor({ specialHours, isAdmin, onAdd, onDelete }: {
               />
             </div>
             <div>
-              <label className="form-label">Close Time</label>
+              <label className="form-label" htmlFor={`${uid}-special-close`}>Close Time</label>
               <input
+                id={`${uid}-special-close`}
                 type="time"
                 value={close}
                 onChange={e => setClose(e.target.value)}
@@ -689,6 +713,7 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
   onSave: () => void
   saving: boolean
 }) {
+  const uid = useId()
   const update = (field: keyof ClinicProfile, value: any) => {
     onUpdate({ ...profile, [field]: value })
   }
@@ -704,8 +729,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div>
-          <label className="form-label">Clinic Name *</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-name`}>Clinic Name *</label>
           <input
+            id={`${uid}-clinic-name`}
             value={profile.name}
             onChange={e => update('name', e.target.value)}
             disabled={!isAdmin}
@@ -713,8 +739,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           />
         </div>
         <div>
-          <label className="form-label">Organization Type</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-org-type`}>Organization Type</label>
           <select
+            id={`${uid}-clinic-org-type`}
             value={profile.organizationType || ''}
             onChange={e => update('organizationType', e.target.value || null)}
             disabled={!isAdmin}
@@ -729,17 +756,62 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           </select>
         </div>
         <div>
-          <label className="form-label">Legal Name</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-legal-name`}>Legal Name</label>
           <input
+            id={`${uid}-clinic-legal-name`}
             value={profile.legalName || ''}
             onChange={e => update('legalName', e.target.value || null)}
             disabled={!isAdmin}
             className="form-input disabled:bg-[var(--color-surface-hover)]"
           />
         </div>
+
+        {/* ── Registered Specialties / Scope of Practice ── */}
+        <div className="sm:col-span-2 p-3.5 rounded-xl bg-[var(--color-surface-raised)] border border-[var(--color-border)]" role="group" aria-labelledby={`${uid}-clinic-specialties-label`}>
+          <div className="flex items-center justify-between mb-1">
+            <span id={`${uid}-clinic-specialties-label`} className="form-label font-bold" style={{ margin: 0 }}>Registered Clinical Specialties</span>
+            <span className="badge badge-brand text-[10px]">
+              {profile.organizationType === 'Polyclinic' ? 'Multi-Specialty Polyclinic' : 'Clinic Scope'}
+            </span>
+          </div>
+          <p className="text-xs text-[var(--color-text-secondary)] mb-2.5">
+            Select the specialties offered by your facility. The OPD Queue and Appointments specialty filters will only show the disciplines selected here.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {CLINICAL_SPECIALTIES.filter(s => s.id !== 'all').map(spec => {
+              const currentList = profile.specialties ? profile.specialties.split(',').map(s => s.trim().toLowerCase()) : []
+              const isSelected = currentList.includes(spec.id.toLowerCase())
+              return (
+                <button
+                  key={spec.id}
+                  type="button"
+                  disabled={!isAdmin}
+                  onClick={() => {
+                    let next: string[]
+                    if (isSelected) {
+                      next = currentList.filter(id => id !== spec.id.toLowerCase())
+                    } else {
+                      next = [...currentList, spec.id.toLowerCase()]
+                    }
+                    update('specialties', next.join(','))
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all border cursor-pointer ${
+                    isSelected
+                      ? 'btn-primary shadow-xs'
+                      : 'bg-[var(--color-surface)] dark:bg-slate-800 text-[var(--color-text-secondary)] border-[var(--color-border)] hover:border-[var(--brand-primary)]'
+                  } disabled:opacity-60 disabled:cursor-not-allowed`}
+                >
+                  <span>{spec.icon}</span>
+                  <span>{spec.name}</span>
+                  {isSelected && <span className="ml-1 text-[10px]">✓</span>}
+                </button>
+              )
+            })}
+          </div>
+        </div>
         <div>
           <div className="flex items-center justify-between mb-1">
-            <label className="form-label" style={{ margin: 0 }}>Timezone</label>
+            <label className="form-label" style={{ margin: 0 }} htmlFor={`${uid}-clinic-timezone`}>Timezone</label>
             {isAdmin && (
               <button
                 type="button"
@@ -757,6 +829,7 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             )}
           </div>
           <input
+            id={`${uid}-clinic-timezone`}
             value={profile.timezone}
             onChange={e => update('timezone', e.target.value)}
             disabled={!isAdmin}
@@ -765,8 +838,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           />
         </div>
         <div>
-          <label className="form-label">Currency</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-currency`}>Currency</label>
           <select
+            id={`${uid}-clinic-currency`}
             value={profile.currency}
             onChange={e => update('currency', e.target.value)}
             disabled={!isAdmin}
@@ -781,8 +855,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           </select>
         </div>
         <div>
-          <label className="form-label">Language</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-language`}>Language</label>
           <select
+            id={`${uid}-clinic-language`}
             value={profile.language}
             onChange={e => update('language', e.target.value)}
             disabled={!isAdmin}
@@ -794,8 +869,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           </select>
         </div>
         <div className="sm:col-span-2">
-          <label className="form-label">Address</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-address`}>Address</label>
           <textarea
+            id={`${uid}-clinic-address`}
             value={profile.address || ''}
             onChange={e => update('address', e.target.value || null)}
             disabled={!isAdmin}
@@ -804,8 +880,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           />
         </div>
         <div>
-          <label className="form-label">Phone</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-phone`}>Phone</label>
           <input
+            id={`${uid}-clinic-phone`}
             value={profile.phone || ''}
             onChange={e => update('phone', e.target.value || null)}
             disabled={!isAdmin}
@@ -814,8 +891,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           />
         </div>
         <div>
-          <label className="form-label">Email</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-email`}>Email</label>
           <input
+            id={`${uid}-clinic-email`}
             type="email"
             value={profile.email || ''}
             onChange={e => update('email', e.target.value || null)}
@@ -824,8 +902,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
           />
         </div>
         <div>
-          <label className="form-label">Website</label>
+          <label className="form-label" htmlFor={`${uid}-clinic-website`}>Website</label>
           <input
+            id={`${uid}-clinic-website`}
             value={profile.website || ''}
             onChange={e => update('website', e.target.value || null)}
             disabled={!isAdmin}
@@ -838,8 +917,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
         <h3 className="text-sm font-bold text-[var(--color-text)] mb-3">Branding</h3>
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
-            <label className="form-label">Primary Color</label>
+            <label className="form-label" htmlFor={`${uid}-clinic-primary-color`}>Primary Color</label>
             <input
+              id={`${uid}-clinic-primary-color`}
               type="color"
               value={profile.primaryColor}
               onChange={e => update('primaryColor', e.target.value)}
@@ -848,8 +928,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Secondary Color</label>
+            <label className="form-label" htmlFor={`${uid}-clinic-secondary-color`}>Secondary Color</label>
             <input
+              id={`${uid}-clinic-secondary-color`}
               type="color"
               value={profile.secondaryColor}
               onChange={e => update('secondaryColor', e.target.value)}
@@ -858,8 +939,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Accent Color</label>
+            <label className="form-label" htmlFor={`${uid}-clinic-accent-color`}>Accent Color</label>
             <input
+              id={`${uid}-clinic-accent-color`}
               type="color"
               value={profile.accentColor}
               onChange={e => update('accentColor', e.target.value)}
@@ -874,8 +956,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
         <h3 className="text-sm font-bold text-[var(--color-text)] mb-3">Appointment Defaults</h3>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <div>
-            <label className="form-label">Duration (min)</label>
+            <label className="form-label" htmlFor={`${uid}-appt-duration`}>Duration (min)</label>
             <input
+              id={`${uid}-appt-duration`}
               type="number"
               min="5"
               max="120"
@@ -886,8 +969,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Buffer (min)</label>
+            <label className="form-label" htmlFor={`${uid}-appt-buffer`}>Buffer (min)</label>
             <input
+              id={`${uid}-appt-buffer`}
               type="number"
               min="0"
               max="60"
@@ -898,8 +982,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Min Advance (hrs)</label>
+            <label className="form-label" htmlFor={`${uid}-appt-min-advance`}>Min Advance (hrs)</label>
             <input
+              id={`${uid}-appt-min-advance`}
               type="number"
               min="0"
               value={profile.minAdvanceBookingHours}
@@ -909,8 +994,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Max Advance (days)</label>
+            <label className="form-label" htmlFor={`${uid}-appt-max-advance`}>Max Advance (days)</label>
             <input
+              id={`${uid}-appt-max-advance`}
               type="number"
               min="1"
               value={profile.maxAdvanceBookingDays}
@@ -986,8 +1072,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
         </div>
         <div className="mt-3 grid gap-3 sm:grid-cols-3">
           <div>
-            <label className="form-label">Cancellation Window (hrs)</label>
+            <label className="form-label" htmlFor={`${uid}-appt-cancellation-window`}>Cancellation Window (hrs)</label>
             <input
+              id={`${uid}-appt-cancellation-window`}
               type="number"
               min="0"
               max="168"
@@ -1004,8 +1091,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
         <h3 className="text-sm font-bold text-[var(--color-text)] mb-3">Billing Defaults</h3>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <div>
-            <label className="form-label">Invoice Prefix</label>
+            <label className="form-label" htmlFor={`${uid}-billing-invoice-prefix`}>Invoice Prefix</label>
             <input
+              id={`${uid}-billing-invoice-prefix`}
               value={profile.invoicePrefix}
               onChange={e => update('invoicePrefix', e.target.value)}
               disabled={!isAdmin}
@@ -1013,8 +1101,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Default GST Rate (%)</label>
+            <label className="form-label" htmlFor={`${uid}-billing-gst-rate`}>Default GST Rate (%)</label>
             <input
+              id={`${uid}-billing-gst-rate`}
               type="number"
               min="0"
               max="100"
@@ -1026,8 +1115,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Default Consultation Fee (₹)</label>
+            <label className="form-label" htmlFor={`${uid}-billing-consult-fee`}>Default Consultation Fee (₹)</label>
             <input
+              id={`${uid}-billing-consult-fee`}
               type="number"
               min="0"
               step="1"
@@ -1057,30 +1147,38 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
         <p className="text-xs text-[var(--color-text-muted)] mb-3">
           Required for Schedule H / H1 / X dispensing compliance. Format: DL-XX-YYYY-XXXXXX
         </p>
+        {!isAdmin && (
+          <p className="text-xs text-[var(--color-text-muted)] mb-3">
+            Read-only for your role — ask a Clinic Admin or Owner to change these licence numbers.
+          </p>
+        )}
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
-            <label className="form-label">Form 20 Licence Number</label>
+            <label className="form-label" htmlFor={`${uid}-pharmacy-licence-20`}>Form 20 Licence Number</label>
             <input
+              id={`${uid}-pharmacy-licence-20`}
               value={profile.pharmacyLicenceNumber20 || ''}
               onChange={e => update('pharmacyLicenceNumber20', e.target.value || null)}
               disabled={!isAdmin}
               className="form-input mono disabled:bg-[var(--color-surface-hover)]"
-              placeholder="DL-20-2026-KA-8891"
+              placeholder="DL-20-YYYY-XXXXXX"
             />
           </div>
           <div>
-            <label className="form-label">Form 21 Licence Number</label>
+            <label className="form-label" htmlFor={`${uid}-pharmacy-licence-21`}>Form 21 Licence Number</label>
             <input
+              id={`${uid}-pharmacy-licence-21`}
               value={profile.pharmacyLicenceNumber21 || ''}
               onChange={e => update('pharmacyLicenceNumber21', e.target.value || null)}
               disabled={!isAdmin}
               className="form-input mono disabled:bg-[var(--color-surface-hover)]"
-              placeholder="DL-21-2026-KA-8892"
+              placeholder="DL-21-YYYY-XXXXXX"
             />
           </div>
           <div>
-            <label className="form-label">Pharmacy GST Number</label>
+            <label className="form-label" htmlFor={`${uid}-pharmacy-gst`}>Pharmacy GST Number</label>
             <input
+              id={`${uid}-pharmacy-gst`}
               value={profile.pharmacyGstNumber || ''}
               onChange={e => update('pharmacyGstNumber', e.target.value || null)}
               disabled={!isAdmin}
@@ -1095,8 +1193,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
         <h3 className="text-sm font-bold text-[var(--color-text)] mb-3">Queue Token Settings</h3>
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
-            <label className="form-label">Token Format</label>
+            <label className="form-label" htmlFor={`${uid}-token-format`}>Token Format</label>
             <input
+              id={`${uid}-token-format`}
               value={profile.tokenFormat}
               onChange={e => update('tokenFormat', e.target.value)}
               disabled={!isAdmin}
@@ -1105,8 +1204,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Token Start Number</label>
+            <label className="form-label" htmlFor={`${uid}-token-start`}>Token Start Number</label>
             <input
+              id={`${uid}-token-start`}
               type="number"
               min="1"
               max="9999"
@@ -1117,8 +1217,9 @@ function ClinicProfileEditor({ profile, isAdmin, onUpdate, onSave, saving }: {
             />
           </div>
           <div>
-            <label className="form-label">Token Reset Frequency</label>
+            <label className="form-label" htmlFor={`${uid}-token-reset`}>Token Reset Frequency</label>
             <select
+              id={`${uid}-token-reset`}
               value={profile.tokenResetFrequency}
               onChange={e => update('tokenResetFrequency', e.target.value)}
               disabled={!isAdmin}

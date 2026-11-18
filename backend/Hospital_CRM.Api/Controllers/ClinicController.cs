@@ -45,6 +45,7 @@ public class ClinicController : ControllerBase
         if (!string.IsNullOrWhiteSpace(request.Timezone)) clinic.Timezone = request.Timezone.Trim();
         if (!string.IsNullOrWhiteSpace(request.Currency)) clinic.Currency = request.Currency.Trim();
         if (!string.IsNullOrWhiteSpace(request.OrganizationType)) clinic.OrganizationType = request.OrganizationType.Trim();
+        if (request.Specialties != null) clinic.Specialties = string.IsNullOrWhiteSpace(request.Specialties) ? null : request.Specialties.Trim();
         if (!string.IsNullOrWhiteSpace(request.LegalName)) clinic.LegalName = request.LegalName.Trim();
         if (!string.IsNullOrWhiteSpace(request.Address)) clinic.Address = request.Address.Trim();
         if (!string.IsNullOrWhiteSpace(request.Phone)) clinic.Phone = request.Phone.Trim();
@@ -143,6 +144,7 @@ public class ClinicController : ControllerBase
             activatedModules,
             name = clinic.Name,
             organizationType = clinic.OrganizationType,
+            specialties = clinic.Specialties,
             legalName = clinic.LegalName,
             address = clinic.Address,
             phone = clinic.Phone,
@@ -418,6 +420,7 @@ public record ClinicProfileRequest(
     string? Timezone = null,
     string? Currency = null,
     string? OrganizationType = null,
+    string? Specialties = null,
     string? LegalName = null,
     string? Address = null,
     string? Phone = null,

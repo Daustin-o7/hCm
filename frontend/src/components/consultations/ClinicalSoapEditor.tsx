@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react'
+import React, { useState, useCallback } from 'react'
 import { AlertCircleIcon } from '../icons/Index'
 import type { SpecialtyConfig, SpecialtyId, ToothStatus } from './consultationTypes'
 
@@ -19,6 +19,14 @@ interface ClinicalSoapEditorProps {
   complaintInputRef: React.RefObject<HTMLTextAreaElement | null>
   diagnosisInputRef: React.RefObject<HTMLInputElement | null>
   onSwitchTab: (tab: 'soap' | 'tools' | 'rx' | 'template_structure') => void
+  precheck?: {
+    submitted?: boolean
+    chiefComplaint?: string | null
+    symptomDuration?: string | null
+    medications?: string | null
+    allergies?: string | null
+  } | null
+  triageObservations?: string | null
 }
 
 export default function ClinicalSoapEditor({
@@ -37,8 +45,12 @@ export default function ClinicalSoapEditor({
   physioVas,
   complaintInputRef,
   diagnosisInputRef,
-  onSwitchTab
+  onSwitchTab,
+  precheck,
+  triageObservations
 }: ClinicalSoapEditorProps) {
+  const [triageImported, setTriageImported] = useState(false)
+
   // Quick Insert Chips Helper
   const appendText = useCallback((field: 'complaint' | 'observations' | 'diagnosis', text: string) => {
     if (field === 'complaint') {
@@ -51,6 +63,41 @@ export default function ClinicalSoapEditor({
       setValidationErrors(v => ({ ...v, diagnosis: '' }))
     }
   }, [setChiefComplaint, setObservations, setDiagnosis, setValidationErrors])
+
+  // Import Triage / Precheck into SOAP Note
+  const handleImportTriage = useCallback(() => {
+    const parts: string[] = []
+    if (precheck?.chiefComplaint) {
+      parts.push(`Precheck Complaint: ${precheck.chiefComplaint}`)
+      if (!chiefComplaint) {
+        setChiefComplaint(precheck.chiefComplaint)
+        setValidationErrors(v => ({ ...v, chiefComplaint: '' }))
+      }
+    }
+    if (precheck?.symptomDuration) {
+      parts.push(`Duration: ${precheck.symptomDuration}`)
+    }
+    if (precheck?.medications) {
+      parts.push(`Current Meds: ${precheck.medications}`)
+    }
+    if (precheck?.allergies) {
+      parts.push(`Allergies: ${precheck.allergies}`)
+    }
+    if (triageObservations) {
+      parts.push(`Triage Observations: ${triageObservations}`)
+    }
+
+    if (parts.length > 0) {
+      const summaryText = parts.map(p => `• ${p}`).join('\n')
+      setObservations(prev => prev ? `${prev}\n\n[Nurse Triage Intake]:\n${summaryText}` : `[Nurse Triage Intake]:\n${summaryText}`)
+      setTriageImported(true)
+    }
+  }, [precheck, triageObservations, chiefComplaint, setChiefComplaint, setObservations, setValidationErrors])
+
+  const hasTriageData = Boolean(
+    (precheck?.submitted && (precheck.chiefComplaint || precheck.symptomDuration || precheck.medications)) ||
+    triageObservations
+  )
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 animate-fadein">
@@ -74,12 +121,36 @@ export default function ClinicalSoapEditor({
           </div>
         )}
 
+        {/* 1-Click Triage / Precheck Import Banner */}
+        {hasTriageData && !triageImported && (
+          <div className="p-3 rounded-xl bg-teal-50 border border-teal-200 text-teal-900 flex items-center justify-between text-xs animate-fadein">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📋</span>
+              <div>
+                <span className="font-bold">Nurse Triage &amp; Precheck Notes Available:</span>{' '}
+                <span className="italic text-teal-800 line-clamp-1">
+                  {precheck?.chiefComplaint ? `"${precheck.chiefComplaint}"` : triageObservations || 'Vitals & symptom intake recorded'}
+                </span>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleImportTriage}
+              className="btn btn-xs bg-teal-700 hover:bg-teal-800 text-white font-semibold flex items-center gap-1 shrink-0 ml-2"
+            >
+              <span>📥 Import into Note</span>
+            </button>
+          </div>
+        )}
+
         {/* Chief Complaint */}
         <div className="card p-4 space-y-2.5">
           <div className="flex items-center justify-between">
-            <label className="form-label text-slate-800 font-bold text-xs" style={{ margin: 0 }}>
-              Chief Complaint &amp; Presenting Symptoms *
-            </label>
+            <div className="flex items-center gap-2">
+              <label className="form-label text-slate-800 font-bold text-xs" style={{ margin: 0 }}>
+                Chief Complaint &amp; Presenting Symptoms *
+              </label>
+            </div>
             {validationErrors.chiefComplaint && (
               <span className="text-[11px] font-semibold text-rose-600 animate-pulse-soft">
                 {validationErrors.chiefComplaint}
@@ -113,7 +184,9 @@ export default function ClinicalSoapEditor({
               }
             }}
             placeholder={currentSpecialtyConfig.placeholders.complaint}
-            className={`form-textarea text-xs ${validationErrors.chiefComplaint ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-200' : ''}`}
+            className={`form-textarea text-xs ${
+              validationErrors.chiefComplaint ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-200' : ''
+            }`}
             aria-invalid={!!validationErrors.chiefComplaint}
           />
         </div>
@@ -121,9 +194,11 @@ export default function ClinicalSoapEditor({
         {/* Observations & Physical Exam */}
         <div className="card p-4 space-y-2.5">
           <div className="flex items-center justify-between">
-            <label className="form-label text-slate-800 font-bold text-xs" style={{ margin: 0 }}>
-              Clinical Observations &amp; Physical Examination
-            </label>
+            <div className="flex items-center gap-2">
+              <label className="form-label text-slate-800 font-bold text-xs" style={{ margin: 0 }}>
+                Clinical Observations &amp; Physical Examination
+              </label>
+            </div>
             <span className="text-[11px] text-slate-500">Vitals, system findings &amp; clinical signs</span>
           </div>
 
@@ -154,9 +229,11 @@ export default function ClinicalSoapEditor({
         {/* Diagnosis */}
         <div className="card p-4 space-y-2.5">
           <div className="flex items-center justify-between">
-            <label className="form-label text-slate-800 font-bold text-xs" style={{ margin: 0 }}>
-              Provisional / Final Diagnosis (ICD-11 / SNOMED) *
-            </label>
+            <div className="flex items-center gap-2">
+              <label className="form-label text-slate-800 font-bold text-xs" style={{ margin: 0 }}>
+                Provisional / Final Diagnosis (ICD-11 / SNOMED) *
+              </label>
+            </div>
             {validationErrors.diagnosis && (
               <span className="text-[11px] font-semibold text-rose-600 animate-pulse-soft">
                 {validationErrors.diagnosis}
@@ -190,7 +267,9 @@ export default function ClinicalSoapEditor({
               }
             }}
             placeholder={currentSpecialtyConfig.placeholders.diagnosis}
-            className={`form-input text-xs ${validationErrors.diagnosis ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-200' : ''}`}
+            className={`form-input text-xs ${
+              validationErrors.diagnosis ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-200' : ''
+            }`}
             aria-invalid={!!validationErrors.diagnosis}
           />
         </div>

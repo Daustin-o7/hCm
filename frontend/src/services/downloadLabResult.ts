@@ -27,8 +27,11 @@ export async function downloadLabResult(orderId: string, resultId: string, versi
   const header = new Uint8Array(await blob.slice(0, 512).arrayBuffer())
   const signature = extension === '.png' ? [137, 80, 78, 71, 13, 10, 26, 10]
     : extension === '.jpg' || extension === '.jpeg' ? [255, 216, 255] : []
-  if (!signature.every((byte, index) => header[index] === byte) ||
-      extension === '.csv' && /^[\s\uFEFF]*[<{\[]/.test(new TextDecoder().decode(header))) {
+  const dicomValid = extension !== '.dcm' ||
+    (header.length >= 132 && String.fromCharCode(...header.slice(128, 132)) === 'DICM')
+  if (!dicomValid ||
+      extension !== '.dcm' && (!signature.every((byte, index) => header[index] === byte) ||
+        extension === '.csv' && /^[\s\uFEFF]*[<{\[]/.test(new TextDecoder().decode(header)))) {
     throw new Error('The server did not return a valid report. Please try again.')
   }
   assertSessionGeneration(generation)

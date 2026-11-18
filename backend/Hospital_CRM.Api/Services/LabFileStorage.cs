@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Text;
 using Microsoft.AspNetCore.DataProtection;
 
 namespace Hospital_CRM.Api.Services;
@@ -10,6 +11,8 @@ public sealed class LabFileStorage
     public const int MaxFileSizeBytes = 25 * 1024 * 1024;
     private const string Prefix = "private-lab:v1:";
     private static ReadOnlySpan<byte> Magic => "HCLAB01"u8;
+    private static ReadOnlySpan<byte> PngMagic => [137, 80, 78, 71, 13, 10, 26, 10];
+    private static ReadOnlySpan<byte> JpegMagic => [255, 216, 255];
     private readonly IDataProtectionProvider _protection;
     public string RootPath { get; }
 
@@ -40,6 +43,8 @@ public sealed class LabFileStorage
             await plaintext.WriteAsync(buffer.AsMemory(0, read), ct);
         }
         if (plaintext.Length == 0) throw new InvalidDataException("empty_lab_file");
+        // The extension is client-supplied; verify the bytes match it before encrypting.
+        ValidateSignature(extension, plaintext.GetBuffer().AsSpan(0, (int)plaintext.Length));
 
         var key = RandomNumberGenerator.GetBytes(32);
         var nonce = RandomNumberGenerator.GetBytes(12);
@@ -148,6 +153,27 @@ public sealed class LabFileStorage
             || legacyName.Contains("..", StringComparison.Ordinal) || !IsAllowedExtension(Path.GetExtension(legacyName)))
             throw new InvalidDataException("invalid_lab_file_key");
         return Path.Combine(RootPath, legacyName);
+    }
+
+    private static void ValidateSignature(string extension, ReadOnlySpan<byte> content)
+    {
+        var valid = extension switch
+        {
+            ".pdf" => content.StartsWith("%PDF-"u8),
+            ".png" => content.StartsWith(PngMagic),
+            ".jpg" or ".jpeg" => content.StartsWith(JpegMagic),
+            ".dcm" => content.Length >= 132 && content.Slice(128, 4).SequenceEqual("DICM"u8),
+            ".csv" => IsCsv(content),
+            _ => false
+        };
+        if (!valid) throw new InvalidDataException("invalid_lab_file");
+    }
+
+    private static bool IsCsv(ReadOnlySpan<byte> content)
+    {
+        var text = Encoding.UTF8.GetString(content[..Math.Min(content.Length, 512)])
+            .TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
+        return text.Length > 0 && text[0] is not ('<' or '{' or '[');
     }
 
     private static void ValidateOwner(Guid tenantId, Guid orderId, Guid resultId)

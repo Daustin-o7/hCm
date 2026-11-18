@@ -14,7 +14,18 @@ interface FinancialData {
   gstLiability: number
   netProfit: number
   netProfitMargin: number
+  expenseByCategory?: Array<{ category: string; total: number }>
   [key: string]: unknown
+}
+
+interface OutstandingData {
+  totalOutstanding: number
+  aging: {
+    current0To30Days: number
+    past31To60Days: number
+    past61To90Days: number
+    over90Days: number
+  }
 }
 
 interface PresumptiveData {
@@ -44,12 +55,15 @@ interface PlatformHealth {
 
 type ReportFormat = 'ITR-4 CSV' | 'GSTR-1 JSON'
 
-const MONTH_OPTIONS = Array.from({ length: 3 }, (_, i) => {
+const MONTH_OPTIONS = Array.from({ length: 12 }, (_, i) => {
   const d = new Date()
   d.setDate(1)
   d.setMonth(d.getMonth() - i)
   const value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-  const label = d.toLocaleString('en-IN', { month: 'long', year: 'numeric' })
+  // Indian financial year runs Apr–Mar; the quarter is what the accountant filters by.
+  const quarter = Math.floor(((d.getMonth() + 9) % 12) / 3) + 1
+  const fyYear = d.getMonth() >= 3 ? d.getFullYear() + 1 : d.getFullYear()
+  const label = `${d.toLocaleString('en-IN', { month: 'long', year: 'numeric' })} · Q${quarter} FY${fyYear}`
   return { value, label: i === 0 ? `${label} (Current)` : label }
 })
 
@@ -57,6 +71,7 @@ export default function Reports() {
   const [selectedMonth, setSelectedMonth] = useState(MONTH_OPTIONS[0].value)
   const [toast, setToast] = useState<string | null>(null)
   const [financialData, setFinancialData] = useState<FinancialData | null>(null)
+  const [outstandingData, setOutstandingData] = useState<OutstandingData | null>(null)
   const [presumptiveData, setPresumptiveData] = useState<PresumptiveData | null>(null)
   const [paymentDistribution, setPaymentDistribution] = useState<PaymentDistribution | null>(null)
   const [platformHealth, setPlatformHealth] = useState<PlatformHealth | null>(null)
@@ -71,12 +86,12 @@ export default function Reports() {
     if (!obj) return fallback
     const parts = path.split('.')
     let current: unknown = obj
-    
+
     for (const part of parts) {
       if (current === null || current === undefined) return fallback
       current = (current as Record<string, unknown>)[part]
     }
-    
+
     return (current !== undefined && current !== null ? current : fallback) as T
   }
 
@@ -127,15 +142,16 @@ export default function Reports() {
     try {
       setLoading(true)
       setError(null)
-      
+
       // Fetch all reports data concurrently with resilient fault tolerance
-      const [financialRes, presumptiveRes, paymentRes, healthRes] = await Promise.allSettled([
+      const [financialRes, presumptiveRes, paymentRes, healthRes, outstandingRes] = await Promise.allSettled([
         api.get<FinancialData>(`/reports/financial?month=${selectedMonth}`),
         api.get<PresumptiveData>(`/reports/tax/itr4?month=${selectedMonth}`),
         api.get<PaymentDistribution>(`/reports/payment-distribution?month=${selectedMonth}`),
-        api.get<PlatformHealth>(`/reports/platform-health?month=${selectedMonth}`)
+        api.get<PlatformHealth>(`/reports/platform-health?month=${selectedMonth}`),
+        api.get<OutstandingData>('/ledger/outstanding-dues'),
       ])
-      
+
       let anyFulfilled = false
 
       if (financialRes.status === 'fulfilled') {
@@ -152,6 +168,10 @@ export default function Reports() {
       }
       if (healthRes.status === 'fulfilled') {
         setPlatformHealth(healthRes.value.data)
+        anyFulfilled = true
+      }
+      if (outstandingRes.status === 'fulfilled') {
+        setOutstandingData(outstandingRes.value.data)
         anyFulfilled = true
       }
 
@@ -360,7 +380,7 @@ export default function Reports() {
               ₹{safeGet(financialData, 'gstLiability', 0).toLocaleString('en-IN')}
             </div>
             <p className="text-[11px] text-slate-400 mt-1">
-              CGST ₹{Math.round(safeGet(financialData, 'gstLiability', 0) / 2).toLocaleString('en-IN')} + 
+              CGST ₹{Math.round(safeGet(financialData, 'gstLiability', 0) / 2).toLocaleString('en-IN')} +
               SGST ₹{Math.round(safeGet(financialData, 'gstLiability', 0) / 2).toLocaleString('en-IN')}
             </p>
           </div>
@@ -381,6 +401,127 @@ export default function Reports() {
           </div>
         </div>
       )}
+
+      {/* Operating Expense Breakdown & Outstanding Dues Grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Expense Category Breakdown (6 cols) */}
+        {financialData?.expenseByCategory && financialData.expenseByCategory.length > 0 && (
+          <div className="lg:col-span-6 card p-5 space-y-4">
+            <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
+              <div>
+                <h2 className="text-sm font-bold tracking-tight font-heading text-[var(--color-text)]">
+                  Operating Expenses by Category
+                </h2>
+                <p className="text-[11px] text-[var(--color-text-muted)]">
+                  Categorized clinic overheads for {MONTH_OPTIONS.find(m => m.value === selectedMonth)?.label}
+                </p>
+              </div>
+              <span className="badge badge-brand">
+                Total ₹{safeGet(financialData, 'expenses', 0).toLocaleString('en-IN')}
+              </span>
+            </div>
+
+            <div className="space-y-3">
+              {financialData.expenseByCategory.map(item => {
+                const totalExp = Number(financialData.expenses) || 1
+                const pct = Math.round((item.total / totalExp) * 100)
+                const categoryLabels: Record<string, string> = {
+                  salaries: '👥 Salaries & Staff',
+                  rent: '🏢 Clinic Facility Rent',
+                  utilities: '⚡ Electricity & Water',
+                  consumables: '🧪 Medical Consumables',
+                  supplies: '📦 Clinical Supplies',
+                  equipment: '🩺 Medical Equipment',
+                  maintenance: '🔧 Repairs & Maintenance',
+                  marketing: '📣 Marketing & Outreach',
+                  software: '💻 IT & Software Subscriptions',
+                  miscellaneous: '📋 Miscellaneous Expenses'
+                }
+                const label = categoryLabels[item.category] || item.category.toUpperCase()
+
+                return (
+                  <div key={item.category} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-[var(--color-text)]">{label}</span>
+                      <span className="mono font-bold text-[var(--color-text)]">
+                        ₹{item.total.toLocaleString('en-IN')} <span className="text-[var(--color-text-muted)] font-normal">({pct}%)</span>
+                      </span>
+                    </div>
+                    <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--color-surface-raised)' }}>
+                      <div
+                        className="h-full bg-[var(--brand-primary)] rounded-full transition-all duration-300"
+                        style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+                      />
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Outstanding Patient Dues & Aging Analysis (6 cols) */}
+        {outstandingData && (
+          <div className="lg:col-span-6 card p-5 space-y-4">
+            <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
+              <div>
+                <h2 className="text-sm font-bold tracking-tight font-heading text-[var(--color-text)]">
+                  Accounts Receivable & Overdue Aging
+                </h2>
+                <p className="text-[11px] text-[var(--color-text-muted)]">
+                  Uncollected patient dues tracked across statutory aging brackets
+                </p>
+              </div>
+              <span className="badge badge-warning">
+                Total ₹{Number(outstandingData.totalOutstanding).toLocaleString('en-IN')}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="p-3 rounded-lg border space-y-1" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-raised)' }}>
+                <span className="text-[11px] font-semibold text-[var(--color-text-secondary)]">Current (0–30 Days)</span>
+                <div className="text-sm font-bold mono text-emerald-600">
+                  ₹{Number(outstandingData.aging?.current0To30Days || 0).toLocaleString('en-IN')}
+                </div>
+                <span className="text-[10px] text-[var(--color-text-muted)]">Normal credit cycle</span>
+              </div>
+
+              <div className="p-3 rounded-lg border space-y-1" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-raised)' }}>
+                <span className="text-[11px] font-semibold text-[var(--color-text-secondary)]">31–60 Days Overdue</span>
+                <div className="text-sm font-bold mono text-amber-600">
+                  ₹{Number(outstandingData.aging?.past31To60Days || 0).toLocaleString('en-IN')}
+                </div>
+                <span className="text-[10px] text-[var(--color-text-muted)]">Follow-up reminder</span>
+              </div>
+
+              <div className="p-3 rounded-lg border space-y-1" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-raised)' }}>
+                <span className="text-[11px] font-semibold text-[var(--color-text-secondary)]">61–90 Days Overdue</span>
+                <div className="text-sm font-bold mono text-orange-600">
+                  ₹{Number(outstandingData.aging?.past61To90Days || 0).toLocaleString('en-IN')}
+                </div>
+                <span className="text-[10px] text-[var(--color-text-muted)]">Priority settlement</span>
+              </div>
+
+              <div className="p-3 rounded-lg border space-y-1" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-raised)' }}>
+                <span className="text-[11px] font-semibold text-[var(--color-text-secondary)]">Over 90 Days</span>
+                <div className="text-sm font-bold mono text-rose-600">
+                  ₹{Number(outstandingData.aging?.over90Days || 0).toLocaleString('en-IN')}
+                </div>
+                <span className="text-[10px] text-[var(--color-text-muted)]">Critical recovery required</span>
+              </div>
+            </div>
+
+            <div className="pt-1 flex justify-end">
+              <a
+                href="/dashboard/billing?tab=outstanding"
+                className="btn btn-secondary btn-sm flex items-center gap-1.5 cursor-pointer"
+              >
+                <span>View Full AR Aging Worklist in Billing →</span>
+              </a>
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Section 44ADA & Payment Collections Grid */}
       {presumptiveData && paymentDistribution && (
@@ -466,13 +607,13 @@ export default function Reports() {
                     UPI (Razorpay Dynamic QR & Static Soundbox)
                   </span>
                   <span className="mono font-bold text-[var(--color-text)]">
-                    ₹{safeGet(paymentDistribution, 'upiAmount', 0).toLocaleString('en-IN')} 
+                    ₹{safeGet(paymentDistribution, 'upiAmount', 0).toLocaleString('en-IN')}
                     ({safeGet(paymentDistribution, 'upiPercentage', 0)}%)
                   </span>
                 </div>
                 <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'var(--color-surface-raised)' }}>
-                  <div 
-                    className="h-full bg-[var(--brand-primary)] rounded-full transition-all duration-300" 
+                  <div
+                    className="h-full bg-[var(--brand-primary)] rounded-full transition-all duration-300"
                     style={{ width: `${Math.min(100, Math.max(0, safeGet(paymentDistribution, 'upiPercentage', 0)))}%` }}
                   />
                 </div>
@@ -483,13 +624,13 @@ export default function Reports() {
                 <div className="flex items-center justify-between text-xs mb-1">
                   <span className="font-bold text-[var(--color-text)]">Card & NetBanking POS</span>
                   <span className="mono font-bold text-[var(--color-text)]">
-                    ₹{safeGet(paymentDistribution, 'cardAmount', 0).toLocaleString('en-IN')} 
+                    ₹{safeGet(paymentDistribution, 'cardAmount', 0).toLocaleString('en-IN')}
                     ({safeGet(paymentDistribution, 'cardPercentage', 0)}%)
                   </span>
                 </div>
                 <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'var(--color-surface-raised)' }}>
-                  <div 
-                    className="h-full bg-[var(--brand-primary)] rounded-full transition-all duration-300" 
+                  <div
+                    className="h-full bg-[var(--brand-primary)] rounded-full transition-all duration-300"
                     style={{ width: `${Math.min(100, Math.max(0, safeGet(paymentDistribution, 'cardPercentage', 0)))}%` }}
                   />
                 </div>
@@ -500,13 +641,13 @@ export default function Reports() {
                 <div className="flex items-center justify-between text-xs mb-1">
                   <span className="font-bold text-[var(--color-text)]">Counter Cash (Form 60 Tracked)</span>
                   <span className="mono font-bold text-[var(--color-text)]">
-                    ₹{safeGet(paymentDistribution, 'cashAmount', 0).toLocaleString('en-IN')} 
+                    ₹{safeGet(paymentDistribution, 'cashAmount', 0).toLocaleString('en-IN')}
                     ({safeGet(paymentDistribution, 'cashPercentage', 0)}%)
                   </span>
                 </div>
                 <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'var(--color-surface-raised)' }}>
-                  <div 
-                    className="h-full bg-amber-500 rounded-full transition-all duration-300" 
+                  <div
+                    className="h-full bg-amber-500 rounded-full transition-all duration-300"
                     style={{ width: `${Math.min(100, Math.max(0, safeGet(paymentDistribution, 'cashPercentage', 0)))}%` }}
                   />
                 </div>
@@ -534,9 +675,9 @@ export default function Reports() {
               </p>
             </div>
             <span className="badge badge-brand flex items-center gap-1.5">
-              <span 
-                className="w-2 h-2 rounded-full inline-block" 
-                style={{ 
+              <span
+                className="w-2 h-2 rounded-full inline-block"
+                style={{
                   backgroundColor: platformStatusColor
                 }}
               />

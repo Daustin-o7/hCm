@@ -34,6 +34,7 @@ Build what's in them; don't build what isn't. If a task seems to need something 
 - ~~`samstack-implementation-reference.md`~~ — never created; Phase 1 shipped without it. Razorpay HMAC pattern: `InvoicesController.cs`; JWT RS256: `IPersistentKeyService`/`PemFileKeyService`.
 - `.opencode/skills/new-fr/SKILL.md` — repeatable build sequence for every FR-XX (migration → endpoint → role check → audit hook → UI → test)
 - `docs/technical/TOOLING-SETUP.md` — ponytail install; `/ponytail-review` before marking any FR done
+- **`docs/technical/STATE-MACHINES.md`** — frontend state machines (`frontend/src/machines/`), the server transitions they must not mirror, and `npm run test:machines`
 - **`docs/technical/GO-LIVE-CHECKLIST.md`** — provisional dev switches that must be settled before production (currently: mandatory MFA gate)
 - **`.agents/skills/frontend-design/SKILL.md`** — ⚡ MUST READ before editing any `.tsx`, `.css`, or UI file. Synthesises taste-skill + Vercel guidelines + design-craft rules. Covers colour tokens, typography scale, interaction quality, anti-patterns checklist, and page-specific patterns for Hospital CRM.
 

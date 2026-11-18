@@ -9,6 +9,18 @@ interface PrescriptionsEditorProps {
   onChangePrescriptions: React.Dispatch<React.SetStateAction<PrescriptionDraft[]>>
 }
 
+const COMMON_FREQUENCIES = [
+  { label: '1-0-1', value: '1-0-1 (Twice daily)', title: 'Morning and Night' },
+  { label: '1-1-1', value: '1-1-1 (Thrice daily)', title: 'Morning, Afternoon, Night' },
+  { label: '0-0-1', value: '0-0-1 (Night only)', title: 'Once daily at bedtime' },
+  { label: '1-0-0', value: '1-0-0 (Morning only)', title: 'Once daily in morning' },
+  { label: 'SOS', value: 'SOS (As needed)', title: 'Take only when necessary' },
+]
+
+const COMMON_DURATIONS = ['3 Days', '5 Days', '7 Days', '15 Days', '30 Days']
+
+const COMMON_TIMINGS = ['After food', 'Before food', 'Empty stomach', 'With food', 'At bedtime']
+
 export default function PrescriptionsEditor({
   prescriptions,
   onChangePrescriptions
@@ -53,8 +65,10 @@ export default function PrescriptionsEditor({
         dosageForm: hit.dosageForm,
         strength: hit.strength,
         dosage: hit.strength ?? '',
+        // Never invent a schedule: the prescriber must set frequency, timing and duration.
         frequency: '',
         duration: '',
+        timing: '',
         scheduleClass: hit.scheduleClass,
         isUnverified: hit.isUnverified
       }
@@ -80,7 +94,7 @@ export default function PrescriptionsEditor({
               <span className="badge badge-brand">{prescriptions.length} items</span>
             )}
           </div>
-          <p className="text-xs text-slate-500">Live search against drug formulary by brand, generic, or therapeutic class.</p>
+          <p className="text-xs text-slate-500">Live search against drug formulary by brand, generic, or therapeutic class with standard Indian dosage chips.</p>
         </div>
       </div>
 
@@ -152,12 +166,12 @@ export default function PrescriptionsEditor({
         <EmptyState
           illustration={
             <svg width="60" height="60" viewBox="0 0 70 70" fill="none" aria-hidden="true">
-              <rect x="16" y="14" width="38" height="46" rx="4" stroke="currentColor" strokeWidth="1.5" fill="none" opacity="0.35"/>
-              <path d="M26 26 L44 26" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.5"/>
-              <path d="M26 34 L40 34" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.5"/>
-              <circle cx="54" cy="18" r="7" stroke="currentColor" strokeWidth="1.5" fill="none" opacity="0.4"/>
-              <path d="M54 14 L54 22" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.6"/>
-              <path d="M50 18 L58 18" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.6"/>
+              <rect x="16" y="14" width="38" height="46" rx="4" stroke="currentColor" strokeWidth="1.5" fill="none" opacity="0.35" />
+              <path d="M26 26 L44 26" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.5" />
+              <path d="M26 34 L40 34" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.5" />
+              <circle cx="54" cy="18" r="7" stroke="currentColor" strokeWidth="1.5" fill="none" opacity="0.4" />
+              <path d="M54 14 L54 22" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.6" />
+              <path d="M50 18 L58 18" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.6" />
             </svg>
           }
           title="No medicines prescribed yet"
@@ -168,18 +182,27 @@ export default function PrescriptionsEditor({
           <table className="data-table">
             <thead>
               <tr>
-                <th>Medicine / Drug</th>
-                <th>Strength / dose</th>
-                <th>Frequency</th>
-                <th>Duration</th>
-                <th>Quantity</th>
+                <th style={{ width: '25%' }}>Medicine / Drug</th>
+                <th style={{ width: '15%' }}>Strength</th>
+                <th style={{ width: '22%' }}>Frequency &amp; Pattern</th>
+                <th style={{ width: '15%' }}>Timing</th>
+                <th style={{ width: '15%' }}>Duration</th>
+                <th style={{ width: '8%' }}>Qty</th>
                 <th className="text-right">Action</th>
               </tr>
             </thead>
             <tbody>
               {prescriptions.map((rx, idx) => (
-                <tr key={idx}>
-                  <td className="font-bold text-slate-800 text-xs">{rx.medicine}</td>
+                <tr key={idx} className="align-top">
+                  <td>
+                    <div className="font-bold text-slate-800 text-xs">{rx.medicine}</div>
+                    {rx.genericName && rx.genericName !== rx.medicine && (
+                      <div className="text-[10px] text-slate-500 italic">{rx.genericName}</div>
+                    )}
+                    {rx.scheduleClass && (
+                      <span className="badge badge-subtle text-[9px] mt-0.5">{rx.scheduleClass}</span>
+                    )}
+                  </td>
                   <td>
                     <input
                       type="text"
@@ -200,9 +223,45 @@ export default function PrescriptionsEditor({
                         const val = e.target.value
                         onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, frequency: val } : p))
                       }}
-                      className="form-input text-xs py-1"
+                      className="form-input text-xs py-1 mb-1"
+                      placeholder="e.g. 1-0-1"
                       aria-label={`Frequency for ${rx.medicine}`}
                     />
+                    {/* Quick Frequency Chips */}
+                    <div className="flex flex-wrap gap-1">
+                      {COMMON_FREQUENCIES.map((f) => (
+                        <button
+                          key={f.label}
+                          type="button"
+                          onClick={() => {
+                            onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, frequency: f.value } : p))
+                          }}
+                          className={`text-[9.5px] px-1.5 py-0.5 rounded border transition-colors ${rx.frequency?.startsWith(f.label)
+                              ? 'bg-teal-600 text-white border-teal-600 font-bold'
+                              : 'bg-slate-50 hover:bg-teal-50 text-slate-600 border-slate-200'
+                            }`}
+                          title={f.title}
+                        >
+                          {f.label}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                  <td>
+                    <select
+                      value={rx.timing || ''}
+                      onChange={(e) => {
+                        const val = e.target.value
+                        onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, timing: val } : p))
+                      }}
+                      className="form-select text-xs py-1"
+                      aria-label={`Timing for ${rx.medicine}`}
+                    >
+                      <option value="">Not set</option>
+                      {COMMON_TIMINGS.map(t => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
                   </td>
                   <td>
                     <input
@@ -212,9 +271,28 @@ export default function PrescriptionsEditor({
                         const val = e.target.value
                         onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, duration: val, durationCount: undefined, durationUnit: undefined } : p))
                       }}
-                      className="form-input text-xs py-1"
+                      className="form-input text-xs py-1 mb-1"
+                      placeholder="e.g. 5 Days"
                       aria-label={`Duration for ${rx.medicine}`}
                     />
+                    {/* Quick Duration Chips */}
+                    <div className="flex flex-wrap gap-1">
+                      {COMMON_DURATIONS.map((dur) => (
+                        <button
+                          key={dur}
+                          type="button"
+                          onClick={() => {
+                            onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, duration: dur, durationCount: undefined, durationUnit: undefined } : p))
+                          }}
+                          className={`text-[9.5px] px-1.5 py-0.5 rounded border transition-colors ${rx.duration === dur
+                              ? 'bg-teal-600 text-white border-teal-600 font-bold'
+                              : 'bg-slate-50 hover:bg-teal-50 text-slate-600 border-slate-200'
+                            }`}
+                        >
+                          {dur.replace(' Days', 'd')}
+                        </button>
+                      ))}
+                    </div>
                   </td>
                   <td>
                     <input
@@ -224,6 +302,7 @@ export default function PrescriptionsEditor({
                       value={rx.totalQuantity ?? ''}
                       onChange={e => onChangePrescriptions(prev => prev.map((p, i) => i === idx ? { ...p, totalQuantity: e.target.value === '' ? undefined : Number(e.target.value) } : p))}
                       className="form-input text-xs py-1"
+                      placeholder="Qty"
                       aria-label={`Quantity for ${rx.medicine}`}
                     />
                   </td>

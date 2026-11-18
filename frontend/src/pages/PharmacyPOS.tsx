@@ -192,10 +192,53 @@ export default function PharmacyPOS() {
   const [downloading, setDownloading] = useState(false)
   const [documentError, setDocumentError] = useState('')
 
+  // Counter stats ribbon
+  const [posStats, setPosStats] = useState<{
+    totalDrugs: number
+    todaySales: number
+    todayInvoicesCount: number
+    expiringSoonBatches: number
+    expiredBatches: number
+    recalledBatches: number
+    lowStockCount: number
+    scheduleH1Today: number
+  } | null>(null)
+
+  // Patient Autocomplete
+  const [patientSearchHits, setPatientSearchHits] = useState<{ id: string; name: string; phone: string }[]>([])
+  const [showPatientHits, setShowPatientHits] = useState(false)
+  const patientSearchTimer = useRef<number | null>(null)
+
+  const handleCustomerNameChange = (val: string) => {
+    setCustomerName(val)
+    if (patientSearchTimer.current) window.clearTimeout(patientSearchTimer.current)
+    if (val.trim().length >= 2) {
+      patientSearchTimer.current = window.setTimeout(async () => {
+        try {
+          const res = await api.get(`/patients/search?q=${encodeURIComponent(val.trim())}`)
+          if (Array.isArray(res.data)) {
+            setPatientSearchHits(res.data)
+            setShowPatientHits(res.data.length > 0)
+          }
+        } catch {
+          setShowPatientHits(false)
+        }
+      }, 250)
+    } else {
+      setShowPatientHits(false)
+    }
+  }
+
   // Modals & State
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [completedInvoice, setCompletedInvoice] = useState<CompletedInvoice | null>(null)
+
+  useEffect(() => {
+    api.get('/pharmacy/stats')
+      .then(res => setPosStats(res.data))
+      .catch(() => { })
+  }, [completedInvoice])
   const [activeSubstituteDrug, setActiveSubstituteDrug] = useState<DrugItem | null>(null)
   const [substitutesList, setSubstitutesList] = useState<any[]>([])
   const [loadingSubstitutes, setLoadingSubstitutes] = useState(false)
@@ -644,12 +687,43 @@ export default function PharmacyPOS() {
         </div>
       </div>
 
+      {/* ── Today's Pharmacy Operations Telemetry Ribbon ── */}
+      {posStats && (
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="card p-3 space-y-0.5">
+            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Today's Revenue</span>
+            <div className="text-base font-bold mono text-[var(--color-text)]">₹{Number(posStats.todaySales).toFixed(2)}</div>
+            <span className="text-[10px] text-[var(--color-text-muted)]">{posStats.todayInvoicesCount} invoices paid</span>
+          </div>
+          <div className="card p-3 space-y-0.5">
+            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Schedule H1 Today</span>
+            <div className="text-base font-bold mono text-amber-600">{posStats.scheduleH1Today}</div>
+            <span className="text-[10px] text-[var(--color-text-muted)]">Rule 65(9) logged</span>
+          </div>
+          <div className="card p-3 space-y-0.5">
+            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Catalogued Drugs</span>
+            <div className="text-base font-bold mono text-[var(--brand-primary)]">{posStats.totalDrugs}</div>
+            <span className="text-[10px] text-[var(--color-text-muted)]">Active formulations</span>
+          </div>
+          <div className="card p-3 space-y-0.5">
+            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Expiring Soon (60d)</span>
+            <div className="text-base font-bold mono text-rose-600">{posStats.expiringSoonBatches}</div>
+            <span className="text-[10px] text-[var(--color-text-muted)]">FEFO prioritized</span>
+          </div>
+          <div className="card p-3 space-y-0.5">
+            <span className="text-[11px] text-[var(--color-text-muted)] font-medium">Low Stock Alerts</span>
+            <div className="text-base font-bold mono text-rose-500">{posStats.lowStockCount}</div>
+            <span className="text-[10px] text-[var(--color-text-muted)]">&lt; 20 units remaining</span>
+          </div>
+        </div>
+      )}
+
       {error && <Alert variant="error" onDismiss={() => setError('')}>{error}</Alert>}
       {saleFrozen && <p role="status" className="alert alert-warning">This sale’s outcome is unresolved. Keep this page open and retry the unchanged sale before starting another transaction.</p>}
 
       {/* ── Main Layout: POS Cart on Right, Drug Search on Left ── */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        
+
         {/* Left Column: Drug Search & Catalog Selector (7 Cols) */}
         <div className="lg:col-span-7 space-y-4">
           <fieldset disabled={saleFrozen} className="card p-4 space-y-3 min-w-0">
@@ -830,212 +904,241 @@ export default function PharmacyPOS() {
         <div className="lg:col-span-5 space-y-4">
           <div className="card p-5 space-y-4">
             <fieldset disabled={saleFrozen} className="space-y-4 min-w-0">
-            <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
-              <h2 className="text-sm font-bold flex items-center gap-2 tracking-tight text-[var(--color-text)]">
-                <span>Current Order Cart</span>
-                <span className="badge badge-brand">
-                  {cart.length} items
-                </span>
-              </h2>
-              {hasScheduleH1 && (
-                <span className="badge badge-warning">
-                  <span>⚠️ Schedule H1 Contained</span>
-                </span>
-              )}
-            </div>
-
-            {/* Cart Items List */}
-            {cart.length === 0 ? (
-              <div className="empty-state">
-                <div className="w-10 h-10 rounded-full flex items-center justify-center mx-auto bg-teal-50 dark:bg-teal-950/60 text-teal-600 dark:text-teal-400 border border-teal-200 dark:border-teal-800">
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
-                  </svg>
-                </div>
-                <p className="empty-state-title">Cart is empty</p>
-                <p className="empty-state-description">Scan barcode or select medicines from the catalog</p>
+              <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
+                <h2 className="text-sm font-bold flex items-center gap-2 tracking-tight text-[var(--color-text)]">
+                  <span>Current Order Cart</span>
+                  <span className="badge badge-brand">
+                    {cart.length} items
+                  </span>
+                </h2>
+                {hasScheduleH1 && (
+                  <span className="badge badge-warning">
+                    <span>⚠️ Schedule H1 Contained</span>
+                  </span>
+                )}
               </div>
-            ) : (
-              <div className="divide-y max-h-60 overflow-y-auto pr-1 custom-scrollbar" style={{ borderColor: 'var(--color-border-subtle)' }}>
-                {cart.map((item, idx) => (
-                  <div key={item.batchId} className="py-2.5 flex items-center justify-between gap-3 text-xs">
-                    <div className="min-w-0 flex-1">
-                      <p className="font-bold truncate text-[var(--color-text)]">{item.drugName}</p>
-                      <p className="text-[11px] font-medium text-[var(--color-text-muted)]">
-                        Batch: <span className="mono font-semibold text-[var(--color-text)]">{item.batchNumber}</span> · Exp: {item.expiryDate} · GST {item.gstRate}%
-                      </p>
-                      <p className="text-xs font-semibold mt-0.5 mono text-[var(--color-text-secondary)]">
-                        ₹{item.unitPrice.toFixed(2)} × {item.quantity} = <strong className="font-bold mono text-[var(--color-text)]">₹{(item.unitPrice * item.quantity).toFixed(2)}</strong>
-                      </p>
-                    </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      <div className="flex items-center border rounded-lg overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
-                        <button
-                          onClick={() => updateQuantity(idx, item.quantity - 1)}
-                          aria-label={`Decrease quantity for ${item.drugName}`}
-                          className="btn btn-ghost btn-sm"
-                        >
-                          -
-                        </button>
-                        <span className="px-2 py-1 font-bold text-xs min-w-[24px] text-center mono text-[var(--color-text)]">
-                          {item.quantity}
-                        </span>
-                        <button
-                          onClick={() => updateQuantity(idx, item.quantity + 1)}
-                          aria-label={`Increase quantity for ${item.drugName}`}
-                          className="btn btn-ghost btn-sm"
-                        >
-                          +
-                        </button>
+              {/* Cart Items List */}
+              {cart.length === 0 ? (
+                <div className="empty-state">
+                  <div className="w-10 h-10 rounded-full flex items-center justify-center mx-auto bg-teal-50 dark:bg-teal-950/60 text-teal-600 dark:text-teal-400 border border-teal-200 dark:border-teal-800">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                    </svg>
+                  </div>
+                  <p className="empty-state-title">Cart is empty</p>
+                  <p className="empty-state-description">Scan barcode or select medicines from the catalog</p>
+                </div>
+              ) : (
+                <div className="divide-y max-h-60 overflow-y-auto pr-1 custom-scrollbar" style={{ borderColor: 'var(--color-border-subtle)' }}>
+                  {cart.map((item, idx) => (
+                    <div key={item.batchId} className="py-2.5 flex items-center justify-between gap-3 text-xs">
+                      <div className="min-w-0 flex-1">
+                        <p className="font-bold truncate text-[var(--color-text)]">{item.drugName}</p>
+                        <p className="text-[11px] font-medium text-[var(--color-text-muted)]">
+                          Batch: <span className="mono font-semibold text-[var(--color-text)]">{item.batchNumber}</span> · Exp: {item.expiryDate} · GST {item.gstRate}%
+                        </p>
+                        <p className="text-xs font-semibold mt-0.5 mono text-[var(--color-text-secondary)]">
+                          ₹{item.unitPrice.toFixed(2)} × {item.quantity} = <strong className="font-bold mono text-[var(--color-text)]">₹{(item.unitPrice * item.quantity).toFixed(2)}</strong>
+                        </p>
                       </div>
 
-                      <button
-                        onClick={() => removeFromCart(idx)}
-                        className="btn btn-ghost btn-sm text-[var(--color-danger)]"
-                        title="Remove item"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex items-center border rounded-lg overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
+                          <button
+                            onClick={() => updateQuantity(idx, item.quantity - 1)}
+                            aria-label={`Decrease quantity for ${item.drugName}`}
+                            className="btn btn-ghost btn-sm"
+                          >
+                            -
+                          </button>
+                          <span className="px-2 py-1 font-bold text-xs min-w-[24px] text-center mono text-[var(--color-text)]">
+                            {item.quantity}
+                          </span>
+                          <button
+                            onClick={() => updateQuantity(idx, item.quantity + 1)}
+                            aria-label={`Increase quantity for ${item.drugName}`}
+                            className="btn btn-ghost btn-sm"
+                          >
+                            +
+                          </button>
+                        </div>
+
+                        <button
+                          onClick={() => removeFromCart(idx)}
+                          className="btn btn-ghost btn-sm text-[var(--color-danger)]"
+                          title="Remove item"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          </svg>
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Customer Details */}
-            <div className="border-t pt-3 space-y-2.5" style={{ borderColor: 'var(--color-border)' }}>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label htmlFor="sale-customer" className="form-label">Patient / Customer</label>
-                  <input
-                    id="sale-customer"
-                    type="text"
-                    value={customerName}
-                    onChange={e => setCustomerName(e.target.value)}
-                    placeholder="e.g. Ramesh Kumar"
-                    className="form-input"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="sale-phone" className="form-label">Mobile Number</label>
-                  <input
-                    id="sale-phone"
-                    type="tel"
-                    value={customerPhone}
-                    onChange={e => setCustomerPhone(e.target.value)}
-                    placeholder="+91 98765 43210"
-                    className="form-input"
-                  />
-                </div>
-              </div>
-
-              {/* Schedule H1 Prescriber Mandatory Form (shows when cart contains H1) */}
-              {hasScheduleH1 && (
-                <div className="alert alert-warning flex-col p-3 space-y-2">
-                  <div className="flex items-center gap-1.5 font-bold text-xs">
-                    <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
-                      <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
-                    </svg>
-                    <span>Schedule H1 / NDPS Statutory Compliance</span>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label htmlFor="sale-prescriber" className="form-label">Prescribing Doctor *</label>
-                      <input
-                        id="sale-prescriber"
-                        type="text"
-                        value={prescriberName}
-                        onChange={e => setPrescriberName(e.target.value)}
-                        placeholder="Dr. S. Sharma"
-                        className="form-input"
-                      />
-                    </div>
-                    <div>
-                      <label htmlFor="sale-registration" className="form-label">Doctor Reg # *</label>
-                      <input
-                        id="sale-registration"
-                        type="text"
-                        value={prescriberRegNo}
-                        onChange={e => setPrescriberRegNo(e.target.value)}
-                        placeholder="MCI-12345/2018"
-                        className="form-input"
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Payment & Summary */}
-            <div className="border-t pt-3 space-y-2" style={{ borderColor: 'var(--color-border)' }}>
-              <div className="flex justify-between text-xs font-medium text-[var(--color-text-secondary)]">
-                <span>Subtotal (Net):</span>
-                <span className="mono font-semibold text-[var(--color-text)]">₹{subtotal.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between text-xs font-medium text-[var(--color-text-secondary)]">
-                <span>GST Tax Collected:</span>
-                <span className="mono font-semibold text-[var(--color-text)]">₹{totalGst.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between items-baseline border-t pt-2" style={{ borderColor: 'var(--color-border)' }}>
-                <span className="stat-label">Grand Total:</span>
-                <span className="stat-value mono text-[var(--brand-primary)]">₹{grandTotal.toFixed(2)}</span>
-              </div>
-
-              {/* Payment Method Selector */}
-              <div className="pt-2">
-                <p className="form-label">Payment method</p>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" role="group" aria-label="Payment method">
-                  {(['Cash', 'UPI', 'Card', 'NetBanking'] as const).map(method => (
-                    <button
-                      key={method}
-                      type="button"
-                      onClick={() => { setPaymentMethod(method); setPaymentReference('') }}
-                      aria-pressed={paymentMethod === method}
-                      className={`btn btn-sm cursor-pointer ${paymentMethod === method ? 'btn-primary' : 'btn-secondary'}`}
-                    >
-                      {method}
-                    </button>
                   ))}
                 </div>
-              </div>
+              )}
 
-              {paymentMethod === 'Cash' && (
-                <div className="grid grid-cols-2 gap-2 pt-1">
-                  <div>
-                    <label htmlFor="sale-tender" className="form-label">Cash tendered</label>
+              {/* Customer Details */}
+              <div className="border-t pt-3 space-y-2.5" style={{ borderColor: 'var(--color-border)' }}>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="relative">
+                    <label htmlFor="sale-customer" className="form-label">Patient / Customer</label>
                     <input
-                      id="sale-tender"
-                      type="number"
-                      min={grandTotal}
-                      step="0.01"
-                      value={tenderedAmount}
-                      onChange={e => setTenderedAmount(e.target.value ? parseFloat(e.target.value) : '')}
-                      placeholder={grandTotal.toFixed(2)}
-                      className="form-input mono"
+                      id="sale-customer"
+                      type="text"
+                      value={customerName}
+                      onChange={e => handleCustomerNameChange(e.target.value)}
+                      onFocus={() => { if (patientSearchHits.length > 0) setShowPatientHits(true) }}
+                      placeholder="e.g. Ramesh Kumar"
+                      className="form-input"
+                      autoComplete="off"
+                    />
+                    {showPatientHits && patientSearchHits.length > 0 && (
+                      <div className="absolute left-0 right-0 top-full mt-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-md shadow-lg z-50 max-h-48 overflow-y-auto divide-y divide-[var(--color-border-subtle)]">
+                        {patientSearchHits.map(p => (
+                          <button
+                            key={p.id}
+                            type="button"
+                            className="w-full text-left p-2 hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+                            onClick={() => {
+                              setCustomerName(p.name)
+                              if (p.phone) setCustomerPhone(p.phone)
+                              setShowPatientHits(false)
+                            }}
+                          >
+                            <div className="font-semibold text-xs text-[var(--color-text)]">{p.name}</div>
+                            <div className="text-[10px] text-[var(--color-text-muted)] font-mono">{p.phone || 'No phone'}</div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <label htmlFor="sale-phone" className="form-label">Mobile Number</label>
+                    <input
+                      id="sale-phone"
+                      type="tel"
+                      value={customerPhone}
+                      onChange={e => setCustomerPhone(e.target.value)}
+                      placeholder="+91 98765 43210"
+                      className="form-input"
                     />
                   </div>
-                  <div>
-                    <p className="form-label">Change return</p>
-                    <div className="form-input mono mt-1 font-semibold text-[var(--color-success-text)]">
-                      ₹{typeof tenderedAmount === 'number' && tenderedAmount > grandTotal
-                        ? (tenderedAmount - grandTotal).toFixed(2)
-                        : '0.00'}
+                </div>
+
+                {/* Schedule H1 Prescriber Mandatory Form (shows when cart contains H1) */}
+                {hasScheduleH1 && (
+                  <div className="alert alert-warning flex-col p-3 space-y-2">
+                    <div className="flex items-center gap-1.5 font-bold text-xs">
+                      <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                      </svg>
+                      <span>Schedule H1 / NDPS Statutory Compliance</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label htmlFor="sale-prescriber" className="form-label">Prescribing Doctor *</label>
+                        <input
+                          id="sale-prescriber"
+                          type="text"
+                          value={prescriberName}
+                          onChange={e => setPrescriberName(e.target.value)}
+                          placeholder="Dr. S. Sharma"
+                          className="form-input"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="sale-registration" className="form-label">Doctor Reg # *</label>
+                        <input
+                          id="sale-registration"
+                          type="text"
+                          value={prescriberRegNo}
+                          onChange={e => setPrescriberRegNo(e.target.value)}
+                          placeholder="MCI-12345/2018"
+                          className="form-input"
+                        />
+                      </div>
                     </div>
                   </div>
+                )}
+              </div>
+
+              {/* Payment & Summary */}
+              <div className="border-t pt-3 space-y-1.5" style={{ borderColor: 'var(--color-border)' }}>
+                <div className="flex justify-between text-xs font-medium text-[var(--color-text-secondary)]">
+                  <span>Subtotal (Net):</span>
+                  <span className="mono font-semibold text-[var(--color-text)]">₹{subtotal.toFixed(2)}</span>
                 </div>
-              )}
-              {paymentMethod !== 'Cash' && (
-                <div>
-                  <label htmlFor="sale-reference" className="form-label">Bank / card receipt reference</label>
-                  <input id="sale-reference" className="form-input" value={paymentReference} maxLength={256}
-                    onChange={e => setPaymentReference(e.target.value)} autoComplete="off" />
-                  <p className="text-xs text-[var(--color-text-muted)]">Record the reference from the clinic’s confirmed receipt.</p>
+                <div className="flex justify-between text-[11px] text-[var(--color-text-muted)]">
+                  <span>CGST (50%):</span>
+                  <span className="mono">₹{(totalGst / 2).toFixed(2)}</span>
                 </div>
-              )}
-            </div>
+                <div className="flex justify-between text-[11px] text-[var(--color-text-muted)]">
+                  <span>SGST (50%):</span>
+                  <span className="mono">₹{(totalGst / 2).toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between text-xs font-medium text-[var(--color-text-secondary)]">
+                  <span>Total GST Collected:</span>
+                  <span className="mono font-semibold text-[var(--color-text)]">₹{totalGst.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between items-baseline border-t pt-2" style={{ borderColor: 'var(--color-border)' }}>
+                  <span className="stat-label">Grand Total:</span>
+                  <span className="stat-value mono text-[var(--brand-primary)]">₹{grandTotal.toFixed(2)}</span>
+                </div>
+
+                {/* Payment Method Selector */}
+                <div className="pt-2">
+                  <p className="form-label">Payment method</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" role="group" aria-label="Payment method">
+                    {(['Cash', 'UPI', 'Card', 'NetBanking'] as const).map(method => (
+                      <button
+                        key={method}
+                        type="button"
+                        onClick={() => { setPaymentMethod(method); setPaymentReference('') }}
+                        aria-pressed={paymentMethod === method}
+                        className={`btn btn-sm cursor-pointer ${paymentMethod === method ? 'btn-primary' : 'btn-secondary'}`}
+                      >
+                        {method}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {paymentMethod === 'Cash' && (
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <div>
+                      <label htmlFor="sale-tender" className="form-label">Cash tendered</label>
+                      <input
+                        id="sale-tender"
+                        type="number"
+                        min={grandTotal}
+                        step="0.01"
+                        value={tenderedAmount}
+                        onChange={e => setTenderedAmount(e.target.value ? parseFloat(e.target.value) : '')}
+                        placeholder={grandTotal.toFixed(2)}
+                        className="form-input mono"
+                      />
+                    </div>
+                    <div>
+                      <p className="form-label">Change return</p>
+                      <div className="form-input mono mt-1 font-semibold text-[var(--color-success-text)]">
+                        ₹{typeof tenderedAmount === 'number' && tenderedAmount > grandTotal
+                          ? (tenderedAmount - grandTotal).toFixed(2)
+                          : '0.00'}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {paymentMethod !== 'Cash' && (
+                  <div>
+                    <label htmlFor="sale-reference" className="form-label">Bank / card receipt reference</label>
+                    <input id="sale-reference" className="form-input" value={paymentReference} maxLength={256}
+                      onChange={e => setPaymentReference(e.target.value)} autoComplete="off" />
+                    <p className="text-xs text-[var(--color-text-muted)]">Record the reference from the clinic’s confirmed receipt.</p>
+                  </div>
+                )}
+              </div>
             </fieldset>
 
             {/* Checkout Action Button */}
@@ -1061,48 +1164,48 @@ export default function PharmacyPOS() {
       {activeSubstituteDrug && (
         <Modal open onClose={closeSubstitutes} title="Generic Molecule Substitutes"
           description={`Showing alternative brands for ${activeSubstituteDrug.name} (${activeSubstituteDrug.genericName})`} size="md">
-            {loadingSubstitutes ? (
-              <div role="status" className="py-8 text-center text-sm text-[var(--color-text-muted)]">
-                <span className="spinner spinner-md" /> Searching generic salt equivalents…
-              </div>
-            ) : substitutesError ? (
-              <div className="space-y-3">
-                <Alert variant="error">{substitutesError}</Alert>
-                <button type="button" disabled={saleFrozen} className="btn btn-secondary"
-                  onClick={() => setSubstituteAttempt(attempt => attempt + 1)}>
-                  Retry substitutes
-                </button>
-              </div>
-            ) : substitutesList.length === 0 ? (
-              <div className="empty-state">
-                <p className="empty-state-description">
-                  No matching generic salt alternatives currently found in catalog.
-                </p>
-              </div>
-            ) : (
-              <div className="divide-y max-h-80 overflow-y-auto" style={{ borderColor: 'var(--color-border-subtle)' }}>
-                {substitutesList.map(sub => (
-                  <div key={sub.id} className="py-3 flex items-center justify-between gap-3">
-                    <div>
-                      <p className="font-semibold text-sm text-[var(--color-text)]">{sub.name}</p>
-                      <p className="text-xs text-[var(--color-text-muted)]">{sub.dosageForm} {sub.strength} • MRP: ₹{sub.indicativeMrp.toFixed(2)}</p>
-                      <span className="badge badge-success">{sub.totalStock} units available</span>
-                    </div>
-
-                    <button
-                      disabled={saleFrozen || !sub.inStock}
-                      onClick={() => {
-                        addToCart(sub)
-                        closeSubstitutes()
-                      }}
-                      className="btn btn-primary btn-sm"
-                    >
-                      {sub.inStock ? '+ Select Brand' : 'Out of Stock'}
-                    </button>
+          {loadingSubstitutes ? (
+            <div role="status" className="py-8 text-center text-sm text-[var(--color-text-muted)]">
+              <span className="spinner spinner-md" /> Searching generic salt equivalents…
+            </div>
+          ) : substitutesError ? (
+            <div className="space-y-3">
+              <Alert variant="error">{substitutesError}</Alert>
+              <button type="button" disabled={saleFrozen} className="btn btn-secondary"
+                onClick={() => setSubstituteAttempt(attempt => attempt + 1)}>
+                Retry substitutes
+              </button>
+            </div>
+          ) : substitutesList.length === 0 ? (
+            <div className="empty-state">
+              <p className="empty-state-description">
+                No matching generic salt alternatives currently found in catalog.
+              </p>
+            </div>
+          ) : (
+            <div className="divide-y max-h-80 overflow-y-auto" style={{ borderColor: 'var(--color-border-subtle)' }}>
+              {substitutesList.map(sub => (
+                <div key={sub.id} className="py-3 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="font-semibold text-sm text-[var(--color-text)]">{sub.name}</p>
+                    <p className="text-xs text-[var(--color-text-muted)]">{sub.dosageForm} {sub.strength} • MRP: ₹{sub.indicativeMrp.toFixed(2)}</p>
+                    <span className="badge badge-success">{sub.totalStock} units available</span>
                   </div>
-                ))}
-              </div>
-            )}
+
+                  <button
+                    disabled={saleFrozen || !sub.inStock}
+                    onClick={() => {
+                      addToCart(sub)
+                      closeSubstitutes()
+                    }}
+                    className="btn btn-primary btn-sm"
+                  >
+                    {sub.inStock ? '+ Select Brand' : 'Out of Stock'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </Modal>
       )}
 
@@ -1144,11 +1247,19 @@ export default function PharmacyPOS() {
 
               <div className="space-y-0.5 pt-1 text-[11px]">
                 <div className="flex justify-between">
-                  <span>Subtotal:</span>
+                  <span>Subtotal (Net):</span>
                   <span>₹{completedInvoice.subtotal.toFixed(2)}</span>
                 </div>
+                <div className="flex justify-between text-[10px] text-[var(--color-text-muted)]">
+                  <span>CGST (50%):</span>
+                  <span>₹{(completedInvoice.gstAmount / 2).toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between text-[10px] text-[var(--color-text-muted)]">
+                  <span>SGST (50%):</span>
+                  <span>₹{(completedInvoice.gstAmount / 2).toFixed(2)}</span>
+                </div>
                 <div className="flex justify-between">
-                  <span>GST Amount:</span>
+                  <span>Total GST:</span>
                   <span>₹{completedInvoice.gstAmount.toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between font-bold text-sm border-t pt-1" style={{ borderColor: 'var(--color-border)' }}>

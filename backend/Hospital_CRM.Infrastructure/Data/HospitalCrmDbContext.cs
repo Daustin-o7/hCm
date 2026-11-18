@@ -699,6 +699,8 @@ public class HospitalCrmDbContext : DbContext
             e.HasIndex(x => x.ConsultationId);
             e.Property(x => x.TestName).HasMaxLength(200).IsRequired();
             e.Property(x => x.Notes).HasMaxLength(1000);
+            e.Property(x => x.SpecimenType).HasMaxLength(100);
+            e.Property(x => x.SampleBarcode).HasMaxLength(50);
             e.HasOne(x => x.Consultation).WithMany().HasForeignKey(x => x.ConsultationId);
             e.HasOne(x => x.Patient).WithMany().HasForeignKey(x => x.PatientId);
             e.HasOne(x => x.Doctor).WithMany().HasForeignKey(x => x.DoctorId);

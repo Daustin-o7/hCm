@@ -30,6 +30,7 @@ interface Appointment {
   patientPhone?: string
   doctorId?: string
   doctorName: string
+  doctorSpecialty?: string
   time: string
   status: string
   queueToken: number | null
@@ -50,7 +51,7 @@ interface Patient {
 }
 
 // ── Specialty Definitions ─────────────────────────────────────────────────────
-import { CLINICAL_SPECIALTIES, getDoctorSpecialty, type SpecialtyMeta } from '../constants/clinicalSpecialties'
+import { CLINICAL_SPECIALTIES, getDoctorSpecialty, getScopedSpecialties, type SpecialtyMeta } from '../constants/clinicalSpecialties'
 export { CLINICAL_SPECIALTIES, getDoctorSpecialty, type SpecialtyMeta }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ export default function Appointments() {
   const [selectedSpecialtyFilter, setSelectedSpecialtyFilter] = useState<string>('all')
   const [selectedDocFilter, setSelectedDocFilter] = useState<string>('all')
   const [searchQuery, setSearchQuery] = useState('')
+  const scopedSpecialties = useMemo(() => getScopedSpecialties(branding.specialties), [branding.specialties])
 
   const {
     register, handleSubmit, reset, watch, setValue,
@@ -166,7 +168,7 @@ export default function Appointments() {
   }
 
   const handleStartConsultation = (appt: Appointment) => {
-    const specialtyMeta = getDoctorSpecialty(appt.doctorName)
+    const specialtyMeta = getDoctorSpecialty(appt.doctorName, appt.doctorSpecialty)
     const url = `/dashboard/consultations?patientId=${appt.patientId || ''}&appointmentId=${appt.appointmentId}&specialty=${specialtyMeta.id}`
     navigate(url)
   }
@@ -246,7 +248,7 @@ export default function Appointments() {
 
       // Specialty filter
       if (selectedSpecialtyFilter !== 'all') {
-        const spec = getDoctorSpecialty(a.doctorName)
+        const spec = getDoctorSpecialty(a.doctorName, a.doctorSpecialty)
         if (spec.id !== selectedSpecialtyFilter) return false
       }
 
@@ -440,7 +442,7 @@ export default function Appointments() {
         </div>
 
         <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
-          {CLINICAL_SPECIALTIES.map(spec => {
+          {scopedSpecialties.map(spec => {
             const isSelected = selectedSpecialtyFilter === spec.id
             return (
               <button
@@ -498,7 +500,7 @@ export default function Appointments() {
               </thead>
               <tbody>
                 {filteredAppointments.map(appt => {
-                  const spec = getDoctorSpecialty(appt.doctorName)
+                  const spec = getDoctorSpecialty(appt.doctorName, appt.doctorSpecialty)
                   const isCheckedIn = appt.status.toLowerCase() === 'checked_in'
                   const isBooked = ['booked', 'scheduled', 'confirmed'].includes(appt.status.toLowerCase())
                   const isCompleted = appt.status.toLowerCase() === 'completed'

@@ -77,16 +77,38 @@ public class LabOrdersController : ControllerBase
 
     [HttpPost("lab-orders/{id:guid}/collect-sample")]
     [AuthorizeRoles("Nurse", "ClinicAdmin")]
-    public async Task<IActionResult> CollectSample(Guid id, CancellationToken ct)
+    public async Task<IActionResult> CollectSample(Guid id, [FromBody] CollectSampleRequest? request, CancellationToken ct)
     {
         var tenantId = User.GetTenantId() ?? Guid.Empty;
         var order = await _db.LabOrders.FirstOrDefaultAsync(o => o.Id == id && o.TenantId == tenantId, ct);
         if (order is null) return NotFound(new { error = "order_not_found" });
+        // A late collection click must not regress a result that is already entered or reviewed.
+        if (order.Status is not (LabOrderStatus.Ordered or LabOrderStatus.SampleCollected))
+            return Conflict(new { error = "invalid_status_transition", status = order.Status.ToString() });
 
         order.Status = LabOrderStatus.SampleCollected;
+        order.SampleCollectedAt = DateTimeOffset.UtcNow;
+        if (!string.IsNullOrWhiteSpace(request?.SpecimenType))
+            order.SpecimenType = request.SpecimenType.Trim();
+        if (!string.IsNullOrWhiteSpace(request?.SampleBarcode))
+            order.SampleBarcode = request.SampleBarcode.Trim();
+        if (!string.IsNullOrWhiteSpace(request?.CollectionNotes))
+        {
+            order.Notes = string.IsNullOrWhiteSpace(order.Notes)
+                ? $"[Sample]: {request.CollectionNotes.Trim()}"
+                : $"{order.Notes}\n[Sample]: {request.CollectionNotes.Trim()}";
+        }
+
         await _db.SaveChangesAsync(ct);
 
-        return Ok(new { id = order.Id, status = "sample_collected" });
+        return Ok(new
+        {
+            id = order.Id,
+            status = "sample_collected",
+            specimenType = order.SpecimenType,
+            sampleBarcode = order.SampleBarcode,
+            sampleCollectedAt = order.SampleCollectedAt
+        });
     }
 
     // ----- FR-08-02: Enter/Upload Lab Result -----
@@ -213,6 +235,9 @@ public class LabOrdersController : ControllerBase
             notes = order.Notes,
             status = order.Status.ToString().ToLower(),
             isAbnormal = order.IsAbnormal,
+            specimenType = order.SpecimenType,
+            sampleBarcode = order.SampleBarcode,
+            sampleCollectedAt = order.SampleCollectedAt,
             doctorReviewedAt = order.DoctorReviewedAt,
             doctorReviewNotes = order.DoctorReviewNotes,
             createdAt = order.CreatedAt,
@@ -334,6 +359,9 @@ public class LabOrdersController : ControllerBase
                 notes = o.Notes,
                 status = o.Status.ToString().ToLower(),
                 isAbnormal = o.IsAbnormal,
+                specimenType = o.SpecimenType,
+                sampleBarcode = o.SampleBarcode,
+                sampleCollectedAt = o.SampleCollectedAt,
                 doctorReviewedAt = o.DoctorReviewedAt,
                 createdAt = o.CreatedAt,
                 completedAt = o.CompletedAt,
@@ -361,5 +389,7 @@ public class LabOrdersController : ControllerBase
 }
 
 public record CreateLabOrderRequest(string TestName, string? Notes);
+
+public record CollectSampleRequest(string? SpecimenType, string? SampleBarcode, string? CollectionNotes);
 
 public record DoctorReviewLabOrderRequest(string? ReviewNotes, bool? IsAbnormal);

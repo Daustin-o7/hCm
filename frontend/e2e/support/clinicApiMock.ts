@@ -39,7 +39,9 @@ export async function installClinicMock(
         reply = { json: { accessToken: `e30.${claims}.mock`, expiresIn: 3600, tenantId: ids.tenant, clinicId: ids.clinic,
           user: { id: ids.user, name: 'Test operator', email: 'test@example.invalid', role }, memberships: [] } }
       } else if (path === '/clinic/profile' && request.method() === 'GET') {
-        reply = { json: { name: 'Isolated test clinic', activatedModules: ['pharmacy', 'lab', 'inventory'], timezone: 'Asia/Kolkata' } }
+        // A spec may supply its own profile; otherwise use the isolated-test default.
+        reply = (await handle(path, request)) ?? { json: { name: 'Isolated test clinic', activatedModules: ['pharmacy', 'lab', 'inventory'], timezone: 'Asia/Kolkata',
+          workingHours: [], holidays: [], specialHours: [] } }
       } else reply = await handle(path, request)
       if (!reply) {
         unexpected.push(`${request.method()} ${path}`)

@@ -641,7 +641,7 @@ public class PharmacyComplianceController : ControllerBase
             sb.AppendLine("ID,Date,ScheduleClass,DrugName,GenericName,BatchNumber,Quantity,PatientName,PatientAddress,PrescribingDoctor,DoctorRegNo,DispensedBy");
             foreach (var r in records)
             {
-                sb.AppendLine($"\"{r.Id}\",\"{r.DispensedAt:yyyy-MM-dd HH:mm}\",\"{r.ScheduleClass}\",\"{PharmacyCommon.EscapeCsv(r.DrugName)}\",\"{PharmacyCommon.EscapeCsv(r.Drug?.GenericName ?? string.Empty)}\",\"{r.BatchNumber}\",{r.Quantity},\"{PharmacyCommon.EscapeCsv(r.PatientName)}\",\"{PharmacyCommon.EscapeCsv(r.PatientAddress)}\",\"{PharmacyCommon.EscapeCsv(r.PrescriberName)}\",\"{r.PrescriberRegNo}\",\"{PharmacyCommon.EscapeCsv(r.DispenserName)}\"");
+                sb.AppendLine($"\"{r.Id}\",\"{r.DispensedAt:yyyy-MM-dd HH:mm}\",\"{r.ScheduleClass}\",\"{PharmacyCommon.EscapeCsv(r.DrugName)}\",\"{PharmacyCommon.EscapeCsv(r.Drug?.GenericName ?? string.Empty)}\",\"{PharmacyCommon.EscapeCsv(r.BatchNumber)}\",{r.Quantity},\"{PharmacyCommon.EscapeCsv(r.PatientName)}\",\"{PharmacyCommon.EscapeCsv(r.PatientAddress)}\",\"{PharmacyCommon.EscapeCsv(r.PrescriberName)}\",\"{PharmacyCommon.EscapeCsv(r.PrescriberRegNo)}\",\"{PharmacyCommon.EscapeCsv(r.DispenserName)}\"");
             }
 
             var bytes = Encoding.UTF8.GetBytes(sb.ToString());

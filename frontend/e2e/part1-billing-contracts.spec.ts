@@ -485,3 +485,21 @@ test('invoice network loss recovers after reload with the exact frozen envelope'
   expect(JSON.stringify(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } })))).not.toContain('OPD General Consultation')
   expect(unexpected).toEqual([])
 })
+
+test('the Reports AR link opens the outstanding aging tab, not the default invoice list', async ({ page }) => {
+  const unexpected = await installClinicMock(page, (path, request): ApiReply | undefined => {
+    if (request.method() !== 'GET') return undefined
+    if (path === '/invoices') return { json: { items: [invoice], total: 1, page: 1, pageSize: 50 } }
+    if (path === '/patients') return { json: [] }
+    if (path === '/appointments') return { json: [] }
+    if (path === '/clinic/tax-profile') return { json: { isGstRegistered: true, documentType: 'Tax Invoice', defaultOpdTaxCategory: 'Exempt', thresholdHighValueUtr: 2000 } }
+    if (path === '/ledger/daily-collection') return { json: { date: '2026-11-06', totalConfirmed: 0, totalReportedPending: 0, confirmedCount: 0, reportedCount: 0, byMethod: [] } }
+    if (path === '/ledger/outstanding-dues') return { json: { totalOutstanding: 100, aging: { current0To30Days: 100, past31To60Days: 0, past61To90Days: 0, over90Days: 0 }, invoices: [] } }
+  })
+  await page.goto('/dashboard/billing?tab=outstanding')
+
+  await expect(page.getByRole('heading', { name: 'Billing, Payments & Ledger' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Outstanding Aging/ })).toHaveClass(/btn-primary/)
+  await expect(page.getByRole('button', { name: /Clinical Invoices/ })).not.toHaveClass(/btn-primary/)
+  expect(unexpected).toEqual([])
+})

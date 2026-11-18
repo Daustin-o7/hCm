@@ -11,6 +11,9 @@ public class LabOrder : ITenantScoped
     public Guid DoctorId { get; set; }    // denormalized for fast worklist queries
     public string TestName { get; set; } = null!;
     public string? Notes { get; set; }
+    public string? SpecimenType { get; set; }
+    public string? SampleBarcode { get; set; }
+    public DateTimeOffset? SampleCollectedAt { get; set; }
     public LabOrderStatus Status { get; set; } = LabOrderStatus.Ordered;
     public bool IsAbnormal { get; set; } = false;
     public DateTimeOffset? DoctorReviewedAt { get; set; }

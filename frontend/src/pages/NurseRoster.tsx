@@ -88,6 +88,19 @@ interface HandoverItem {
   createdAt: string
 }
 
+interface AuthorityProxyItem {
+  id: string
+  delegatorName: string | null
+  delegatorId: string
+  designeeName: string | null
+  designeeId: string
+  permissions: string
+  validFrom: string
+  validUntil: string
+  isActive: boolean
+  reason?: string
+}
+
 const SHIFT_TYPES = ['Morning', 'Evening', 'Night'] as const
 const LEAVE_TYPES = ['Sick', 'Casual', 'Vacation', 'Unpaid'] as const
 
@@ -103,7 +116,7 @@ export default function NurseRoster() {
   const isAdmin = hasRole(['clinicadmin'])
   const isNurse = hasRole(['nurse'])
 
-  const [activeTab, setActiveTab] = useState<'roster' | 'swaps' | 'leave' | 'announcements' | 'handover'>('roster')
+  const [activeTab, setActiveTab] = useState<'roster' | 'swaps' | 'leave' | 'announcements' | 'handover' | 'proxies'>('roster')
   const [rosters, setRosters] = useState<RosterItem[]>([])
   const [activeRosterId, setActiveRosterId] = useState<string | null>(null)
   const rosterLifecycle = rosters.find(r => r.id === activeRosterId)?.status ?? 'Draft'
@@ -113,6 +126,7 @@ export default function NurseRoster() {
   const [openCovers, setOpenCovers] = useState<OpenCoverItem[]>([])
   const [announcements, setAnnouncements] = useState<AnnouncementItem[]>([])
   const [handovers, setHandovers] = useState<HandoverItem[]>([])
+  const [proxies, setProxies] = useState<AuthorityProxyItem[]>([])
 
   const [nurses, setNurses] = useState<NurseOption[]>([])
   const [myLeaves, setMyLeaves] = useState<LeaveRow[]>([])
@@ -121,7 +135,7 @@ export default function NurseRoster() {
   const [balance, setBalance] = useState<{ totalDays: number } | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [toast, setToast] = useState<string | null>(null)
+  const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'warn' } | null>(null)
 
   // Post Shift Modal
   const [showPost, setShowPost] = useState(false)
@@ -169,8 +183,8 @@ export default function NurseRoster() {
   const [handoverPending, setHandoverPending] = useState('')
   const [handoverAlerts, setHandoverAlerts] = useState('')
 
-  const showToast = (msg: string) => {
-    setToast(msg)
+  const showToast = (msg: string, kind: 'ok' | 'warn' = 'ok') => {
+    setToast({ msg, kind })
     setTimeout(() => setToast(null), 4000)
   }
 
@@ -178,7 +192,7 @@ export default function NurseRoster() {
     setLoading(true)
     setError('')
     try {
-      const [shiftRes, leaveReq, swapsRes, openRes, annRes, handRes, rosterRes] = await Promise.all([
+      const [shiftRes, leaveReq, swapsRes, openRes, annRes, handRes, rosterRes, proxiesRes] = await Promise.all([
         api.get('/shifts').catch(() => ({ data: [] })),
         isNurse ? api.get('/staff/me/nurse-profile').catch(() => null) : Promise.resolve(null),
         api.get('/staff/roster/swaps').catch(() => ({ data: [] })),
@@ -186,6 +200,7 @@ export default function NurseRoster() {
         api.get('/staff/roster/announcements').catch(() => ({ data: [] })),
         api.get('/nurse-care/handovers').catch(() => ({ data: [] })),
         api.get('/staff/roster').catch(() => ({ data: [] })),
+        api.get('/staff/roster/proxies').catch(() => ({ data: [] })),
       ])
 
       setShifts(shiftRes.data || [])
@@ -193,6 +208,7 @@ export default function NurseRoster() {
       setOpenCovers(openRes.data || [])
       setAnnouncements(annRes.data || [])
       setHandovers(handRes.data || [])
+      setProxies(proxiesRes.data || [])
 
       const rosterList: RosterItem[] = rosterRes.data || []
       setRosters(rosterList)
@@ -215,6 +231,9 @@ export default function NurseRoster() {
         ])
         setNurses(nl.data || [])
         setPendingLeaves(pl.data || [])
+      } else if (isNurse) {
+        const peersRes = await api.get('/staff/nurses/peers').catch(() => ({ data: [] }))
+        setNurses(peersRes.data || [])
       }
     } catch (err) {
       setError(friendlyError(err))
@@ -351,8 +370,26 @@ export default function NurseRoster() {
   const approveSwap = async (swapId: string) => {
     setSaving(true)
     try {
-      await api.post(`/staff/roster/swaps/${swapId}/approve`, {})
-      showToast('Shift swap approved and applied atomically!')
+      const res = await api.post(`/staff/roster/swaps/${swapId}/approve`, {})
+      if (res.data?.restGapWarnings && res.data.restGapWarnings.length > 0) {
+        const warn = res.data.restGapWarnings[0]
+        showToast(`Swap applied! Rest gap warning: only ${warn.hoursRest}h rest between shifts (<11h minimum).`, 'warn')
+      } else {
+        showToast('Shift swap approved and applied atomically!')
+      }
+      load()
+    } catch (err) {
+      setError(friendlyError(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const revokeProxy = async (proxyId: string) => {
+    setSaving(true)
+    try {
+      await api.post(`/staff/roster/proxies/${proxyId}/revoke`, {})
+      showToast('Authority proxy delegation revoked.')
       load()
     } catch (err) {
       setError(friendlyError(err))
@@ -583,17 +620,16 @@ export default function NurseRoster() {
       </div>
 
       {error && <Alert variant="error" onDismiss={() => setError('')}>{error}</Alert>}
-      {toast && <div className="alert alert-success"><span>{toast}</span></div>}
+      {toast && <div className={`alert alert-${toast.kind === 'warn' ? 'warning' : 'success'}`} role="status"><span>{toast.msg}</span></div>}
 
       {/* ── Navigation Tabs ── */}
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] overflow-x-auto pb-1">
         <button
           onClick={() => setActiveTab('roster')}
-          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${
-            activeTab === 'roster'
+          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${activeTab === 'roster'
               ? 'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400 bg-teal-50/40 dark:bg-teal-950/20'
               : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-          }`}
+            }`}
         >
           <span>🗓️</span>
           <span>Shift Schedule ({shifts.length})</span>
@@ -601,11 +637,10 @@ export default function NurseRoster() {
 
         <button
           onClick={() => setActiveTab('swaps')}
-          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${
-            activeTab === 'swaps'
+          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${activeTab === 'swaps'
               ? 'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400 bg-teal-50/40 dark:bg-teal-950/20'
               : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-          }`}
+            }`}
         >
           <span>🔄</span>
           <span>Swaps &amp; Open Board ({openCovers.length + swaps.length})</span>
@@ -613,11 +648,10 @@ export default function NurseRoster() {
 
         <button
           onClick={() => setActiveTab('leave')}
-          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${
-            activeTab === 'leave'
+          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${activeTab === 'leave'
               ? 'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400 bg-teal-50/40 dark:bg-teal-950/20'
               : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-          }`}
+            }`}
         >
           <span>🏖️</span>
           <span>Leave &amp; Balances</span>
@@ -625,11 +659,10 @@ export default function NurseRoster() {
 
         <button
           onClick={() => setActiveTab('announcements')}
-          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${
-            activeTab === 'announcements'
+          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${activeTab === 'announcements'
               ? 'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400 bg-teal-50/40 dark:bg-teal-950/20'
               : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-          }`}
+            }`}
         >
           <span>📢</span>
           <span>Ward Notices ({announcements.length})</span>
@@ -637,14 +670,24 @@ export default function NurseRoster() {
 
         <button
           onClick={() => setActiveTab('handover')}
-          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${
-            activeTab === 'handover'
+          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${activeTab === 'handover'
               ? 'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400 bg-teal-50/40 dark:bg-teal-950/20'
               : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-          }`}
+            }`}
         >
           <span>📋</span>
           <span>Shift Handovers</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('proxies')}
+          className={`px-4 py-2 text-xs font-semibold rounded-t-lg transition-colors flex items-center gap-1.5 ${activeTab === 'proxies'
+              ? 'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400 bg-teal-50/40 dark:bg-teal-950/20'
+              : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
+            }`}
+        >
+          <span>🛡️</span>
+          <span>Delegations &amp; Proxies ({proxies.length})</span>
         </button>
       </div>
 
@@ -975,11 +1018,10 @@ export default function NurseRoster() {
               {announcements.map(ann => (
                 <div
                   key={ann.id}
-                  className={`p-4 rounded-xl border ${
-                    ann.priority === 'urgent'
+                  className={`p-4 rounded-xl border ${ann.priority === 'urgent'
                       ? 'border-amber-400 bg-amber-50/50 dark:bg-amber-950/20'
                       : 'border-[var(--color-border)] bg-[var(--color-surface-raised)]'
-                  }`}
+                    }`}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -1049,6 +1091,58 @@ export default function NurseRoster() {
         </div>
       )}
 
+      {/* ── TAB 6: DELEGATIONS & AUTHORITY PROXIES ── */}
+      {activeTab === 'proxies' && (
+        <div className="card p-5 space-y-4">
+          <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
+            <div>
+              <h2 className="text-sm font-bold font-heading text-[var(--color-text)]">Time-Boxed Authority Delegations</h2>
+              <p className="text-[11px] text-[var(--color-text-muted)]">
+                Delegated authority proxies for shift and leave approvals (e.g. Acting Head Nurse while on leave)
+              </p>
+            </div>
+            <span className="badge badge-brand">Audit Tracked</span>
+          </div>
+
+          {proxies.length === 0 ? (
+            <p className="text-xs text-[var(--color-text-muted)] py-6 text-center">No active or historical authority delegations found for this clinic.</p>
+          ) : (
+            <div className="space-y-3">
+              {proxies.map(p => (
+                <div key={p.id} className="p-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-raised)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className={`badge ${p.isActive ? 'badge-success' : 'badge-neutral'}`}>
+                        {p.isActive ? 'Active Proxy' : 'Expired / Inactive'}
+                      </span>
+                      <span className="text-xs font-bold text-[var(--color-text)]">
+                        {p.delegatorName || 'Head Nurse'} → {p.designeeName || 'Acting Nurse'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-[var(--color-text-secondary)] mt-1">
+                      Permissions: <span className="font-mono text-teal-700 dark:text-teal-400 font-semibold">{p.permissions}</span> · Valid: {fmtDate(p.validFrom)} → {fmtDate(p.validUntil)}
+                    </div>
+                    {p.reason && (
+                      <p className="text-[11px] italic text-[var(--color-text-muted)] mt-0.5">"{p.reason}"</p>
+                    )}
+                  </div>
+
+                  {isAdmin && p.isActive && (
+                    <button
+                      onClick={() => revokeProxy(p.id)}
+                      disabled={saving}
+                      className="btn btn-secondary btn-xs text-[var(--color-danger)] font-semibold"
+                    >
+                      Revoke Delegation
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── MODALS ── */}
 
       {/* Post Shift Modal */}
@@ -1104,7 +1198,11 @@ export default function NurseRoster() {
         footer={
           <>
             <button className="btn btn-secondary" onClick={() => setShowSwapModal(false)} disabled={saving}>Cancel</button>
-            <button className="btn btn-primary font-semibold" onClick={submitSwapRequest} disabled={saving}>
+            <button
+              className="btn btn-primary font-semibold"
+              onClick={submitSwapRequest}
+              disabled={saving || (swapType === 'DirectSwap' && (!swapColleagueNurseId || !swapColleagueShiftId))}
+            >
               {saving ? 'Submitting…' : 'Submit Request'}
             </button>
           </>
@@ -1135,6 +1233,54 @@ export default function NurseRoster() {
               </button>
             </div>
           </div>
+
+          {swapType === 'DirectSwap' && (
+            <div className="space-y-3 p-3 rounded-lg bg-[var(--color-surface-raised)] border border-[var(--color-border)]">
+              <div>
+                <label className="form-label">Colleague Nurse to Trade With *</label>
+                <select
+                  className="form-select text-xs w-full"
+                  value={swapColleagueNurseId}
+                  onChange={e => {
+                    setSwapColleagueNurseId(e.target.value)
+                    setSwapColleagueShiftId('')
+                  }}
+                >
+                  <option value="">Select a colleague…</option>
+                  {nurses.filter(n => n.id !== myProfileId).map(n => (
+                    <option key={n.id} value={n.id}>
+                      {n.name} {n.designation ? `(${n.designation})` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {swapColleagueNurseId && (
+                <div>
+                  <label className="form-label">Colleague's Shift to Take *</label>
+                  <select
+                    className="form-select text-xs w-full"
+                    value={swapColleagueShiftId}
+                    onChange={e => setSwapColleagueShiftId(e.target.value)}
+                  >
+                    <option value="">Select colleague's shift slot…</option>
+                    {shifts
+                      .filter(s => s.nurseProfileId === swapColleagueNurseId && s.status === 'Assigned' && s.id !== swapTargetShift?.id)
+                      .map(s => (
+                        <option key={s.id} value={s.id}>
+                          {fmtDate(s.date)} · {s.shiftType} ({s.stationOrWard || 'General OPD'})
+                        </option>
+                      ))}
+                  </select>
+                  {shifts.filter(s => s.nurseProfileId === swapColleagueNurseId && s.status === 'Assigned' && s.id !== swapTargetShift?.id).length === 0 && (
+                    <p className="text-[11px] text-amber-600 mt-1">
+                      This colleague has no other active assigned shifts scheduled in this roster period.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           <div>
             <label className="form-label">Reason for Request</label>

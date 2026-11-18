@@ -205,6 +205,9 @@ build guard, not forgotten.
 | `/api/v1/auth/logout` | POST | Anonymous (Cookie) | Revokes the presented refresh row and deletes the cookie |
 | `/api/v1/auth/revoke-all` | POST | Authenticated | Revokes every live refresh family (shared workstation protection) |
 | `/api/v1/auth/.well-known/jwks.json` | GET | Anonymous | RS256 public keys with `kid` for rotation |
+| `/api/v1/users?role=` | GET | Active selected-clinic member (not PlatformAdmin) | Fails closed without matching user/tenant/clinic claims and membership; projects role and specialty from that clinic membership |
+| `/api/v1/staff/me/credentials` | GET, PATCH | Doctor | Reads/updates only the caller's active selected-clinic Doctor membership |
+| `/api/v1/staff/{userId}/credentials` | PATCH | ClinicAdmin, Owner | Updates an active Doctor membership in the admin's selected clinic |
 | `/api/v1/patients/{id}/break-glass` | POST | ClinicAdmin, Doctor, Nurse | Reason-coded emergency override; audited in `PatientAuditLogs` + `AuthAuditLogs` |
 
 ---
@@ -233,9 +236,10 @@ build guard, not forgotten.
 ### 1.1 — Patient Search, Identity & Family Phone Sharing (India Context)
 
 - **Search Authorization & PHI Minimization:**
-  - Strict permission check (`patients.read` / `Receptionist`, `Doctor`, `ClinicAdmin`).
+  - Strict permission check (`patients.read` / `Receptionist`, `Doctor`, `ClinicAdmin`, `Owner`, `Nurse`).
+  - Nurses can browse the list, paged registry, summary, search, and demographic/consent detail. This grants no registration, demographic, consent, invoice, or consultation writes; the patient UI hides those unauthorized actions. Nursing workflows retain their existing role checks. The **Book OPD** entry remains available, but appointment creation keeps its existing server-side roles and still excludes Nurse.
   - Minimum query length: 2 characters (prevents full-database dumps).
-  - Rate-limited and search events audited in `PatientAuditLogs` (Action=`"SEARCH"`, prevents casual browsing of celebrity or neighbor records).
+  - Authorized collection searches are recorded in `AuthAuditLogs` (`EventType="patient_search_authorized"`), not a patient-specific `PatientAuditLogs` row.
   - Response fields are strictly minimized (ID, UHID, Name, Phone, Age/DOB, Gender) — clinical histories are hidden until patient selection.
 - **Family Phone Sharing & Duplicate Resolution:**
   - In India, multiple family members routinely share a single mobile number. The system supports 1:N patients per phone while preventing accidental merges.
@@ -277,9 +281,21 @@ build guard, not forgotten.
 
 - **Atomic Queue Counter (Clinic Timezone):**
   - Designed for multi-specialty clinics (multiple doctors running simultaneous outpatient queues) as well as single-doctor practices.
-  - Replaces vulnerable read-then-write `Max(Token) + 1` with a dedicated counter table: `DoctorDailyQueueCounter` (`TenantId`, `DoctorId`, `Date`, `CurrentToken`).
+  - Replaces vulnerable read-then-write `Max(Token) + 1` with a dedicated counter table: `DoctorDailyQueueCounter` (`TenantId`, `DoctorId`, `Date`, `LastToken`).
   - Clinic date calculated using clinic's local timezone (IST, `Asia/Kolkata` via `TimezoneService`) — avoids premature 5:30 AM queue resets from UTC dates.
-  - Atomic counter increment via DB execution strategy / upsert with unique constraint on `(TenantId, DoctorId, Date, QueueToken)`.
+  - Atomic counter increment via DB execution strategy / upsert with unique constraint on `(TenantId, DoctorId, Date)`.
+- **Receptionist-Centric OPD Queue & Doctor Readiness Desk:**
+  - Designed specifically for Indian hospital/clinic front-desk operations where receptionists manage lobby crowd flow and coordinate doctor room assignments.
+  - **Doctor Readiness & Room Occupancy Grid:** Real-time visibility into each consulting room — displaying who is inside (`In Consult`), doctor availability (`Ready for Patient`), and the exact next patient waiting in line.
+  - **Actionable Call & Hold Workflow:** Receptionists announce patients (`📢 Call to Room`), put a waiting patient on temporary hold (`⏸️ Hold / Park`) so the queue does not stall, and resume them to the waiting line (`▶️ Resume`) when they return.
+- **In-Queue 1-Click Check-In & Token Issuance:**
+  - Scheduled/booked (`expected`) patients can be checked in directly from the Queue view via a 1-click `📥 Check In` button, atomically issuing the sequential token (`A-01`, `A-02`) and adding them to the live lobby without switching to `/dashboard/appointments`.
+- **Clinic Specialty Registration & Multi-Room TV Matrix:**
+  - Clinics register their facility structure (`Clinic` for single specialty, `Polyclinic`/`Hospital` for multi-specialty) and define their offered clinical specialties.
+  - **CRM Scoping:** Queue and appointment specialty filters scope to the clinic's registered disciplines. Doctor selection and EMR routing follow the doctor's own registered specialty.
+  - **Waiting-Room Display (`/queue-display`):**
+    - *Multi-Specialty Polyclinic:* Automatically switches to a multi-column digital room matrix displaying each consulting room, doctor, specialty badge, active "Now Serving" token, and upcoming waiting line.
+    - *Single Specialty:* Displays a high-contrast single-room focal board.
 - **Idempotent Check-in:**
   - Front-desk double-clicks return existing token without re-incrementing or generating duplicate queue slots.
 - **Zero-PHI Public Live Tracker:**
@@ -292,7 +308,7 @@ build guard, not forgotten.
       "position": 3,
       "currentlyServing": 11,
       "estimatedWaitMinutes": 30,
-      "status": "CheckedIn"
+      "status": "waiting"
     }
     ```
   - **Zero PHI:** Patient name, phone, doctor identity, clinic specialty, and diagnosis are completely omitted.
@@ -305,15 +321,20 @@ build guard, not forgotten.
 
 | Endpoint | Method | Roles | Controller / Action | DB Entities & Constraints | Frontend Component |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `/api/v1/patients/search?q=` | GET | Receptionist, Doctor, ClinicAdmin | `PatientsController.Search` | Reads `Patients`; audits to `PatientAuditLogs` | `Patients.tsx` (Debounced query >= 2 chars) |
+| `/api/v1/patients/search?q=` | GET | Receptionist, Doctor, ClinicAdmin, Owner, Nurse | `PatientsController.Search` | Audits authorization to `AuthAuditLogs` (`patient_search_authorized`) before lookup | `Patients.tsx` (Debounced query >= 2 chars) |
+| `/api/v1/patients`, `/api/v1/patients/paged`, `/api/v1/patients/summary` | GET | Receptionist, Doctor, ClinicAdmin, Owner, Nurse | `PatientsController.GetAll / GetPaged / Summary` | Tenant-filtered `Patients`; `patients.read` required | `Patients.tsx`, appointment patient picker |
+| `/api/v1/patients/{id}` | GET | Receptionist, Doctor, ClinicAdmin, Owner, Nurse | `PatientsController.GetById` | Tenant-filtered demographics and versioned consents; `patients.read` required | `Patients.tsx` (Patient detail) |
 | `/api/v1/patients` | POST | Receptionist, ClinicAdmin | `PatientsController.Register` | `Patients` (unique `Uhid`), `PatientConsents` (versioned), `whatsapp_opt_in` | `Patients.tsx` (Registration modal + family phone check) |
 | `/api/v1/patients/{id}/consents/{cId}/withdraw` | POST | Receptionist, ClinicAdmin | `PatientsController.WithdrawConsent` | `PatientConsents.WithdrawnAt` updated | `Patients.tsx` (Consent history & revocation) |
 | `/api/v1/appointments` | POST | Receptionist, Doctor, ClinicAdmin | `AppointmentsController.Book` | `Appointments` (Unique `TenantId, DoctorId, Date, TimeSlot` where `Status <> 6`) | `Appointments.tsx`, `Queue.tsx` |
-| `/api/v1/appointments/{id}` | PUT | Receptionist, Doctor, ClinicAdmin | `AppointmentsController.Update` | Strict state machine validator (`AllowedTransitions`) | `Queue.tsx`, `Appointments.tsx` |
+| `/api/v1/appointments/{id}` | PUT | Receptionist, Doctor, ClinicAdmin, Nurse (nursing/consultation only) | `AppointmentsController.Update` | Strict state machine validator (`AllowedTransitions`) | `Queue.tsx`, `Appointments.tsx` |
 | `/api/v1/appointments/{id}/reschedule` | POST | Receptionist, ClinicAdmin | `AppointmentsController.Reschedule` | Validates slot uniqueness, appends to `AppointmentHistory` | `Appointments.tsx` (Reschedule modal) |
-| `/api/v1/appointments/{id}/check-in` | POST | Receptionist, ClinicAdmin | `AppointmentsController.CheckIn` | Atomic `DoctorDailyQueueCounter`, creates `QueueTrackingToken` | `Queue.tsx` (Check-In action) |
+| `/api/v1/appointments/{id}/check-in` | POST | Receptionist, Doctor, ClinicAdmin | `AppointmentsController.CheckIn` | Atomic `DoctorDailyQueueCounter`, creates `QueueTrackingToken` | `Queue.tsx` (Check-In action) |
 | `/api/v1/appointments/{id}/priority` | PATCH | Receptionist, Doctor, Nurse, Admin | `AppointmentsController.UpdatePriority` | `Appointments.Priority`, `TriageReasonCode`, appends `PriorityLogs` | `Queue.tsx` (Triage Modal + ER advisory) |
+| `/api/v1/appointments/{id}/call` | POST | Receptionist, Doctor, Nurse, Admin | `AppointmentsController.CallPatient` | `Appointments.CalledAt`, `Appointments.CalledByUserId` | `Queue.tsx` (📢 Call to Room action) |
+| `/api/v1/clinic/profile` | PUT | ClinicAdmin | `ClinicController.UpdateProfile` | `Clinics.OrganizationType`, `Clinics.Specialties` | `Settings.tsx` (Clinic Profile & Specialties) |
 | `/api/v1/queue-status/{token}` | GET | Anonymous (Rate-limited) | `QueueStatusController.GetStatus` | Reads `Appointments` by `QueueTrackingToken` (Zero PHI) | `QueueStatus.tsx` (Public live tracker) |
+| `/queue-display` | Page | Authenticated Staff Session | `QueueDisplay.tsx` | Multi-Room Polyclinic Grid or Single-Room focal board | `QueueDisplay.tsx` (Waiting-Room TV screen) |
 
 ---
 
@@ -451,7 +472,7 @@ build guard, not forgotten.
    (the booking's doctor owns the visit — claiming never reassigns it)
  • Context panel: allergies (precheck + triage vitals), past visits, last Rx, triage vitals
  • Draft (autosave, local + server) using a specialty template
- • Diagnoses: free text + optional ICD-10
+ • Diagnoses: free text + optional ICD code
  • Investigations: "advised" list (core text)  |  Lab orders (module) → lab worklist
    (no invoice line yet — billing for lab tests is not wired)
  • e-Rx: structured lines (generic, brand, strength, form, freq, duration, qty)
@@ -460,7 +481,7 @@ build guard, not forgotten.
      └─ Copy-previous (client-side from the context panel)
  • FINALIZE (one transaction): note + Rx + orders locked ► appointment completed
      ├─ One signed record per visit (unique appointment+version); further edits = amend
-     ├─ Reg. number + reproducible SHA-256 signature + verification code
+     ├─ Reg. number + v2: SHA-256 content seal + verification code
      └─ Follow-up date ► optional follow-up appointment
  • Amend after finalize = new immutable version + reason (dispensed lines carried forward)
  • Lab results: versioned, doctor review required, abnormal flag
@@ -492,7 +513,7 @@ build guard, not forgotten.
 
 - **Draft vs. Finalized Separation:**
   - While consulting, notes and prescription items are saved as **Drafts** (`Status = ConsultationStatus.Draft`).
-  - Drafts auto-save to both local storage (offline resilience against connection drops) and the server via `POST /api/v1/appointments/{id}/consultation/draft` (`prescriptionItems`, the same shape finalize uses).
+  - Drafts auto-save to both local storage (sessionStorage, offline resilience against connection drops) and the server via `POST /api/v1/appointments/{id}/consultation/draft` (`prescriptionItems`, the same shape finalize uses).
   - Drafts carry **zero legal weight** and leave the appointment status as `InConsultation`. Once the visit is finalized, drafts are refused (`409 consultation_already_finalized`) — the only route is an amendment.
 - **Single Atomic Transaction Finalize:**
   - `POST /api/v1/appointments/{id}/consultation/finalize`:
@@ -504,9 +525,28 @@ build guard, not forgotten.
     6. Creates `LabOrders` for the ordered tests (no invoice line is raised — lab billing is not wired).
     7. Automatically advances appointment status to `AppointmentStatus.Completed`.
     8. Stamps Doctor's State Medical Council / NMC Registration Number from `TenantMembership.RegistrationNumber`.
-    9. Issues a reproducible SHA-256 signature hash (`DigitalSignatureHash`) over `doctorId | appointmentId | consultationId | diagnosis | signedAt` (whole seconds) and a unique verification code (`VerificationQrCode`).
+    9. Issues a `v2:` SHA-256 content seal (`DigitalSignatureHash`) over the canonical signed note and medicine lines, plus a unique verification code (`VerificationQrCode`). Legacy identity-only hashes still verify as `legacy_limited`.
     10. Automatically provisions follow-up appointment if follow-up date is provided. (No reminder is queued.)
     11. Appends `CONSULTATION_FINALIZED` to `PatientAuditLogs`.
+
+### 3.3b — Doctor Clinical Desk Ergonomics & Speed (Enhanced Workspace)
+
+- **1-Click Nurse Triage & Precheck Import (`📥 Import into Note`):**
+  - Doctors can instantly import patient precheck symptom duration, medication lists, and nurse bedside triage vitals directly into the SOAP note.
+- **Common Indian OPD Quick Lab Test Panels:**
+  - 1-click selectable chips for high-frequency Indian outpatient diagnostic tests: Complete Blood Count (CBC), HbA1c, Fasting Blood Sugar (FBS), Post-Prandial Blood Sugar (PPBS), Lipid Profile, Liver Function Test (LFT), Kidney Function Test (KFT/RFT), Serum Creatinine, Thyroid Profile (T3/T4/TSH), Urine Routine & Micro (C/E), Serum Electrolytes, Chest X-Ray (PA View), and 12-Lead ECG.
+  - Selections automatically land in the Module 08 Lab Worklist upon consultation finalization.
+- **Indian Outpatient Prescription Helpers:**
+  - Quick dosage frequency chips: `1-0-1` (twice daily), `1-1-1` (thrice daily), `0-0-1` (bedtime), `1-0-0` (morning), `SOS` (as needed).
+  - Quick duration chips: `3d`, `5d`, `7d`, `15d`, `30d`.
+  - Quick food timings: `After food`, `Before food`, `Empty stomach`, `With food`, `At bedtime`.
+- **Local Session Recovery Snapshot (`sessionStorage`):**
+  - Real-time client-side draft caching keyed by appointment ID prevents loss of clinical notes during browser tab closures, reloads, or Wi-Fi disconnections.
+  - Safe restoration prompt with 1-click restore or discard; automatically cleared upon finalized cryptographic sealing or amendment.
+- **Facility-Scoped Clinical Disciplines:**
+  - The Doctor Clinical Desk Discipline selector strictly scopes available departments and specialty toolkits (Dental, Physio, Pediatrics, Cardiology, Ortho, etc.) based on the clinic's registration configuration (`branding.specialties`).
+- **Direct Ribbon Prescription Reprint (`🖨️ Print Rx`):**
+  - Instant access to official signed prescription PDF directly from the patient command ribbon for finalized encounters.
 
 ### 3.4 — Structured Prescriptions & Safety Checks
 
@@ -538,12 +578,12 @@ build guard, not forgotten.
 
 - **Authenticity Verification:**
   - Finalize issues a `VerificationQrCode` (e.g. `RX-1A2B3C4D5E6F7`) plus `DigitalSignatureHash`.
-  - `DigitalSignatureHash = SHA-256(doctorId | appointmentId | consultationId | diagnosis | signedAt-unix-seconds)`. `SignedAt` is truncated to whole seconds before hashing, so the value is recomputable from the stored row — a tampered diagnosis or timestamp stops matching.
+  - `DigitalSignatureHash` is a `v2:` SHA-256 content seal over the canonical note and medicine lines (deterministic JSON: sorted keys, normalized decimals, ordered items). Any post-signature edit to the note, diagnosis, or medicines stops matching. Older rows carrying the legacy identity-only hash verify as `legacy_limited` instead of claiming content integrity.
   - External chemists and patients can query `GET /api/v1/prescriptions/verify/{code}` (also aliased at `/api/v1/consultations/verify-rx/{code}`), anonymous, no login.
-  - The response returns `signatureValid` (recomputed and compared), `version`, `amended`, clinic name/address, doctor name, registration number, qualifications, signature hash, masked patient initials and the medicine lines — no clinical notes or contact details.
+  - The response returns `signatureValid` (recomputed and compared), `version`, `amended`, clinic name/address, doctor name, registration number, qualifications, signature hash, masked patient initials, approximate age, gender, and the medicine lines — no full name, contact details, or clinical notes.
   - Amendments reuse the same code. `?version=N` returns that printed version and flags `isSuperseded` only when a newer signed version exists; the newest version stays `valid` even though an amendment leaves its row in status `Amended`. An unknown version is `404 prescription_version_not_found`.
   - An amended prescription reveals only `amendmentReason`; the superseded version's medicine lines are shown only when that exact version is requested.
-  - **No PDF and no QR image yet:** the code is returned as JSON text and shown as text in `FinalizeSuccessModal`. Printing/PDF rendering is not implemented.
+  - **PDF & print:** `GET /api/v1/prescriptions/{id}/pdf` and `GET /api/v1/consultations/{id}/prescription/pdf` render a server-side PDF with an embedded vector QR code; `GET /api/v1/prescriptions/{id}/print` returns the printable payload. Every render/print appends a `PrescriptionPrintLogs` row, and reprints carry the `DUPLICATE COPY` watermark.
   - Public page `frontend/src/pages/VerifyRx.tsx` at `/rx-verify/:code` and `/verify-rx/:code`. Share links (`POST /api/v1/prescriptions/{id}/share-link`) add `exp` + `sig` (HMAC-SHA256 over `code:exp`, 7 days, `Prescription:ShareSecret`); verification rejects expired (`410`) or forged (`400`) links, and returns `503 share_link_not_configured` when the secret is unset.
 
 ### 3.7 — Lab Results Lifecycle & Review Loop
@@ -577,14 +617,18 @@ build guard, not forgotten.
 | `/api/v1/appointments/{id}/consultation/finalize` | POST | Doctor | `ConsultationsController.FinalizeConsultation` | One transaction: `Consultations (Status=Finalized)`, `Prescriptions`, `PrescriptionItems`, `LabOrders`, `Appointments.Status=Completed`; unique `(AppointmentId, Version)`; audit `CONSULTATION_FINALIZED` | `FinalizeSuccessModal.tsx` |
 | `/api/v1/consultations/{id}/amend` | POST | Doctor | `ConsultationsController.AmendConsultation` | Creates `Consultations (v+1, Status=Amended)` with `AmendmentReason`; carries the prescription forward; audit `CONSULTATION_AMENDED` | `AmendmentModal.tsx` |
 | `/api/v1/prescriptions/verify/{code}` (alias `/api/v1/consultations/verify-rx/{code}`) | GET | Anonymous (Public) | `ConsultationsController.VerifyPrescription` | Reads every signed `Consultations` row for the `VerificationQrCode`; `?version=` selects the printed copy (404 when absent); `isSuperseded` only for older versions; optional `exp`/`sig` share-link check | `VerifyRx.tsx` |
-| `/api/v1/consultations/{id}/lab-orders` | POST | Doctor | `LabOrdersController.CreateOrder` | `LabOrders (Status=Ordered)`; module `lab`; no invoice line | none (SPA sends no lab orders yet) |
+| `/api/v1/prescriptions/{id}/print` | GET | ClinicAdmin, Doctor, Receptionist, Pharmacist, Nurse | `ConsultationsController.PrintPrescription` | Appends `PrescriptionPrintLogs`; `isDuplicateCopy` + `DUPLICATE COPY` watermark on reprints | `FinalizeSuccessModal.tsx` / ribbon |
+| `/api/v1/prescriptions/{id}/share-link` | POST | ClinicAdmin, Doctor, Receptionist, Pharmacist | `ConsultationsController.GenerateShareLink` | Requires active patient consent; HMAC-SHA256 `exp`+`sig`, 7 days; `503` when `Prescription:ShareSecret` is unset | `FinalizeSuccessModal.tsx` |
+| `/api/v1/prescriptions/{id}/pdf` | GET | ClinicAdmin, Doctor, Receptionist, Pharmacist, Nurse (membership-scoped) | `ConsultationsController.GetPrescriptionPdf` | Renders PDF + vector QR; appends `PrescriptionPrintLogs`; reprint watermark | `FinalizeSuccessModal.tsx` |
+| `/api/v1/consultations/{id}/prescription/pdf` | GET | ClinicAdmin, Doctor, Receptionist, Pharmacist, Nurse (membership-scoped) | `ConsultationsController.GetConsultationPrescriptionPdf` | Resolves the consultation's prescription and delegates to the PDF renderer | `FinalizeSuccessModal.tsx` |
+| `/api/v1/consultations/{id}/lab-orders` | POST | Doctor | `LabOrdersController.CreateOrder` | `LabOrders (Status=Ordered)`; module `lab`; no invoice line | none (the SPA orders tests through finalize's `orderedLabTests`) |
 | `/api/v1/lab-orders` | GET | Doctor, ClinicAdmin | `LabOrdersController.Worklist` | `LabOrders` + `latestResultVersion` | `LabOrders.tsx` |
 | `/api/v1/lab-orders/{id}` | GET | Doctor, ClinicAdmin, Nurse | `LabOrdersController.GetOrder` | `LabOrders` + newest `LabResults` version | none (API only) |
 | `/api/v1/lab-orders/{id}/collect-sample` | POST | Nurse, ClinicAdmin | `LabOrdersController.CollectSample` | `LabOrders.Status = SampleCollected` | none (API only) |
 | `/api/v1/lab-orders/{id}/result` | PATCH | Doctor, ClinicAdmin | `LabOrdersController.EnterResult` | New `LabResults` version (`Version`, `PreviousVersionId`); `LabOrders.Status = Resulted` | none (API only) |
 | `/api/v1/lab-orders/{id}/doctor-review` | POST | Doctor | `LabOrdersController.DoctorReview` | `LabOrders.Status = ReviewedByDoctor`, `DoctorReviewedAt`; `409 no_result_to_review` | none (API only) |
 
-**Section 3 known gaps (documented, not built):** lab tests are not billed; no prescription PDF or QR image; no drug favourites or protocol library; `ConsultTemplate` has no version column (so `Consultation.TemplateVersion` is client-reported); `LabOrderStatus.Completed` is unreachable; receptionist can still read clinical endpoints; the SPA has no lab-test picker or public verification page.
+**Section 3 known gaps (documented, not built):** lab tests are not billed; no drug favourites or protocol library; `ConsultTemplate` has no version column (so `Consultation.TemplateVersion` is client-reported); `LabOrderStatus.Completed` is unreachable; receptionist can still read clinical endpoints. Prescription PDF, the vector QR image, the lab-test picker, and the public verification page are now built.
 
 ---
 
@@ -613,17 +657,20 @@ build guard, not forgotten.
 5.3 ADJUSTMENTS
   • Discount: reason required, rejected above gross, posted as a contra-revenue
     line; the clinic-set % approval threshold is not built
-  • Advance/deposit: NOT built (no PatientDeposit table)
+  • Advance/deposit: built (PatientDeposits + PatientDepositAllocations; collected,
+    applied to an invoice, refunded; each posts to the ledger)
   • Packages and memberships: later
 
 5.4 FINALIZE
-  • Sequential, gapless number per tenant + year + series (INV-YYYY-XXXXXX),
-    MAX+1 in a serializable transaction with a DB unique index
+  • Sequential, gapless number per tenant + year + series (INV-2026-27-000142;
+    the FY segment is "2026-27" from IndianFinancialYearUtils), MAX+1 in a
+    serializable transaction with a DB unique index
   • Server-side printable payload from the finalized version only; reprints marked
     duplicate. No PDF renderer — the endpoint returns JSON for the UI to render
   • Mistakes → credit note + new invoice, never an edit
 
-5.5 PAYMENT CAPTURE  (manual-first; money goes patient → clinic bank only)
+5.5 PAYMENT CAPTURE  (manual-first; no platform escrow - money settles to the
+ clinic's own bank account, or the clinic's own Razorpay merchant account)
   • Methods: cash, card (slip ref), UPI QR, bank transfer
   • UPI: reception taps "Collect via UPI" → dynamic UPI QR (invoice amount +
     invoice ref) from the primary payee account; "Use backup account" button
@@ -636,7 +683,9 @@ build guard, not forgotten.
   • Staff check the credit in the bank app/soundbox → Confirm (+UTR,
     mandatory at or above a clinic-set amount) → invoice paid / partially paid
   • A second confirm of the same payment and an over-balance amount are rejected
-  • Cap on reported-but-unconfirmed amount and spike alerts: NOT built
+  • Cap on reported-but-unconfirmed payments (count and amount) and the
+    staff-confirmation spike alert are enforced from TenantTaxProfile
+    (MaxUnconfirmedReportedPaymentsCount/Amount, StaffConfirmationSpikeThreshold)
   • Receipt: printed, or WhatsApp with patient opt-in
 
 5.7 PAYEE ACCOUNT CONTROLS
@@ -644,7 +693,9 @@ build guard, not forgotten.
     cooling-off, email alert to every clinic admin
   • Accounts are clinic-scoped: the QR only offers the invoice clinic's own
     account, never a sibling clinic's
-  • Priority order stored per clinic; daily limit stored but not yet enforced
+  • Priority order stored per clinic; daily limit enforced when the dynamic QR
+    picks an account (over-limit accounts are skipped; 400
+    payee_daily_limit_exceeded when none has headroom)
 
 5.8 REFUNDS & CREDIT NOTES
   • Dual control; refund sent from the clinic's bank manually, ref recorded
@@ -701,11 +752,12 @@ build guard, not forgotten.
   - Requires a mandatory reason text; the server rejects a discount above the gross and posts it as a `DiscountAllowed` contra-revenue debit so the ledger still balances.
   - Clinic-configurable discount threshold (e.g., discounts > 15% require Owner / ClinicAdmin approval) is **not built** — there is no threshold setting or approval step.
 - **Patient Deposits / Advances:**
-  - **Not built.** There is no `PatientDeposit` table or advance-offset flow; `DiscountAmount` does not cover this.
+  - Built: `PatientDeposits` + `PatientDepositAllocations` (`PatientDepositsController`). A deposit is collected (cash/UPI/card/netbanking, receipt number), applied to one or more invoices, or refunded; each step posts an append-only ledger entry (`DepositCollected` / `DepositApplied` / `DepositRefunded`).
 
 ### 5.4 — Manual-First Direct Payment Capture
 - **Direct Clinic Bank Account Routing:**
-  - All funds move directly **Patient → Clinic Bank Account**. Zero intermediate aggregator pooling, zero wallet holding, zero escrow liability.
+  - Cash / card / UPI / bank-transfer collections settle straight into the **clinic's own bank account** — no platform escrow, no pooled wallet, no aggregator balance held by Samstack.
+  - A clinic may also enable its **own** Razorpay merchant account (`PaymentMethod.Razorpay`); receipts are then verified by webhook signature and reconciled through the unmatched-receipt queue before matching an invoice. Razorpay is a PSP in that path, so "no intermediary at all" applies only to the manual methods.
 - **Payment Methods:**
   - `Cash`: Cash collected at reception desk.
   - `Card`: Terminal POS swipe, staff records terminal slip transaction reference.
@@ -768,7 +820,7 @@ build guard, not forgotten.
 
 ### 5.11 — Priority Execution Matrix
 - **Must do now:** 5.1 (Invoice Build), 5.2 (Tenant Tax Profile), 5.4 (Finalize & Sequential Numbering), 5.5 (Payment Capture & Dynamic QR), 5.6 (Staff Confirmation & UTR), 5.8 (Refunds & Credit Notes), and core of 5.9 (Append-Only Ledger).
-- **Should do soon:** 5.3 (Discounts & Patient Deposits), 5.7 (Payee Account Cooling-Off & Alerts), Bank Statement Import (v1.5).
+- **Should do soon:** 5.3 (discount approval threshold only — deposits are built), 5.7 (Payee Account Cooling-Off & Alerts), Bank Statement Import (v1.5).
 - **Can wait:** WhatsApp Payment Links (v2), PSP Routing Adapters (v3), Insurance/TPA Packages.
 - **Strictly do not do:** Reading customer SMS/messages, pooling or settling funds (escrow/aggregator risk), or promising "zero fees" in sales copy.
 
@@ -833,6 +885,11 @@ build guard, not forgotten.
        └─► User row + TenantMembership (tenant, clinic, role) + role_granted audit
 ```
 
+**Selected-clinic directory and signing credentials:**
+- `GET /api/v1/users?role=doctor` uses the caller's authenticated identity, matching tenant/clinic claims and database tenant scope, and an active membership with the token's role. Missing or mismatched scope returns `403`; a missing identity returns `401`. The directory excludes PlatformAdmin, filters/projects the selected membership's role and specialty, and returns `400 invalid_role` for an unknown or undefined role filter instead of returning all staff.
+- As a Doctor, open **Settings → Signing credentials** to read or update your own selected-clinic membership using `GET`/`PATCH /api/v1/staff/me/credentials`. ClinicAdmin/Owner retains `PATCH /api/v1/staff/{userId}/credentials` for an active doctor in the same selected clinic.
+- Both PATCH routes require `{ registrationNumber, qualifications }`, trim surrounding spaces, and validate 2–100 / 2–200 characters respectively. They return the saved fields and persist the membership plus `SigningCredentialsUpdated` audit in one save. Only future signatures use the updated credentials; existing consultation snapshots and signature hashes stay unchanged. The form loads independently of clinic configuration; session/clinic changes cancel outgoing requests and ignore stale responses so they cannot populate the new form.
+
 ### 1.2 — Clinic Configuration
 
 ```
@@ -878,7 +935,7 @@ build guard, not forgotten.
   GET /api/v1/patients/search?q=<min 2 chars>
        ├─► Checked against 'patients.read' role permission
        ├─► Minimum 2 characters required (prevents DB dumping)
-       ├─► Logs search event to PatientAuditLogs (Action='SEARCH')
+       ├─► Records search authorization in AuthAuditLogs (patient_search_authorized)
        └─► Returns minimized PHI (Id, Uhid, Name, Phone, Age, Gender)
   GET /api/v1/patients/{id} ──► full demographics + versioned consents
   PATCH /api/v1/patients/{id} ──► update demographics
@@ -1161,35 +1218,57 @@ build guard, not forgotten.
      POST /api/v1/message-templates
      { name, channel: "whatsapp", content }
      └─► TemplateApprovalStatus=Pending (Meta/BSP approval external)
+         Placeholders limited to {{patient_name}}, {{clinic_name}},
+         {{date}}, {{time}}, {{precheck_link}}. The dispatch path cannot
+         substitute anything else, so an unknown token is rejected on write.
+     PATCH /api/v1/message-templates/{id} { name?, content?, approvalStatus? }
+       └─► Records the decision Meta/BSP made out of band; nothing is sent
+           to Meta from here. Editing the body resets the status to pending
+           (Meta re-reviews new content). While a template is not Approved,
+           delivery fails approved_template_required — never silently sent.
 
   [FR-13-01] Clinic Admin configures rules:
      POST /api/v1/notification-rules
-     { ruleType: "remindndaysbefore|remindifnovisitnmonths|
-                   appointmentconfirmation|appointmentreminder",
-       timingConfig: { daysBefore: 1, months: 6 },
+     { ruleType: "remindndaysbefore|remindifnovisitnmonths",
+       timingConfig: { daysBefore: 0-365 }   // remindndaysbefore
+                   | { months: 1-24 }        // remindifnovisitnmonths
        templateId, active: true }
+       └─► Exactly one timing key per rule type: the API stores only the key
+           the worker reads and rejects any other shape.
      PATCH /api/v1/notification-rules/{id} { active: false }
 
+     appointmentconfirmation / appointmentreminder are system-owned
+     (booking flow + ReminderSchedulerService). POST rejects them with
+     rule_type_managed_by_system — a rule row for them would never fire.
+
   [FR-13-03] NotificationRulesWorker (BackgroundService, 5-min):
-     1. Read active rules for current tenant
-     2. For each rule:
-        a. Parse timingConfig
-        b. Query matching appointments/patients
-        c. For each candidate:
-           - Check NotificationLog for (RuleId, AppointmentId, same-day)
-             → skip if already sent (idempotency)
-           - Render template with {{patient_name}}/{{clinic_name}}/{{date}}/{{time}}
-           - Insert NotificationLog row (RuleId set, Channel, SentAt)
-           - Log to console (stub; real impl calls Meta/BSP)
-     3. Per-rule exception isolation (one bad rule doesn't crash worker)
+     1. Drain the NotificationIntent outbox (booking confirmation intents)
+     2. Read active rules for current tenant
+     3. remindndaysbefore → appointments on today+daysBefore with consent
+        remindifnovisitnmonths → patients with no visit for N months
+          (dormant unless NotificationRules:NoVisitPolicyApproved=true)
+     4. Send through INotificationChannel → Meta Graph API when a whatsapp
+        TenantIntegration with a numeric merchantId is enabled; otherwise
+        the send is rejected with channel_not_configured
+     5. Every outcome becomes a NotificationLog row, including skips:
+        consent_missing · approved_template_required · patient_day_guard
+        (max one notification per patient per calendar day) ·
+        retry_exhausted after 3 attempts
+     6. Per-rule exception isolation (one bad rule doesn't crash worker)
 
-  Phase 1 FR-20/21 become default rules:
+  Phase 1 FR-20/21 remain default rules:
     - appointmentconfirmation: wired into booking flow
-    - appointmentreminder: 1 day before, fired by worker
-    (Phase 1 ReminderSchedulerService continues to work as backup)
+    - appointmentreminder: 1 day before, fired by ReminderSchedulerService
+      (the MOD-13 worker skips this type — booking owns it)
 
-  Edge case: rule conflicts (two rules would fire same day) →
-  de-duplicated at send time (one message, not two).
+  Edge case: two rules eligible for the same patient on the same day →
+  the second send is skipped and logged as patient_day_guard
+  (one message per patient per day, not two).
+
+  [FR-13-03] Delivery history:
+     GET /api/v1/notification-logs?status=&page=&pageSize=
+       └─► Clinic Admin only, tenant-scoped through the appointment,
+           append-only (REVOKE UPDATE, DELETE) so there is no write verb
 ```
 
 ### 2.A.4 — Operational Data
@@ -1201,7 +1280,7 @@ build guard, not forgotten.
   [FR-09-01] Clinic Admin/Receptionist:
      POST /api/v1/inventory/items
      { name, tier: "dead|consumable|usable", unit, lowStockThreshold? }
-     PATCH /api/v1/inventory/items/{id} { name?, unit?, active?, threshold? }
+     PATCH /api/v1/inventory/items/{id} { name?, unit?, active?, lowStockThreshold? }
        └─► Soft-deactivate (active=false), NEVER hard delete
            (historical stock_movements must still reference item by ID)
 
@@ -1238,33 +1317,50 @@ build guard, not forgotten.
   not a project-management tool).
 
 ┌──────────────────────────────────────────────────────────────┐
-│ MOD-08: Lab Records (FR-08-01/02/03)                         │
+│ MOD-08: Lab Records & Diagnostics (FR-08-01/02/03)            │
 └──────────────────────────────────────────────────────────────┘
   [FR-08-01] Doctor orders:
      POST /api/v1/consultations/{id}/lab-orders
      { testName, notes? }
        └─► Status=Ordered; links to consultation, denormalizes
-           patientId+doctorId for fast worklist
+           patientId+doctorId for fast worklist queries
 
-  [FR-08-02] Doctor/ClinicAdmin enters result:
+  [FR-08-01b] Nurse / ClinicAdmin collects specimen:
+     POST /api/v1/lab-orders/{id}/collect-sample
+     { specimenType, sampleBarcode, collectionNotes? }
+       └─► Status=SampleCollected; records sample barcode, specimen type
+           (e.g., EDTA Whole Blood, Plain Serum, Fluoride Plasma) & timestamp
+
+  [FR-08-02] Doctor / ClinicAdmin enters result:
      PATCH /api/v1/lab-orders/{id}/result
-     (multipart: resultText?, file?)
+     (multipart: resultText?, referenceRange?, units?, isAbnormal, file?)
        │
        ▼
      - Creates new LabResult row with Version = latest+1
-     - PreviousVersionId chain (amendment, never overwrite)
-     - File saved to lab-uploads/ (local disk; S3 swap per TRD-Phase2)
-     - FileUrl returned: /lab-uploads/{file}
-     - Order status → Completed
+     - PreviousVersionId chain (clinical amendment, never overwrite)
+     - Standard Indian OPD diagnostic templates auto-fill reference ranges
+       (CBC, FBS, PPBS, HbA1c, Serum Creatinine, LFT, Lipid Profile, TSH, Urine, Electrolytes)
+     - File saved with authenticated binary envelope (HCLAB01 AES-256-GCM)
+     - IsAbnormal flag triggers critical panic alert badge (🚨 Abnormal)
+     - Status → Resulted
 
-  [FR-08-03] Doctor/ClinicAdmin views:
-     GET /api/v1/lab-orders?status=ordered|completed
-       └─► Sort: pending first, then by createdAt desc
-       └─► Each row shows latestResultVersion
+  [FR-08-02b] Doctor Reviews & Signs Off:
+     POST /api/v1/lab-orders/{id}/doctor-review
+     { notes? }
+       └─► Status=ReviewedByDoctor; records doctor timestamp & review notes
+
+  [FR-08-03] Diagnostic Worklist & Branded Reporting:
+     GET /api/v1/lab-orders?status=ordered|samplecollected|resulted|reviewedbydoctor
+       └─► Sort: pending stages first, then createdAt desc
+       └─► Multi-parameter search: patient name, phone, test name, barcode
+       └─► Panic Alert Toggle: filter exclusively for abnormal/critical reports
+       └─► Branded Diagnostic Slip: generates printable lab report with clinic letterhead
+           (organizationName, address, contact), patient demographics, test results,
+           reference ranges, and digital sign-off stamp.
 
   Edge case: consultation amended after order created ──► order
   still links to original consultation ID, unaffected.
-  No LIMS/instrument auto-import (per FR-08-02 security notes).
+  Clinical integrity: results are immutable; corrections create v2+ referencing v1.
 
 ┌──────────────────────────────────────────────────────────────┐
 │ MOD-11: Finance Ledger (FR-11-01/02/03)                      │
@@ -1309,13 +1405,17 @@ build guard, not forgotten.
   [FR-14-01] SAMSTACK staff (PlatformAdmin role):
      GET /api/v1/platform-admin/tenants?q=search
        └─► Lists all clinics (single-tenant now, multi-tenant in Tier 2)
-       └─► Shows: name, subscriptionTier, status, activatedModules
+       └─► Shows: name, subscriptionTier, status, activatedModules, organizationType, specialties
+     POST /api/v1/platform-admin/tenants
+       └─► Provisions tenant, clinic, admin invite, and initial organizationType + registered clinical specialties
 
   [FR-14-02] SAMSTACK staff:
      GET /api/v1/platform-admin/tenants/{id}
      PATCH /api/v1/platform-admin/tenants/{id}
      { subscriptionTier?, subscriptionStatus?, activatedModules?,
-       subscriptionEndsAt? }
+       subscriptionEndsAt?, organizationType?, specialties? }
+       └─► Configures subscription plan, module entitlements, facility classification (Clinic vs Polyclinic),
+           and clinical specialties that scope the CRM & queue matrix
        └─► Every change is highest-privilege audit-tracked
            (same standard as financial mutations)
 
@@ -1436,6 +1536,10 @@ AUTH & USERS
   POST   /api/v1/staff/invite
   POST   /api/v1/staff/accept-invite
   GET    /api/v1/staff
+  GET    /api/v1/users?role=                         (Active selected-clinic membership; no PlatformAdmin)
+  GET    /api/v1/staff/me/credentials                 (Doctor's own selected-clinic signing credentials)
+  PATCH  /api/v1/staff/me/credentials                 (Doctor self-service; audited)
+  PATCH  /api/v1/staff/{userId}/credentials           (ClinicAdmin/Owner; selected-clinic doctor; audited)
 
 CLINIC
   GET    /api/v1/clinic/profile
@@ -1448,6 +1552,9 @@ CLINIC
 
 PATIENTS
   POST   /api/v1/patients                            (FR-06 / UHID / family phone aware)
+  GET    /api/v1/patients                            (patients.read, including Nurse)
+  GET    /api/v1/patients/paged                      (patients.read, including Nurse)
+  GET    /api/v1/patients/summary                    (patients.read, including Nurse)
   GET    /api/v1/patients/search?q=                  (FR-07 / permissioned & audited)
   GET    /api/v1/patients/{id}                       (FR-07)
   PATCH  /api/v1/patients/{id}                       (FR-08)
@@ -1503,6 +1610,8 @@ NOTIFICATION RULES
   PATCH  /api/v1/notification-rules/{id}              (MOD-13)
   GET    /api/v1/message-templates                    (MOD-13)
   POST   /api/v1/message-templates                    (MOD-13)
+  PATCH  /api/v1/message-templates/{id}               (MOD-13) — edit body, record Meta approval
+  GET    /api/v1/notification-logs                    (MOD-13) — delivery history, status filter, paged
 
 INVENTORY
   GET    /api/v1/inventory/items                      (MOD-09)
@@ -1593,7 +1702,10 @@ PHARMACY COMPLIANCE & DISPENSING (PharmacyComplianceController)
 - **UAE adapter** — International
 - **Voice Agent** (MOD-27) — Phase 3 per FRD-Phase2 §9
 - **Offline sync** (FR-22) — deferred (see state/technical-debt.md item 7)
-- **Real WhatsApp / Razorpay** — stubs, awaiting pilot vendor accounts (OpenIddict in-house OIDC active)
+- **Real WhatsApp / Razorpay vendor accounts** — the Meta Graph send path and the Razorpay
+  payment/webhook path are implemented; both stay inactive until a tenant integration row
+  (`whatsapp` with a numeric merchantId, or `razorpay` keys) is configured. Awaiting pilot
+  vendor accounts (OpenIddict in-house OIDC active).
 - **S3 blob storage** for MOD-08 — local disk `lab-uploads/` for now
 
 ---

@@ -236,10 +236,10 @@ public class AppointmentsController : ControllerBase
     {
         [AppointmentStatus.Booked] = [AppointmentStatus.Confirmed, AppointmentStatus.CheckedIn, AppointmentStatus.Cancelled, AppointmentStatus.NoShow],
         [AppointmentStatus.Confirmed] = [AppointmentStatus.CheckedIn, AppointmentStatus.Cancelled, AppointmentStatus.NoShow],
-        [AppointmentStatus.CheckedIn] = [AppointmentStatus.InNursing, AppointmentStatus.InConsultation, AppointmentStatus.Cancelled, AppointmentStatus.NoShow],
+        [AppointmentStatus.CheckedIn] = [AppointmentStatus.InNursing, AppointmentStatus.InConsultation, AppointmentStatus.Parked, AppointmentStatus.Cancelled, AppointmentStatus.NoShow],
         [AppointmentStatus.InNursing] = [AppointmentStatus.InConsultation, AppointmentStatus.Completed, AppointmentStatus.Cancelled, AppointmentStatus.Parked],
         [AppointmentStatus.InConsultation] = [AppointmentStatus.Completed, AppointmentStatus.Parked, AppointmentStatus.Cancelled],
-        [AppointmentStatus.Parked] = [AppointmentStatus.InConsultation, AppointmentStatus.Cancelled, AppointmentStatus.NoShow],
+        [AppointmentStatus.Parked] = [AppointmentStatus.CheckedIn, AppointmentStatus.InConsultation, AppointmentStatus.Cancelled, AppointmentStatus.NoShow],
         [AppointmentStatus.Completed] = [], // Terminal
         [AppointmentStatus.Cancelled] = [], // Terminal
         [AppointmentStatus.NoShow] = []     // Terminal
@@ -297,6 +297,12 @@ public class AppointmentsController : ControllerBase
             _db.AppointmentHistories.Add(history);
             appointment.Status = newStatus.Value;
             appointment.UpdatedAt = DateTimeOffset.UtcNow;
+            // Resuming from hold puts the patient back in the waiting line; the earlier call must not stay on the board.
+            if (newStatus.Value == AppointmentStatus.CheckedIn)
+            {
+                appointment.CalledAt = null;
+                appointment.CalledByUserId = null;
+            }
             if (appointment.Status is AppointmentStatus.Completed or AppointmentStatus.Cancelled or AppointmentStatus.NoShow)
                 appointment.EndQueueTracking(history.ChangedAt);
 
@@ -410,6 +416,7 @@ public class AppointmentsController : ControllerBase
                 patientAge = a.Patient.ApproxAge,
                 doctorId = a.DoctorId,
                 doctorName = a.Doctor.Name,
+                doctorSpecialty = a.Doctor.Specialty,
                 date = a.Date,
                 time = a.TimeSlot,
                 status = formatStatus(a.Status),

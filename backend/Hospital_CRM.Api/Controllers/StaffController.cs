@@ -348,11 +348,35 @@ public class StaffController : ControllerBase
         return Ok(staff);
     }
 
-    /// <summary>
-    /// Sets the credentials a doctor's signature carries (FR-14). Without them
-    /// FinalizeConsultation returns signing_credentials_required, so this is the only path
-    /// that makes a real clinic able to sign at all.
-    /// </summary>
+    [HttpGet("me/credentials")]
+    [AuthorizeRoles("Doctor")]
+    public async Task<IActionResult> GetMySigningCredentials(CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        if (userId is null || userId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_token" });
+
+        var doctor = await SelectedDoctorMembershipAsync(ct);
+        if (doctor is null) return Forbid();
+
+        return Ok(new { registrationNumber = doctor.RegistrationNumber, qualifications = doctor.Qualifications });
+    }
+
+    [HttpPatch("me/credentials")]
+    [AuthorizeRoles("Doctor")]
+    public async Task<IActionResult> UpdateMySigningCredentials([FromBody] SigningCredentialsRequest request, CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        if (userId is null || userId == Guid.Empty)
+            return Unauthorized(new { error = "invalid_token" });
+
+        var doctor = await SelectedDoctorMembershipAsync(ct);
+        if (doctor is null) return Forbid();
+
+        return await SaveSigningCredentialsAsync(doctor, doctor, request, ct);
+    }
+
+    /// <summary>Sets the selected-clinic credentials snapshotted when a doctor signs a consultation (FR-14).</summary>
     [HttpPatch("{userId:guid}/credentials")]
     [AuthorizeRoles("ClinicAdmin")]
     public async Task<IActionResult> UpdateSigningCredentials(Guid userId,
@@ -361,15 +385,21 @@ public class StaffController : ControllerBase
         var admin = await SelectedAdminMembershipAsync(ct);
         if (admin is null) return Forbid();
 
-        var registration = request.RegistrationNumber?.Trim();
-        var qualifications = request.Qualifications?.Trim();
-        if (registration?.Length is not (>= 2 and <= 100) || qualifications?.Length is not (>= 2 and <= 200))
-            return BadRequest(new { error = "credentials_required", message = "A signing doctor needs both a registration number and qualifications." });
-
         var doctor = await _db.TenantMemberships.FirstOrDefaultAsync(m =>
             m.UserId == userId && m.TenantId == admin.TenantId && m.ClinicId == admin.ClinicId
             && m.Status == "active" && m.Role == UserRole.Doctor, ct);
         if (doctor is null) return NotFound(new { error = "doctor_membership_not_found" });
+
+        return await SaveSigningCredentialsAsync(doctor, admin, request, ct);
+    }
+
+    private async Task<IActionResult> SaveSigningCredentialsAsync(TenantMembership doctor, TenantMembership actor,
+        SigningCredentialsRequest request, CancellationToken ct)
+    {
+        var registration = request.RegistrationNumber?.Trim();
+        var qualifications = request.Qualifications?.Trim();
+        if (registration?.Length is not (>= 2 and <= 100) || qualifications?.Length is not (>= 2 and <= 200))
+            return BadRequest(new { error = "credentials_required", message = "A signing doctor needs a registration number (2–100 characters) and qualifications (2–200 characters)." });
 
         doctor.RegistrationNumber = registration;
         doctor.Qualifications = qualifications;
@@ -379,7 +409,7 @@ public class StaffController : ControllerBase
         _db.AuthAuditLogs.Add(new AuthAuditLog
         {
             EventType = AuthEvent.SigningCredentialsUpdated, Outcome = "success",
-            UserId = admin.UserId, TenantId = admin.TenantId, Detail = $"doctor={userId}",
+            UserId = actor.UserId, TenantId = actor.TenantId, Detail = $"doctor={doctor.UserId}",
             IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
             UserAgent = Request.Headers.UserAgent.ToString(), CreatedAt = DateTimeOffset.UtcNow
         });
@@ -390,6 +420,22 @@ public class StaffController : ControllerBase
             registrationNumber = doctor.RegistrationNumber,
             qualifications = doctor.Qualifications
         });
+    }
+
+    private Task<TenantMembership?> SelectedDoctorMembershipAsync(CancellationToken ct)
+    {
+        var userId = User.GetUserId();
+        var tenantId = User.GetTenantId();
+        var clinicId = User.GetClinicId();
+        if (User.Identity?.IsAuthenticated != true || userId is null || userId == Guid.Empty
+            || tenantId is null || tenantId == Guid.Empty || clinicId is null || clinicId == Guid.Empty
+            || _db.CurrentTenantId != tenantId
+            || !string.Equals(User.GetUserRole(), "Doctor", StringComparison.OrdinalIgnoreCase))
+            return Task.FromResult<TenantMembership?>(null);
+
+        return _db.TenantMemberships.SingleOrDefaultAsync(m =>
+            m.UserId == userId && m.TenantId == tenantId && m.ClinicId == clinicId && m.Status == "active"
+            && m.Role == UserRole.Doctor && m.Clinic != null && m.Clinic.TenantId == tenantId, ct);
     }
 
     private Task<TenantMembership?> SelectedAdminMembershipAsync(CancellationToken ct)
@@ -442,10 +488,10 @@ public record StaffInviteRequest(
     EmploymentStatus? EmploymentStatus = null);
 
 public record SigningCredentialsRequest(
-    [Required(ErrorMessage = "Registration number is required"), StringLength(100, MinimumLength = 2)]
+    [Required(ErrorMessage = "Registration number is required")]
     string RegistrationNumber,
 
-    [Required(ErrorMessage = "Qualifications are required"), StringLength(200, MinimumLength = 2)]
+    [Required(ErrorMessage = "Qualifications are required")]
     string Qualifications);
 
 public record AcceptInviteRequest(

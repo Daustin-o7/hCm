@@ -12,15 +12,16 @@ interface WishlistItem {
   category: 'task' | 'goal' | 'equipment' | 'expansion'
   status: 'open' | 'done' | 'cancelled'
   createdBy: string
+  createdByName?: string | null
   createdAt: string
   updatedAt: string
 }
 
-const CATEGORY_LABELS: Record<string, string> = {
-  task: 'Task',
-  goal: 'Goal',
-  equipment: 'Equipment',
-  expansion: 'Expansion',
+const CATEGORY_CONFIG: Record<string, { label: string; icon: string; badge: string }> = {
+  task: { label: 'Task', icon: '📝', badge: 'badge badge-neutral' },
+  goal: { label: 'Goal', icon: '🎯', badge: 'badge badge-success' },
+  equipment: { label: 'Equipment', icon: '🛠️', badge: 'badge badge-brand' },
+  expansion: { label: 'Expansion', icon: '🏗️', badge: 'badge badge-warning' },
 }
 
 export default function Wishlist() {
@@ -29,6 +30,8 @@ export default function Wishlist() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<'open' | 'done' | 'all'>('open')
+  const [search, setSearch] = useState('')
+  const [filterCategory, setFilterCategory] = useState<string>('all')
 
   const [modalOpen, setModalOpen] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
@@ -93,12 +96,22 @@ export default function Wishlist() {
     }
   }
 
+  const filtered = items.filter(i => {
+    if (tab !== 'all' && i.status !== tab) return false
+    if (filterCategory !== 'all' && i.category !== filterCategory) return false
+    if (search.trim() && !i.text.toLowerCase().includes(search.trim().toLowerCase()) &&
+      !(i.createdByName && i.createdByName.toLowerCase().includes(search.trim().toLowerCase()))) {
+      return false
+    }
+    return true
+  })
+
   const counts = {
     open: items.filter(i => i.status === 'open').length,
     done: items.filter(i => i.status === 'done').length,
     all: items.length,
   }
-  const visible = tab === 'all' ? items : items.filter(i => i.status === tab)
+  const visible = filtered
 
   return (
     <div className="space-y-6 pb-12 animate-fadein">
@@ -126,7 +139,6 @@ export default function Wishlist() {
         </div>
       </div>
 
-
       {error && (
         <div className="alert alert-error">
           {error}
@@ -135,21 +147,50 @@ export default function Wishlist() {
       )}
 
       <div className="card p-5 space-y-4">
-        <div className="tabs mb-0">
-          {([
-            { id: 'open', label: 'Open', count: counts.open },
-            { id: 'done', label: 'Done', count: counts.done },
-            { id: 'all', label: 'All', count: counts.all },
-          ] as const).map(t => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`tab ${tab === t.id ? 'active' : ''} flex items-center gap-1.5 cursor-pointer`}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b pb-3" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="tabs mb-0 border-b-0 pb-0">
+            {([
+              { id: 'open', label: 'Open', count: counts.open },
+              { id: 'done', label: 'Done', count: counts.done },
+              { id: 'all', label: 'All', count: counts.all },
+            ] as const).map(t => (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`tab ${tab === t.id ? 'active' : ''} flex items-center gap-1.5 cursor-pointer`}
+              >
+                <span>{t.label}</span>
+                <span className={`badge ${tab === t.id ? 'badge-brand' : 'badge-neutral'}`}>{t.count}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <select
+              value={filterCategory}
+              onChange={e => setFilterCategory(e.target.value)}
+              className="form-select text-xs py-1.5"
+              aria-label="Filter by category"
             >
-              <span>{t.label}</span>
-              <span className={`badge ${tab === t.id ? 'badge-brand' : 'badge-neutral'}`}>{t.count}</span>
-            </button>
-          ))}
+              <option value="all">All Categories</option>
+              <option value="equipment">🛠️ Equipment</option>
+              <option value="goal">🎯 Goal</option>
+              <option value="expansion">🏗️ Expansion</option>
+              <option value="task">📝 Task</option>
+            </select>
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="Search wishlist…"
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                className="form-input text-xs py-1.5 pl-8 w-44 sm:w-56"
+              />
+              <svg className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+            </div>
+          </div>
         </div>
 
         <div className="overflow-x-auto">
@@ -176,10 +217,10 @@ export default function Wishlist() {
                 <tr>
                   <td colSpan={5} className="p-0">
                     <EmptyState
-                      title={items.length === 0 ? 'Wishlist is Empty' : `No ${tab} Items`}
+                      title={items.length === 0 ? 'Wishlist is Empty' : `No Matching ${tab.toUpperCase()} Items`}
                       description={items.length === 0
                         ? 'Jot down that autoclave you have been meaning to replace, or the clinic expansion you keep discussing.'
-                        : 'Nothing in this list right now.'}
+                        : 'No items match your selected filters.'}
                       action={items.length === 0 ? {
                         label: '+ Add First Item',
                         onClick: openAdd,
@@ -190,58 +231,69 @@ export default function Wishlist() {
                 </tr>
               )}
 
-              {!loading && visible.map(item => (
-                <tr key={item.id}>
-                  <td>
-                    <div className={`font-bold ${item.status === 'done' ? 'line-through text-[var(--color-text-muted)]' : 'text-[var(--color-text)]'}`}>
-                      {item.text}
-                    </div>
-                  </td>
-                  <td>
-                    <span className="badge badge-neutral">{CATEGORY_LABELS[item.category] ?? item.category}</span>
-                  </td>
-                  <td>
-                    {item.status === 'open' && <span className="badge badge-brand">Open</span>}
-                    {item.status === 'done' && <span className="badge badge-success">Done</span>}
-                    {item.status === 'cancelled' && <span className="badge badge-neutral">Cancelled</span>}
-                  </td>
-                  <td className="text-sm">{fmtDate(item.createdAt)}</td>
-                  <td className="text-right">
-                    <div className="flex items-center justify-end gap-2">
-                      <button onClick={() => openEdit(item)} className="btn btn-ghost btn-sm cursor-pointer">
-                        Edit
-                      </button>
-                      {item.status === 'open' && (
-                        <>
+              {!loading && visible.map(item => {
+                const cfg = CATEGORY_CONFIG[item.category] ?? { label: item.category, icon: '•', badge: 'badge badge-neutral' }
+                return (
+                  <tr key={item.id}>
+                    <td>
+                      <div className={`font-bold ${item.status === 'done' ? 'line-through text-[var(--color-text-muted)]' : 'text-[var(--color-text)]'}`}>
+                        {item.text}
+                      </div>
+                      {item.createdByName && (
+                        <div className="text-[11px] text-[var(--color-text-muted)] mt-0.5">
+                          Added by {item.createdByName}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <span className={cfg.badge}>
+                        <span className="mr-1">{cfg.icon}</span>
+                        {cfg.label}
+                      </span>
+                    </td>
+                    <td>
+                      {item.status === 'open' && <span className="badge badge-brand">Open</span>}
+                      {item.status === 'done' && <span className="badge badge-success">Done</span>}
+                      {item.status === 'cancelled' && <span className="badge badge-neutral">Cancelled</span>}
+                    </td>
+                    <td className="text-sm font-mono text-xs">{fmtDate(item.createdAt)}</td>
+                    <td className="text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        <button onClick={() => openEdit(item)} className="btn btn-ghost btn-sm cursor-pointer">
+                          Edit
+                        </button>
+                        {item.status === 'open' && (
+                          <>
+                            <button
+                              onClick={() => setStatus(item, 'done')}
+                              disabled={busyId !== null}
+                              className="btn btn-secondary btn-sm cursor-pointer"
+                            >
+                              {busyId === item.id ? 'Saving…' : 'Done'}
+                            </button>
+                            <button
+                              onClick={() => setStatus(item, 'cancelled')}
+                              disabled={busyId !== null}
+                              className="btn btn-ghost btn-sm cursor-pointer text-[var(--color-danger)]"
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        )}
+                        {item.status !== 'open' && (
                           <button
-                            onClick={() => setStatus(item, 'done')}
+                            onClick={() => setStatus(item, 'open')}
                             disabled={busyId !== null}
                             className="btn btn-secondary btn-sm cursor-pointer"
                           >
-                            {busyId === item.id ? 'Saving…' : 'Done'}
+                            Reopen
                           </button>
-                          <button
-                            onClick={() => setStatus(item, 'cancelled')}
-                            disabled={busyId !== null}
-                            className="btn btn-ghost btn-sm cursor-pointer text-[var(--color-danger)]"
-                          >
-                            Cancel
-                          </button>
-                        </>
-                      )}
-                      {item.status !== 'open' && (
-                        <button
-                          onClick={() => setStatus(item, 'open')}
-                          disabled={busyId !== null}
-                          className="btn btn-secondary btn-sm cursor-pointer"
-                        >
-                          Reopen
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -260,7 +312,7 @@ export default function Wishlist() {
             <input
               type="text"
               required
-              maxLength={500}
+              maxLength={1000}
               value={text}
               onChange={(e) => setText(e.target.value)}
               placeholder="e.g. Replace the old centrifuge next quarter"
